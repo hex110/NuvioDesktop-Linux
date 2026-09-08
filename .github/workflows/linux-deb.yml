@@ -88,11 +88,16 @@ jobs:
         run: |
           set -euo pipefail
           deb="Nuvio-HTPC-Linux-x86_64-${RELEASE_VERSION}.deb"
-          dpkg-deb -c "$deb" | grep -q 'libplayer_bridge\.so' || {
+          # Listed once into a variable rather than piped straight into grep -q:
+          # grep -q exits on the first match, dpkg-deb takes SIGPIPE, and under
+          # pipefail that fails the step even though the file is present.
+          listing="$(dpkg-deb -c "$deb")"
+          if ! printf '%s\n' "$listing" | grep -q 'libplayer_bridge\.so'; then
             echo "libplayer_bridge.so is missing from the package." >&2
-            dpkg-deb -c "$deb" | grep -iE 'native|\.so$' >&2 || true
+            printf '%s\n' "$listing" | grep -iE 'native|\.so$' >&2 || true
             exit 1
-          }
+          fi
+          printf '%s\n' "$listing" | grep 'libplayer_bridge\.so'
           ls -lh "$deb"
 
       - uses: actions/upload-artifact@v7
