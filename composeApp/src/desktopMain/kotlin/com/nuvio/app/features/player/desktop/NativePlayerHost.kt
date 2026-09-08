@@ -3,6 +3,8 @@ package com.nuvio.app.features.player.desktop
 import java.awt.Canvas
 import java.awt.Color
 import java.awt.Graphics
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
 
 internal class NativePlayerHost : Canvas() {
     var onPeerReady: (() -> Unit)? = null
@@ -15,6 +17,37 @@ internal class NativePlayerHost : Canvas() {
     init {
         background = Color.BLACK
         ignoreRepaint = false
+        // NUVIO-LINUX: restored from upstream. On Linux/XWayland a heavyweight
+        // Canvas embedded in a Compose SwingPanel is not guaranteed an
+        // expose-driven paint() when it is first laid out, so the paint()-based
+        // first-full-size-paint signal -- which is what unlocks the native
+        // attach -- can never fire and playback silently never starts.
+        // componentResized fires reliably on layout, so use it to drive the same
+        // signal. Linux-only, to keep macOS/Windows behaviour byte-identical.
+        if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+            addComponentListener(object : ComponentAdapter() {
+                override fun componentResized(event: ComponentEvent) {
+                    repaint()
+                    notifyFirstPaints()
+                }
+
+                override fun componentShown(event: ComponentEvent) {
+                    repaint()
+                    notifyFirstPaints()
+                }
+            })
+        }
+    }
+
+    private fun notifyFirstPaints() {
+        if (!firstPaintNotified) {
+            firstPaintNotified = true
+            onFirstPaint?.invoke()
+        }
+        if (!firstFullSizePaintNotified && width > 1 && height > 1) {
+            firstFullSizePaintNotified = true
+            onFirstFullSizePaint?.invoke()
+        }
     }
 
     override fun update(graphics: Graphics) {
