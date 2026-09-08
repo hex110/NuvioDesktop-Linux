@@ -1,0 +1,102 @@
+name: Linux DEB
+
+# Builds the Linux package this fork exists to produce. Runs on ubuntu-latest
+# rather than either local machine: the runner has more RAM than the laptop and
+# the build is fully reproducible from a clean checkout.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (e.g. 1.14.0)"
+        required: true
+        default: "1.14.0"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux_deb:
+    name: Linux x64 - DEB
+    runs-on: ubuntu-latest
+    env:
+      # Base64 of a local.properties carrying SUPABASE_URL, SUPABASE_ANON_KEY,
+      # INTRODB_API_URL, IMDB_RATINGS_API_BASE_URL, IMDB_TAPFRAME_API_BASE_URL
+      # and PREMIUMIZE_CLIENT_ID. Without it the build ships blanked
+      # credentials and login fails outright.
+      LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+      RELEASE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # Installs libgtk-3-dev, libmpv-dev, libwebkit2gtk-4.1-dev, libx11-dev
+      # and libxcomposite-dev -- exactly what the native player bridge links
+      # against -- plus fakeroot for dpkg-deb.
+      - name: Install build dependencies
+        run: bash ./scripts/linux/install-desktop-build-dependencies.sh fakeroot
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      # Deliberately NOT scripts/linux/configure-desktop-runtime.sh: that is
+      # upstream's, and validates upstream's property names (NUVIO_SUPABASE_URL,
+      # TRAKT_CLIENT_ID) while requiring Sentry secrets this fork does not use.
+      # The fork's GenerateRuntimeConfigsTask reads SUPABASE_URL / SUPABASE_ANON_KEY.
+      - name: Write local.properties
+        run: |
+          set -euo pipefail
+          if [[ -z "${LOCAL_PROPERTIES_BASE64:-}" ]]; then
+            echo "NUVIO_LOCAL_PROPERTIES_BASE64 secret is not set." >&2
+            exit 1
+          fi
+          printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > local.properties
+          for property in SUPABASE_URL SUPABASE_ANON_KEY; do
+            grep -Eq "^${property}=.+" local.properties || {
+              echo "Missing required property: ${property}" >&2; exit 1; }
+          done
+
+      # The contract between NativePlayerBridge.kt and the Linux bridge. A
+      # method the fork adds still compiles and then throws
+      # UnsatisfiedLinkError at first playback, so fail the build here instead.
+      - name: Check JNI contract
+        run: python3 ./scripts/linux/check-jni-contract.py
+
+      - name: Build Linux DEB
+        run: |
+          set -euo pipefail
+          ./gradlew :composeApp:packageReleaseDeb \
+            -Pcompose.desktop.packaging.checkJdkVendor=false \
+            --no-configuration-cache --no-daemon --stacktrace
+
+          deb_dir="composeApp/build/compose/binaries/main-release/deb"
+          mapfile -t debs < <(find "${deb_dir}" -maxdepth 1 -type f -name '*.deb' | sort)
+          if [[ "${#debs[@]}" -ne 1 ]]; then
+            echo "Expected exactly one .deb in ${deb_dir}, found ${#debs[@]}." >&2
+            ls -la "${deb_dir}" >&2 || true
+            exit 1
+          fi
+          cp "${debs[0]}" "Nuvio-HTPC-Linux-x86_64-${RELEASE_VERSION}.deb"
+
+      # Confirms the bridge actually made it into the package -- the failure
+      # mode is a .deb that installs cleanly and cannot play anything.
+      - name: Verify the native bridge is packaged
+        run: |
+          set -euo pipefail
+          deb="Nuvio-HTPC-Linux-x86_64-${RELEASE_VERSION}.deb"
+          dpkg-deb -c "$deb" | grep -q 'libplayer_bridge\.so' || {
+            echo "libplayer_bridge.so is missing from the package." >&2
+            dpkg-deb -c "$deb" | grep -iE 'native|\.so$' >&2 || true
+            exit 1
+          }
+          ls -lh "$deb"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-htpc-linux-deb-${{ env.RELEASE_VERSION }}
+          path: Nuvio-HTPC-Linux-x86_64-${{ env.RELEASE_VERSION }}.deb
+          if-no-files-found: error
