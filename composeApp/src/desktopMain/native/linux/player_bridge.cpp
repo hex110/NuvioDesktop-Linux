@@ -31,7 +31,9 @@
 #include <mutex>
 #include <cstdlib>
 #include <set>
+#include <cmath>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -758,6 +760,30 @@ std::string jsonEscape(const std::string &s) {
         }
     }
     return o;
+}
+
+// Quote a string as a JSON scalar (used by chaptersJson).
+std::string jsonQuote(const std::string &in) {
+    std::string out = "\"";
+    for (char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out.push_back(c);
+                }
+        }
+    }
+    out += "\"";
+    return out;
 }
 
 // Read an mpv string property, trimmed; "" if unset.
@@ -1526,9 +1552,43 @@ JNIEXPORT jboolean JNICALL NP(initGtkEarly)(JNIEnv *, jobject) {
 
 JNIEXPORT jlong JNICALL NP(create)(
     JNIEnv *env, jobject /*thiz*/, jlong hostViewPtr, jstring sourceUrl,
-    jobjectArray headerLines, jboolean playWhenReady, jlong initialPositionMs,
-    jstring controlsPageUrl, jint decoderPriority,
-    jboolean /*nvidiaRtxSuperResolutionEnabled*/, jobject eventSink) {
+    jstring sourceAudioUrl, jobjectArray headerLines, jboolean playWhenReady,
+    jlong initialPositionMs, jdouble /*initialProgressFraction*/,
+    jstring controlsPageUrl,
+    jboolean /*nvidiaRtxSuperResolutionEnabled*/, jboolean /*nvidiaRtxHdrEnabled*/,
+    jboolean /*isAnimeContent*/, jstring /*animeSvpFilter*/,
+    jobjectArray extraMpvOptions, jobject eventSink) {
+    // The fork dropped decoderPriority from the JNI surface and drives decoding
+    // through extraMpvOptions instead. Keep upstream's branch below intact by
+    // pinning the value it used to receive for the default path: hardware decode
+    // with a software fallback.
+    const jint decoderPriority = 1;
+    // NVIDIA RTX super-resolution / True HDR, the anime SVP filter and SVP
+    // frame-interpolation profiling are Windows-only in the fork; the flags are
+    // accepted and ignored here.
+
+    // A separate audio-only source (some debrid/cloud sources split A/V).
+    std::string audioFile = jstringToUtf8(env, sourceAudioUrl);
+
+    // The fork's "Advanced MPV configuration" surface: raw key=value option
+    // lines, applied before mpv_initialize so option-only settings take.
+    std::vector<std::pair<std::string, std::string>> extraOptions;
+    if (extraMpvOptions != nullptr) {
+        jsize extraCount = env->GetArrayLength(extraMpvOptions);
+        for (jsize i = 0; i < extraCount; ++i) {
+            auto entry = static_cast<jstring>(env->GetObjectArrayElement(extraMpvOptions, i));
+            std::string line = jstringToUtf8(env, entry);
+            if (entry) env->DeleteLocalRef(entry);
+            while (!line.empty() && (line.front() == ' ' || line.front() == '-')) line.erase(line.begin());
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) {
+                extraOptions.emplace_back(line, "yes");
+            } else {
+                extraOptions.emplace_back(line.substr(0, eq), line.substr(eq + 1));
+            }
+        }
+    }
 
     // libmpv requires LC_NUMERIC=C (e.g. non-"C" locales with comma
     // decimals make mpv_create fail); the JVM uses java.util.Locale, so
@@ -1610,6 +1670,7 @@ JNIEXPORT jlong JNICALL NP(create)(
         }
         mpv_set_option_string(m, "hwdec", hwdec);
         mpv_set_option_string(m, "gpu-hwdec-interop", "auto");
+        if (!audioFile.empty()) mpv_set_option_string(m, "audio-file", audioFile.c_str());
         if (decoderPriority == 0) {
             mpv_set_option_string(m, "vd-lavc-software-fallback", "no");
         } else if (decoderPriority == 2) {
@@ -1632,7 +1693,12 @@ JNIEXPORT jlong JNICALL NP(create)(
         if (!playWhenReady) {
             mpv_set_option_string(m, "pause", "yes");
         }
-    };
+    
+        // User-supplied mpv options win over every default set above.
+        for (const auto &opt : extraOptions) {
+            mpv_set_option_string(m, opt.first.c_str(), opt.second.c_str());
+        }
+};
 
     // Attempt 1: x11egl — the proven path on Mesa (Intel/AMD). Attempt 2: x11vk —
     // NVIDIA's proprietary EGL refuses to make a context current on the foreign
@@ -1873,20 +1939,22 @@ JNIEXPORT jstring JNICALL NP(subtitleTracksJson)(JNIEnv *env, jobject, jlong han
     return utf8ToJstring(env, buildTracksJson(p->mpv, "sub"));
 }
 
-JNIEXPORT void JNICALL NP(selectAudioTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
+JNIEXPORT jboolean JNICALL NP(selectAudioTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
     Player *p = asPlayer(handle);
-    if (!p) return;
+    if (!p) return JNI_FALSE;
     int64_t id = trackId;
     if (trackId < 0) mpv_set_property_string(p->mpv, "aid", "no");
     else mpv_set_property(p->mpv, "aid", MPV_FORMAT_INT64, &id);
+    return JNI_TRUE;
 }
 
-JNIEXPORT void JNICALL NP(selectSubtitleTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
+JNIEXPORT jboolean JNICALL NP(selectSubtitleTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
     Player *p = asPlayer(handle);
-    if (!p) return;
+    if (!p) return JNI_FALSE;
     int64_t id = trackId;
     if (trackId < 0) mpv_set_property_string(p->mpv, "sid", "no");
     else mpv_set_property(p->mpv, "sid", MPV_FORMAT_INT64, &id);
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL NP(addSubtitleUrl)(JNIEnv *env, jobject, jlong handle, jstring url) {
@@ -1922,13 +1990,11 @@ JNIEXPORT void JNICALL NP(setSubtitleDelayMs)(JNIEnv *, jobject, jlong handle, j
 JNIEXPORT void JNICALL NP(applySubtitleStyle)(
     JNIEnv *env, jobject, jlong handle, jstring textColor, jstring /*backgroundColor*/,
     jstring outlineColor, jfloat outlineSize, jboolean bold, jfloat fontSize, jint subPos,
-    jboolean useLibass, jboolean stripSdh) {
+    jstring fontName) {
     Player *p = asPlayer(handle);
     if (!p) return;
-    // Keep the track's own ASS styling when libass rendering is on, and let the
-    // settings below take over when it is off (matching the Windows bridge).
-    mpv_set_property_string(p->mpv, "sub-ass-override",
-                            useLibass == JNI_TRUE ? "scale" : "force");
+    // ASS override is no longer decided here: the fork drives it separately
+    // through setSubtitleAssStyleMode(mode, scale).
     mpv_set_property_string(p->mpv, "sub-color", jstringToUtf8(env, textColor).c_str());
     mpv_set_property_string(p->mpv, "sub-border-color", jstringToUtf8(env, outlineColor).c_str());
     std::string border = std::to_string(outlineSize);
@@ -1938,9 +2004,9 @@ JNIEXPORT void JNICALL NP(applySubtitleStyle)(
     mpv_set_property_string(p->mpv, "sub-font-size", size.c_str());
     std::string pos = std::to_string(subPos);
     mpv_set_property_string(p->mpv, "sub-pos", pos.c_str());
-    // Strip captions written for deaf and hard-of-hearing viewers.
-    mpv_set_property_string(p->mpv, "sub-filter-sdh", stripSdh == JNI_TRUE ? "yes" : "no");
-    mpv_set_property_string(p->mpv, "sub-filter-sdh-harder", stripSdh == JNI_TRUE ? "yes" : "no");
+    // The fork lets any installed system font replace the bundled one.
+    std::string font = jstringToUtf8(env, fontName);
+    if (!font.empty()) mpv_set_property_string(p->mpv, "sub-font", font.c_str());
 }
 
 // ---- Phase 2 stubs: webview controls / window chrome / focus ------------
@@ -2018,6 +2084,167 @@ JNIEXPORT void JNICALL NP(shutdownWebView2Warmup)(JNIEnv *, jobject) {
 JNIEXPORT jboolean JNICALL NP(setWindowsDisplaySleepInhibited)(JNIEnv *, jobject, jboolean) {
     return JNI_FALSE;
 }
+
+
+// ---- NUVIO_HTPC_FORK_ADDITIONS -------------------------------------------
+// Methods the UmbraProjects fork declares in NativePlayerBridge.kt that
+// upstream's Linux bridge does not implement. Every declared method must exist
+// or the JVM throws UnsatisfiedLinkError the first time playback starts, so the
+// Windows-only concepts below are present as deliberate no-ops rather than
+// omitted. scripts/linux/check-jni-contract.py enforces that this list stays
+// complete across rebases onto new fork releases.
+
+// --- implemented against mpv / WebKitGTK ---
+
+JNIEXPORT void JNICALL NP(setMute)(JNIEnv *, jobject, jlong handle, jboolean muted) {
+    Player *p = asPlayer(handle);
+    if (p) mpv_set_property_string(p->mpv, "mute", muted == JNI_TRUE ? "yes" : "no");
+}
+
+JNIEXPORT jboolean JNICALL NP(isMuted)(JNIEnv *, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p) return JNI_FALSE;
+    return mpvGetStr(p->mpv, "mute") == "yes" ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL NP(setMpvProperty)(JNIEnv *env, jobject, jlong handle,
+                                          jstring key, jstring value) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    std::string k = jstringToUtf8(env, key);
+    if (k.empty()) return;
+    mpv_set_property_string(p->mpv, k.c_str(), jstringToUtf8(env, value).c_str());
+}
+
+JNIEXPORT void JNICALL NP(toggleStatsOverlay)(JNIEnv *, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    const char *cmd[] = {"script-binding", "stats/display-stats-toggle", nullptr};
+    mpv_command(p->mpv, cmd);
+}
+
+// Mode is one of mpv's sub-ass-override values; scale drives sub-scale.
+JNIEXPORT void JNICALL NP(setSubtitleAssStyleMode)(JNIEnv *env, jobject, jlong handle,
+                                                   jstring mode, jdouble scale) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    std::string m = jstringToUtf8(env, mode);
+    if (m != "no" && m != "yes" && m != "scale" && m != "force") return;
+    double clamped = scale < 0.1 ? 0.1 : (scale > 5.0 ? 5.0 : scale);
+    mpv_set_property_string(p->mpv, "sub-ass-override", m.c_str());
+    mpvSetDouble(p->mpv, "sub-scale", clamped);
+}
+
+// [{"startTime":<seconds>,"title":"..."}] -- the shape the controls page and
+// the Kotlin decoder expect (mirrors the Windows bridge's chaptersJson).
+JNIEXPORT jstring JNICALL NP(chaptersJson)(JNIEnv *env, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p) return utf8ToJstring(env, "[]");
+    std::string countStr = mpvGetStr(p->mpv, "chapter-list/count");
+    long count = 0;
+    try {
+        count = countStr.empty() ? 0 : std::stol(countStr);
+    } catch (const std::exception &) {
+        count = 0;
+    }
+    std::string out = "[";
+    bool first = true;
+    for (long i = 0; i < count; ++i) {
+        std::string prefix = "chapter-list/" + std::to_string(i);
+        std::string timeStr = mpvGetStr(p->mpv, prefix + "/time");
+        if (timeStr.empty()) continue;
+        double startTime = 0.0;
+        try {
+            startTime = std::stod(timeStr);
+        } catch (const std::exception &) {
+            continue;
+        }
+        if (!std::isfinite(startTime) || startTime < 0.0) continue;
+        if (!first) out += ",";
+        first = false;
+        out += "{\"startTime\":" + std::to_string(startTime) +
+               ",\"title\":" + jsonQuote(mpvGetStr(p->mpv, prefix + "/title")) + "}";
+    }
+    out += "]";
+    return utf8ToJstring(env, out);
+}
+
+// Kotlin pushes arbitrary script into the controls page (the fork uses it for
+// player-UI messaging that does not fit the updateControls payload).
+JNIEXPORT void JNICALL NP(runJavaScript)(JNIEnv *env, jobject, jlong handle, jstring script) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    auto *payload = new std::pair<Player *, std::string>(p, jstringToUtf8(env, script));
+    g_main_context_invoke(nullptr,
+                          +[](gpointer data) -> gboolean {
+                              auto *pair = static_cast<std::pair<Player *, std::string> *>(data);
+                              if (playerAlive(pair->first)) evalJs(pair->first->webview, pair->second);
+                              delete pair;
+                              return G_SOURCE_REMOVE;
+                          },
+                          payload);
+}
+
+// The overlay window pins its own cursor, so hiding must happen natively --
+// the page's CSS `cursor: none` never reaches the screen. See the note on
+// setOverlayCursorHidden.
+JNIEXPORT void JNICALL NP(setCursorHidden)(JNIEnv *, jobject, jlong handle, jboolean hidden) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    auto *payload = new std::pair<Player *, bool>(p, hidden == JNI_TRUE);
+    g_main_context_invoke(nullptr,
+                          +[](gpointer data) -> gboolean {
+                              auto *pair = static_cast<std::pair<Player *, bool> *>(data);
+                              if (playerAlive(pair->first)) setOverlayCursorHidden(pair->first, pair->second);
+                              delete pair;
+                              return G_SOURCE_REMOVE;
+                          },
+                          payload);
+}
+
+// --- deliberate no-ops: Windows-only concepts ---
+
+// Windows sets an AppUserModelID so the taskbar groups windows and the media
+// flyout can name the app. No equivalent is needed on Linux.
+JNIEXPORT void JNICALL NP(initializeAppIdentity)(JNIEnv *, jobject) {}
+
+// Windows publishes to SystemMediaTransportControls. The Linux equivalent is
+// MPRIS, which Nuvio does not implement on any platform yet. Implementing it
+// here would also let the desktop's idle logic see that a film is playing.
+JNIEXPORT void JNICALL NP(setMediaSessionMetadata)(JNIEnv *, jobject, jlong,
+                                                   jstring, jstring, jstring) {}
+
+// SVP frame interpolation is Windows-only in the fork; these three calls only
+// bracket its startup profiling.
+JNIEXPORT void JNICALL NP(beginVideoProfile)(JNIEnv *, jobject, jlong) {}
+JNIEXPORT void JNICALL NP(endVideoProfile)(JNIEnv *, jobject, jlong) {}
+JNIEXPORT void JNICALL NP(completeSvpStartupProfile)(JNIEnv *, jobject, jlong) {}
+
+// Borderless fullscreen is a Win32 window-style swap. On Linux the Compose
+// window handles fullscreen itself; upstream ships the same empty stub for its
+// own setWindowBorderlessFullscreen.
+JNIEXPORT void JNICALL NP(setBorderlessFullscreen)(JNIEnv *, jobject, jlong, jboolean) {}
+JNIEXPORT void JNICALL NP(setBorderlessFullscreenSuspended)(JNIEnv *, jobject, jlong, jboolean) {}
+
+// --- deferred: real features, not yet ported ---
+
+// mpv only repaints the wid-embedded surface on a size change while otherwise
+// idle, so colour-preset and equalizer changes may not appear until the window
+// is resized. The Windows bridge nudges the container by 1px and back; doing
+// that here means resizing a window AWT owns, so it is left for a follow-up.
+JNIEXPORT void JNICALL NP(forceVideoRedraw)(JNIEnv *, jobject, jlong) {}
+
+// Seek-bar thumbnail previews. The Windows bridge decodes them out-of-band;
+// until that is ported the controls page simply receives no thumbnail.
+JNIEXPORT void JNICALL NP(requestSeekThumbnail)(JNIEnv *, jobject, jlong, jlong) {}
+
+// Picture-in-Picture: a floating, draggable, resizable player window driven by
+// Win32 hit-testing and SetWindowPos. Needs a GTK/X11 equivalent.
+JNIEXPORT void JNICALL NP(setCompactPlayerWindow)(JNIEnv *, jobject, jlong, jboolean) {}
+JNIEXPORT void JNICALL NP(beginCompactPlayerWindowMove)(JNIEnv *, jobject, jlong) {}
+JNIEXPORT void JNICALL NP(beginCompactPlayerWindowResize)(JNIEnv *, jobject, jlong, jint) {}
+JNIEXPORT void JNICALL NP(updateCompactPlayerWindowInteraction)(JNIEnv *, jobject, jlong) {}
+JNIEXPORT void JNICALL NP(endCompactPlayerWindowInteraction)(JNIEnv *, jobject, jlong) {}
 
 #undef NP
 } // extern "C"
