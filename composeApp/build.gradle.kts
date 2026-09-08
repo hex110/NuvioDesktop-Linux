@@ -1438,4 +1438,10 @@ if (isLinuxHost) {
     tasks.matching { it.name in linuxNativePlayerTasks }.configureEach {
         dependsOn(stageLinuxPlayerBridge)
     }
+    // Compose's prepareAppResources snapshots appResourcesRootDir when it runs.
+    // Without this it runs before the Sync above, finds the directory empty,
+    // reports NO-SOURCE, and the bridge silently misses the package.
+    tasks.matching { it.name == "prepareAppResources" }.configureEach {
+        dependsOn(stageLinuxPlayerBridge)
+    }
 }
