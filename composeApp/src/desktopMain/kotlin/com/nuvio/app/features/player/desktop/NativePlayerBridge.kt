@@ -176,6 +176,12 @@ internal object NativePlayerBridge {
 
         val libraryName = nativeLibraryName(platform)
         val platformDir = nativeDirectoryName(platform)
+        // NUVIO-LINUX: a packaged app ships the bridge as a Compose app resource
+        // (see stageLinuxPlayerBridgeResources). Restored from upstream.
+        findPackagedApplicationLibrary(platformDir, libraryName)?.let { packagedLibrary ->
+            System.load(packagedLibrary.absolutePath)
+            return
+        }
         findLocalBuildLibrary(platformDir, libraryName)?.let { localLibrary ->
             copyLocalRuntimeResources(platformDir, localLibrary.parentFile)
             loadedRuntimeDir = localLibrary.parentFile
@@ -346,6 +352,15 @@ internal object NativePlayerBridge {
             "windows" -> listOf("libmpv-2.dll")
             else -> emptyList()
         }
+    }
+
+    // NUVIO-LINUX: taken from upstream.
+    private fun findPackagedApplicationLibrary(platformDir: String, libraryName: String): File? {
+        val resourcesDir = System.getProperty("compose.application.resources.dir")
+            ?.takeIf(String::isNotBlank)
+            ?.let(::File)
+            ?: return null
+        return resourcesDir.resolve("native/$platformDir/$libraryName").takeIf(File::isFile)
     }
 
     private fun findLocalBuildLibrary(platformDir: String, libraryName: String): File? {

@@ -1348,7 +1348,10 @@ compose.desktop {
                 // copied once from ~/.config/nuvio and leaving it untouched), so
                 // only the install prefix and package identity need changing.
                 packageName = "nuvio-htpc"
-                installationPath = "/opt/nuvio-htpc"
+                // jpackage installs to <installationPath>/<packageName>, so this
+                // must be /opt, not /opt/nuvio-htpc, or the payload lands in
+                // /opt/nuvio-htpc/nuvio-htpc.
+                installationPath = "/opt"
                 appCategory = "AudioVideo"
                 menuGroup = "Nuvio"
                 shortcut = true
@@ -1419,27 +1422,20 @@ if (isLinuxHost) {
     }
 
     // A packaged app has no composeApp/build/native/linux to fall back on, and
-    // release builds must never extract executable code at runtime. Put the
-    // bridge in the image next to the jars, where findPackagedNativeRuntime
-    // looks for it (java.home is <image>/lib/runtime, so this is ../app).
-    mapOf(
-        "createDistributable" to "main",
-        "createReleaseDistributable" to "main-release",
-    ).forEach { (taskName, imageFlavor) ->
-        tasks.matching { it.name == taskName }.configureEach {
-            notCompatibleWithConfigurationCache("Stages the Linux player bridge into the app image.")
-            doLast {
-                val binariesDir = layout.buildDirectory
-                    .dir("compose/binaries/$imageFlavor/app").get().asFile
-                val appDir = binariesDir.listFiles()
-                    ?.filter(File::isDirectory)
-                    ?.firstNotNullOfOrNull { root -> root.resolve("lib/app").takeIf(File::isDirectory) }
-                check(appDir != null) { "Linux app image not found under $binariesDir" }
-                val staged = appDir.resolve("libplayer_bridge.so")
-                linuxPlayerBridgeOutput.get().asFile.copyTo(staged, overwrite = true)
-                check(staged.isFile) { "Failed to stage the player bridge into $appDir" }
-                logger.lifecycle("Staged libplayer_bridge.so into $appDir")
-            }
-        }
+    // release builds must never extract executable code at runtime. Ship the
+    // bridge as a Compose app resource: jpackage copies appResourcesRootDir into
+    // the image's resources directory, which works for createDistributable and
+    // packageReleaseDeb alike. A doLast on createReleaseDistributable does not --
+    // packageReleaseDeb drives jpackage itself and never runs that task, which is
+    // how the first CI build produced a .deb with no bridge in it.
+    val linuxAppResourcesRoot = layout.buildDirectory.dir("nativeAppResources")
+    val stageLinuxPlayerBridge = tasks.register<Sync>("stageLinuxPlayerBridgeResources") {
+        dependsOn(buildLinuxPlayerBridge)
+        from(linuxPlayerBridgeOutput)
+        into(linuxAppResourcesRoot.map { it.dir("common/native/linux") })
+    }
+    compose.desktop.application.nativeDistributions.appResourcesRootDir.set(linuxAppResourcesRoot)
+    tasks.matching { it.name in linuxNativePlayerTasks }.configureEach {
+        dependsOn(stageLinuxPlayerBridge)
     }
 }
