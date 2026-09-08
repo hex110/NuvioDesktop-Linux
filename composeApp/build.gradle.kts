@@ -1326,6 +1326,15 @@ compose.desktop {
             }
             linux {
                 iconFile.set(project.file("src/desktopMain/resources/icons/nuvio-app-icon.png"))
+                // NUVIO-LINUX: install beside the stock Nuvio, not over it. The
+                // data directory already separates itself (~/.config/nuviohtpc,
+                // copied once from ~/.config/nuvio and leaving it untouched), so
+                // only the install prefix and package identity need changing.
+                packageName = "nuvio-htpc"
+                installationPath = "/opt/nuvio-htpc"
+                appCategory = "AudioVideo"
+                menuGroup = "Nuvio"
+                shortcut = true
             }
         }
 
