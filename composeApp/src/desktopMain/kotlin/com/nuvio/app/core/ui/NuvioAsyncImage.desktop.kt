@@ -38,7 +38,19 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val MinCustomDownscaleRatio = 1.08f
-private const val MaxDesktopSourceSizePx = 1536
+// NUVIO-LINUX: tunable rather than fixed. The 1536 px request is deliberately
+// oversized so the high-quality kernel has source to reduce from, which is the
+// right trade on a desktop GPU with RAM to spare. On a 1080p panel at scale 1 a
+// poster card draws at roughly 250 px, so 1536 is ~6x oversampling paid for in
+// decode time (2.4-7.5 ms each) and in cache bytes -- and the memory cache on a
+// small machine is only the 96 MB floor. Lowering it to ~768 keeps ample source
+// for the reduction while cutting decoded bytes ~4x.
+//
+//   -Dnuvio.maxSourceSizePx=768
+//
+// Unset keeps upstream's 1536 exactly.
+private val MaxDesktopSourceSizePx: Int =
+    System.getProperty("nuvio.maxSourceSizePx")?.toIntOrNull()?.coerceIn(256, 4096) ?: 1536
 private const val MaxScaledBitmapPixels = 1_250_000L
 
 // See [rememberHeroSourceSize]. The headroom covers HERO_SCROLL_MAX_SCALE (1.3x) without paying for
