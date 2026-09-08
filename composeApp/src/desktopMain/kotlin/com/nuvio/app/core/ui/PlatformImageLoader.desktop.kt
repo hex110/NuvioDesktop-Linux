@@ -5,6 +5,8 @@ import coil3.disk.DiskCache
 import coil3.disk.directory
 import coil3.memory.MemoryCache
 import com.nuvio.app.core.storage.DesktopStorage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import okio.Path.Companion.toOkioPath
 
 /**
@@ -14,24 +16,26 @@ import okio.Path.Companion.toOkioPath
  * viewport and came back (animated frames are not held in the memory cache the way a static bitmap
  * is, so scrolling away drops them entirely).
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 internal actual fun ImageLoader.Builder.configurePlatformImageLoader(): ImageLoader.Builder =
-    memoryCache {
-        MemoryCache.Builder()
-            .maxSizeBytes(memoryCacheBudgetBytes())
-            .build()
-    }.diskCache {
-        DiskCache.Builder()
-            .directory(DesktopStorage.rootDir.resolve(IMAGE_CACHE_DIR_NAME).toOkioPath())
-            .maxSizeBytes(IMAGE_CACHE_MAX_BYTES)
-            .build()
-    }.components {
+    decoderCoroutineContext(Dispatchers.IO.limitedParallelism(decodeParallelism()))
+        .memoryCache {
+            MemoryCache.Builder()
+                .maxSizeBytes(memoryCacheBudgetBytes())
+                .build()
+        }.diskCache {
+            DiskCache.Builder()
+                .directory(DesktopStorage.rootDir.resolve(IMAGE_CACHE_DIR_NAME).toOkioPath())
+                .maxSizeBytes(IMAGE_CACHE_MAX_BYTES)
+                .build()
+        }.components {
         // Order matters: factories are tried in registration order and the first non-null wins, and
         // Coil appends its own defaults after these. Animation is offered the source first; whatever
         // it declines falls to the high-quality still decoder, which would otherwise have gone to
         // Coil's own - the one that reduces with nearest-neighbour.
-        add(AnimatedSkiaImageDecoder.Factory())
-        add(HighQualityBitmapDecoder.Factory())
-    }
+            add(AnimatedSkiaImageDecoder.Factory())
+            add(HighQualityBitmapDecoder.Factory())
+        }
 
 /**
  * How many bytes of *decoded* artwork to keep in memory.
@@ -56,6 +60,31 @@ internal actual fun ImageLoader.Builder.configurePlatformImageLoader(): ImageLoa
  * This is separate from, and much smaller than, [IMAGE_CACHE_MAX_BYTES] — that one holds compressed
  * bytes on disk, which is not the resource that runs out here.
  */
+/**
+ * How many artwork decodes may run at once.
+ *
+ * NUVIO-LINUX: Coil is left on its default decoder dispatcher, which is
+ * `Dispatchers.IO` -- a 64-thread pool. Entering the home screen prefetches on
+ * the order of sixteen posters per collection row, so on a laptop that means
+ * dozens of simultaneous full-size decodes (2.4-7.5 ms each, several MB of
+ * bitmap apiece) against 12 hardware threads. The work is not just slow, it
+ * arrives all at once: the CPU is oversubscribed and the allocation spike drives
+ * GC, which this build makes more expensive by shrinking the heap aggressively
+ * (-XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30).
+ *
+ * Bounding it does not reduce the total work, it stops it being attempted
+ * simultaneously -- the rows still fill, but the UI thread keeps its frames.
+ *
+ *   -Dnuvio.decodeParallelism=N
+ */
+private fun decodeParallelism(): Int {
+    System.getProperty("nuvio.decodeParallelism")?.toIntOrNull()?.let {
+        return it.coerceIn(1, 64)
+    }
+    val processors = Runtime.getRuntime().availableProcessors()
+    return (processors / 3).coerceIn(2, 8)
+}
+
 private fun memoryCacheBudgetBytes(): Long {
     val physicalRamBytes = physicalMemoryBytes() ?: (Runtime.getRuntime().maxMemory() * 4)
     return (physicalRamBytes * MemoryCacheRamFraction).toLong()
