@@ -361,6 +361,14 @@ private inline fun desktopStartupStep(name: String, block: () -> Unit) {
 }
 
 fun main() {
+    // NUVIO-LINUX: must be the first statement. AWT/Skiko otherwise registers
+    // GdkDisplayManager without a full GTK init and the player bridge's later
+    // gtk_init aborts. Harmless no-op on other platforms.
+    if (com.nuvio.app.features.player.desktop.DesktopHostOs.current ==
+        com.nuvio.app.features.player.desktop.DesktopHostOs.LINUX
+    ) {
+        runCatching { com.nuvio.app.features.player.desktop.NativePlayerBridge.initGtkEarly() }
+    }
     configureDesktopFileLogging()
     // Opt-in: dumps raw addon stream payloads so unparsed fields are visible. See
     // StreamPayloadDiagnostics — off by default, since it logs whole stream objects.

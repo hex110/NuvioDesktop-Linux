@@ -139,6 +139,11 @@ internal object NativePlayerBridge {
     external fun toggleStatsOverlay(handle: Long)
     external fun forceVideoRedraw(handle: Long)
 
+    // NUVIO-LINUX: GTK must be initialised on the JVM main thread before
+    // AWT/Skiko partially loads libgdk-3, or the bridge thread's gtk_init
+    // aborts with a GType conflict. No-op off Linux.
+    external fun initGtkEarly(): Boolean
+
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
 
@@ -151,7 +156,13 @@ internal object NativePlayerBridge {
 
     private fun loadNativeLibrary() {
         val platform = DesktopHostOs.current
-        require(platform == DesktopHostOs.MACOS || platform == DesktopHostOs.WINDOWS) {
+        // NUVIO-LINUX: the Linux bridge is built from
+        // src/desktopMain/native/linux/player_bridge.cpp by buildLinuxPlayerBridge.
+        require(
+            platform == DesktopHostOs.MACOS ||
+                platform == DesktopHostOs.WINDOWS ||
+                platform == DesktopHostOs.LINUX
+        ) {
             "Native desktop playback is not implemented for $platform yet."
         }
 

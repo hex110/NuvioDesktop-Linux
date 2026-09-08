@@ -1336,3 +1336,47 @@ compose.desktop {
 }
 
 
+
+// ---- NUVIO-LINUX ----------------------------------------------------------
+// Linux player-bridge build. Kept as one appended block rather than edits
+// threaded through the file above, so a rebase onto a new fork release either
+// applies it cleanly or fails in exactly one place.
+val isLinuxHost = System.getProperty("os.name").contains("linux", ignoreCase = true)
+val linuxPlayerBridgeSource =
+    layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.cpp")
+val linuxPlayerBridgeOutput =
+    layout.buildDirectory.file("native/linux/libplayer_bridge.so")
+
+val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
+    notCompatibleWithConfigurationCache(
+        "Builds a host-local player bridge against gtk3/webkit2gtk-4.1/libmpv."
+    )
+    enabled = isLinuxHost
+    inputs.file(linuxPlayerBridgeSource)
+    outputs.file(linuxPlayerBridgeOutput)
+    commandLine(
+        "bash",
+        rootProject.file("scripts/linux/build-player-bridge.sh").absolutePath,
+        linuxPlayerBridgeSource.asFile.absolutePath,
+        linuxPlayerBridgeOutput.get().asFile.absolutePath,
+    )
+}
+
+if (isLinuxHost) {
+    // NativePlayerBridge.findLocalBuildLibrary() looks in composeApp/build/native/linux,
+    // which is exactly where the task above writes, so `run` needs no extra staging.
+    val linuxNativePlayerTasks = setOf(
+        "run", "runDistributable", "runRelease", "runReleaseDistributable",
+        "createDistributable", "createReleaseDistributable",
+        "packageDeb", "packageReleaseDeb",
+        "packageDistributionForCurrentOS", "packageReleaseDistributionForCurrentOS",
+        "packageUberJarForCurrentOS", "packageReleaseUberJarForCurrentOS",
+    )
+    tasks.matching { it.name in linuxNativePlayerTasks }.configureEach {
+        dependsOn(buildLinuxPlayerBridge)
+    }
+    tasks.withType<Jar>().matching { it.name == "desktopJar" }.configureEach {
+        dependsOn(buildLinuxPlayerBridge)
+        from(linuxPlayerBridgeOutput) { into("native/linux") }
+    }
+}
