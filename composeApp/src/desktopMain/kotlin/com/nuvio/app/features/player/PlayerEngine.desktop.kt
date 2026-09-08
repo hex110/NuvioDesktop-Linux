@@ -68,7 +68,13 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+    // NUVIO-LINUX: without LINUX here every play falls through to the
+    // "Desktop in-app playback is not available yet" placeholder, which is
+    // exactly what a click on play used to produce.
+    if (DesktopHostOs.current == DesktopHostOs.MACOS ||
+        DesktopHostOs.current == DesktopHostOs.WINDOWS ||
+        DesktopHostOs.current == DesktopHostOs.LINUX
+    ) {
         NativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceAudioUrl = sourceAudioUrl,

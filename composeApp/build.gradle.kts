@@ -1226,6 +1226,10 @@ compose.desktop {
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
+            // NUVIO-LINUX: LinuxAwtViewResolver reflects into sun.awt.X11 to read
+            // the AWT canvas's X11 window XID (mpv's "wid"). Without this the
+            // setAccessible call throws InaccessibleObjectException on JDK 17.
+            "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
             // Native-crash diagnostics (chasing the silent, log-less CTD on plugin users —
             // suspected QuickJS/JNI access violation). On an EXCEPTION_ACCESS_VIOLATION the
             // HotSpot handler writes an hs_err_pid<pid>.log naming the faulting native module,
