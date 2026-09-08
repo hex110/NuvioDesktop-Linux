@@ -1363,6 +1363,18 @@ val linuxPlayerBridgeSource =
 val linuxPlayerBridgeOutput =
     layout.buildDirectory.file("native/linux/libplayer_bridge.so")
 
+// jlink bundles whichever JDK runs Gradle. On CachyOS that JDK is compiled for
+// x86-64-v4, so the image it produces dies with SIGILL on any CPU without
+// AVX-512 -- including the 12th-gen laptop this fork is built for, which tops
+// out at v3. Point NUVIO_LINUX_JAVA_HOME at a generic-baseline JDK (Temurin) to
+// get a portable image. CI already runs Temurin, so it needs no override.
+if (System.getProperty("os.name").contains("linux", ignoreCase = true)) {
+    System.getenv("NUVIO_LINUX_JAVA_HOME")?.takeIf(String::isNotBlank)?.let { home ->
+        compose.desktop.application.javaHome = home
+        logger.lifecycle("NUVIO-LINUX: bundling the JDK at $home")
+    }
+}
+
 val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
     notCompatibleWithConfigurationCache(
         "Builds a host-local player bridge against gtk3/webkit2gtk-4.1/libmpv."
