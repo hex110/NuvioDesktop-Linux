@@ -1111,9 +1111,16 @@ mapOf(
         notCompatibleWithConfigurationCache("Rewrites the packaged material-icons-extended jar in the app image.")
         doLast {
             val binariesDir = layout.buildDirectory.dir("compose/binaries/$imageFlavor/app").get().asFile
-            val appDir = listOf("Nuvio/app", "Nuvio.app/Contents/app", "nuvio/lib/app")
-                .map(binariesDir::resolve)
-                .firstOrNull(File::isDirectory)
+            // NUVIO-LINUX: find the image by shape rather than by name. jpackage
+            // derives the directory from the top-level packageName, so hardcoded
+            // names break whenever that or the platform changes.
+            val appDir = binariesDir.listFiles()
+                ?.filter(File::isDirectory)
+                ?.firstNotNullOfOrNull { root ->
+                    listOf("app", "lib/app", "Contents/app")
+                        .map(root::resolve)
+                        .firstOrNull(File::isDirectory)
+                }
             check(appDir != null) { "No packaged app directory found under $binariesDir" }
             trimMaterialIconsExtendedJar(appDir, logger)
             writeAppImageBuildInfo(
@@ -1387,5 +1394,30 @@ if (isLinuxHost) {
     tasks.withType<Jar>().matching { it.name == "desktopJar" }.configureEach {
         dependsOn(buildLinuxPlayerBridge)
         from(linuxPlayerBridgeOutput) { into("native/linux") }
+    }
+
+    // A packaged app has no composeApp/build/native/linux to fall back on, and
+    // release builds must never extract executable code at runtime. Put the
+    // bridge in the image next to the jars, where findPackagedNativeRuntime
+    // looks for it (java.home is <image>/lib/runtime, so this is ../app).
+    mapOf(
+        "createDistributable" to "main",
+        "createReleaseDistributable" to "main-release",
+    ).forEach { (taskName, imageFlavor) ->
+        tasks.matching { it.name == taskName }.configureEach {
+            notCompatibleWithConfigurationCache("Stages the Linux player bridge into the app image.")
+            doLast {
+                val binariesDir = layout.buildDirectory
+                    .dir("compose/binaries/$imageFlavor/app").get().asFile
+                val appDir = binariesDir.listFiles()
+                    ?.filter(File::isDirectory)
+                    ?.firstNotNullOfOrNull { root -> root.resolve("lib/app").takeIf(File::isDirectory) }
+                check(appDir != null) { "Linux app image not found under $binariesDir" }
+                val staged = appDir.resolve("libplayer_bridge.so")
+                linuxPlayerBridgeOutput.get().asFile.copyTo(staged, overwrite = true)
+                check(staged.isFile) { "Failed to stage the player bridge into $appDir" }
+                logger.lifecycle("Staged libplayer_bridge.so into $appDir")
+            }
+        }
     }
 }

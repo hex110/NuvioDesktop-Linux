@@ -15,6 +15,14 @@ internal fun findPackagedNativeRuntime(
     javaHome: File?,
     requiredFiles: List<String>,
 ): File? {
+    // NUVIO-LINUX: a jpackage Linux image puts the JVM at <image>/lib/runtime,
+    // so java.home's parent is <image>/lib and the jars (and our staged bridge)
+    // are in <image>/lib/app.
+    if (platform == DesktopHostOs.LINUX) {
+        val libDir = javaHome?.parentFile?.takeIf { it.isDirectory } ?: return null
+        return listOf(libDir.resolve("app"), libDir)
+            .firstOrNull { dir -> requiredFiles.all { dir.resolve(it).isFile } }
+    }
     if (platform != DesktopHostOs.WINDOWS) return null
     val installDir = javaHome?.parentFile?.takeIf { it.isDirectory } ?: return null
     return installDir.takeIf { dir -> requiredFiles.all { dir.resolve(it).isFile } }
@@ -210,7 +218,13 @@ internal object NativePlayerBridge {
         platformDir: String,
         libraryName: String,
     ): File? {
-        val requiredFiles = listOf(libraryName) + bundledRuntimeResourceNames(platformDir)
+        // NUVIO-LINUX: the runtime index lists Windows DLLs; on Linux the bridge
+        // links against system gtk3/webkit2gtk/libmpv, so only it is required.
+        val requiredFiles = if (platform == DesktopHostOs.LINUX) {
+            listOf(libraryName)
+        } else {
+            listOf(libraryName) + bundledRuntimeResourceNames(platformDir)
+        }
         val javaHome = System.getProperty("java.home")?.takeIf { it.isNotBlank() }?.let(::File)
         return findPackagedNativeRuntime(platform, javaHome, requiredFiles)
     }
