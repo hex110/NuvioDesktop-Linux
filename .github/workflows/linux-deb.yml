@@ -19,6 +19,8 @@ jobs:
   linux_deb:
     name: Linux x64 - DEB
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       # Base64 of a local.properties carrying SUPABASE_URL, SUPABASE_ANON_KEY,
       # INTRODB_API_URL, IMDB_RATINGS_API_BASE_URL, IMDB_TAPFRAME_API_BASE_URL
@@ -105,3 +107,22 @@ jobs:
           name: nuvio-htpc-linux-deb-${{ env.RELEASE_VERSION }}
           path: Nuvio-HTPC-Linux-x86_64-${{ env.RELEASE_VERSION }}.deb
           if-no-files-found: error
+
+      # Tag builds publish, so the package has a stable URL for the PKGBUILD
+      # instead of an Actions artifact that expires and needs authentication.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            "Nuvio-HTPC-Linux-x86_64-${RELEASE_VERSION}.deb" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Linux build of the Nuvio HTPC fork.
+
+          Install on Arch with the PKGBUILD in ~/pkgbuilds/nuvio-htpc-bin, which
+          repackages this .deb; the payload installs to /opt/nuvio-htpc and keeps
+          its data in ~/.config/nuviohtpc, so it coexists with the stock Nuvio."
+
