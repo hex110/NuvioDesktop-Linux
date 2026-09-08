@@ -1222,6 +1222,12 @@ compose.desktop {
         jvmArgs += listOfNotNull(
             "-Dapple.awt.application.appearance=NSAppearanceNameDarkAqua",
             "-Dskiko.renderApi=$skikoRenderApi",
+            // NUVIO-LINUX: keep AWT from loading its own GTK for the Swing L&F and
+            // file dialogs. The player bridge owns the process's GTK via
+            // initGtkEarly, and a second GTK in the same process is the GType
+            // conflict that initGtkEarly exists to avoid. Upstream ships this;
+            // the fork dropped it with the rest of its Linux support.
+            "-Djdk.gtk.version=0",
             "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
