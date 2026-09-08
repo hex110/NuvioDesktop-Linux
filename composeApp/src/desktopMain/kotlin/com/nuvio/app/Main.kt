@@ -369,6 +369,14 @@ private inline fun desktopStartupStep(name: String, block: () -> Unit) {
 }
 
 fun main() {
+    // NUVIO-LINUX: must be the first statement. AWT/Skiko otherwise registers
+    // GdkDisplayManager without a full GTK init and the player bridge's later
+    // gtk_init aborts. Harmless no-op on other platforms.
+    if (com.nuvio.app.features.player.desktop.DesktopHostOs.current ==
+        com.nuvio.app.features.player.desktop.DesktopHostOs.LINUX
+    ) {
+        runCatching { com.nuvio.app.features.player.desktop.NativePlayerBridge.initGtkEarly() }
+    }
     // Before the log file or any store is opened: a second copy of Nuvio sharing the data directory
     // corrupts the log rotation and the image disk cache (see DesktopSingleInstance). The player
     // smoke harness is exempt — it is a deliberate side-by-side dev launch with its own window.
