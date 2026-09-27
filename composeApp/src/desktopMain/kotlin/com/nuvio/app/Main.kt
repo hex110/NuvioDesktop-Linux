@@ -368,6 +368,7 @@ fun main() {
         com.nuvio.app.features.player.desktop.DesktopHostOs.LINUX
     ) {
         runCatching { com.nuvio.app.features.player.desktop.NativePlayerBridge.initGtkEarly() }
+        runCatching { pinLinuxWindowClass() }
     }
     configureDesktopFileLogging()
     // Opt-in: dumps raw addon stream payloads so unparsed fields are visible. See
@@ -850,6 +851,26 @@ fun main() {
     Thread.sleep(400)
     kotlin.system.exitProcess(0)
 }
+
+/**
+ * NUVIO-LINUX: fixes the X11 WM_CLASS to the desktop entry id, `nuvio-htpc`.
+ *
+ * XToolkit names the class after the bottom frame of whichever thread constructs the toolkit.
+ * Something at startup touches AWT from a worker thread before the main thread does, so the
+ * class came out as `java-lang-Thread` -- which matches no desktop entry, so docks showed a generic Java icon and
+ * never grouped the window with a pinned launcher. Constructing the toolkit here, then
+ * overwriting the name, makes it deterministic. Needs --add-opens java.desktop/sun.awt.X11.
+ */
+private fun pinLinuxWindowClass() {
+    val toolkit = Toolkit.getDefaultToolkit()
+    if (toolkit.javaClass.name != "sun.awt.X11.XToolkit") return
+    toolkit.javaClass.getDeclaredField("awtAppClassName").apply {
+        isAccessible = true
+        set(null, LinuxWindowClass)
+    }
+}
+
+private const val LinuxWindowClass = "nuvio-htpc"
 
 /** Cap on the exit-path cache flush: a stuck disk must not stop the app from closing. */
 private const val CACHE_FLUSH_TIMEOUT_MS = 2_000L
