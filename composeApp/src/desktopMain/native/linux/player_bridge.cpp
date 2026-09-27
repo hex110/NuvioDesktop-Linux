@@ -2226,6 +2226,26 @@ JNIEXPORT void JNICALL NP(completeSvpStartupProfile)(JNIEnv *, jobject, jlong) {
 JNIEXPORT void JNICALL NP(setBorderlessFullscreen)(JNIEnv *, jobject, jlong, jboolean) {}
 JNIEXPORT void JNICALL NP(setBorderlessFullscreenSuspended)(JNIEnv *, jobject, jlong, jboolean) {}
 
+// XInput controller polling (fork 1.15.0). XInput is a Windows API; the fork
+// gates gamepad input to Windows (gamepadSupported()), so this is never reached
+// today. Returning 0 means "no slot answered". What Linux users lose: in-app
+// controller navigation -- a pad works only through whatever the desktop maps
+// it to (e.g. Steam Input as keyboard).
+JNIEXPORT jint JNICALL NP(pollGamepads)(JNIEnv *, jobject, jint, jintArray) { return 0; }
+
+// Desktop-wide idle time for the fork's screensaver (Windows GetLastInputInfo).
+// -1 is the documented "could not be read": DesktopScreensaver then sets
+// nativeIdleUnavailable and falls back to AWT input events, and -- because of
+// that same flag -- to window.isActive for isForegroundProcess below. There is
+// no portable equivalent on Wayland (XScreenSaver only sees XWayland clients).
+JNIEXPORT jlong JNICALL NP(systemIdleMs)(JNIEnv *, jobject) { return -1; }
+
+// Whether the foreground window is ours (Windows GetForegroundWindow). Only
+// consulted while systemIdleMs works, which on Linux it never does, so this is
+// unreachable in practice; true matches the "assume focused" behaviour of
+// every build before 1.15.0.
+JNIEXPORT jboolean JNICALL NP(isForegroundProcess)(JNIEnv *, jobject) { return JNI_TRUE; }
+
 // --- deferred: real features, not yet ported ---
 
 // mpv only repaints the wid-embedded surface on a size change while otherwise
