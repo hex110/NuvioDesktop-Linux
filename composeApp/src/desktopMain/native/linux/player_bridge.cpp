@@ -103,6 +103,11 @@ struct Player {
     // also what restores the page after a web-process crash/reload.
     std::string pendingControlsJson;
     std::atomic<bool> firstFrameShown{false};  // gates the loading-screen composite
+    // Arms the one-shot "playbackRestart" event: set on FILE_LOADED, cleared by
+    // the first PLAYBACK_RESTART, so Kotlin hears about the first frame of each
+    // load but not every post-seek restart (Windows-bridge parity). Only
+    // touched on the mpv event thread.
+    bool playbackRestartPendingForFile = false;
     // Keyboard shortcuts render a small feedback toast in the page without
     // revealing the chrome, so they open the composite gate for a bounded
     // window instead of latching overlayActive (nothing would ever close it —
@@ -1481,6 +1486,28 @@ gboolean warmupOnGtk(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+// NUVIO-LINUX: lifecycle events from the mpv event thread to Kotlin. Since
+// fork 1.15.0 PlayerEngine.desktop.kt reports only a loading placeholder
+// (isLoading=true, speed=1) until "playbackRestart" arrives, so without these
+// the app believed every file was still loading: speed steps restarted from
+// 1x, the default speed was never applied, and progress was never recorded.
+// The sink dispatches with SwingUtilities.invokeLater, so this never blocks
+// dispose(), which joins this thread.
+void sendPlayerEvent(Player *player, const char *type) {
+    if (!player->eventSink || !player->eventMethod || !gVm) return;
+    JNIEnv *env = nullptr;
+    bool didAttach = false;
+    if (gVm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (gVm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+        didAttach = true;
+    }
+    jstring jtype = env->NewStringUTF(type);
+    env->CallVoidMethod(player->eventSink, player->eventMethod, jtype, (jdouble)1.0);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (jtype) env->DeleteLocalRef(jtype);
+    if (didAttach) gVm->DetachCurrentThread();
+}
+
 // Drains the mpv event queue so the core keeps running and tracks EOF.
 void runEventLoop(Player *player) {
     while (player->running.load()) {
@@ -1502,9 +1529,19 @@ void runEventLoop(Player *player) {
             case MPV_EVENT_START_FILE:
                 player->ended.store(false);
                 player->firstFrameShown.store(false);  // re-show loading for the new file
+                player->playbackRestartPendingForFile = false;
+                break;
+            case MPV_EVENT_FILE_LOADED:
+                player->playbackRestartPendingForFile = true;
+                sendPlayerEvent(player, "fileLoaded");
                 break;
             case MPV_EVENT_PLAYBACK_RESTART:
                 player->firstFrameShown.store(true);
+                if (player->playbackRestartPendingForFile) {
+                    player->playbackRestartPendingForFile = false;
+                    NUVIO_LOG("event playbackRestart");
+                    sendPlayerEvent(player, "playbackRestart");
+                }
                 break;
             case MPV_EVENT_SHUTDOWN:
                 player->running.store(false);
