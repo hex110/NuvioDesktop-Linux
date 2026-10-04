@@ -1284,6 +1284,8 @@ private fun PlaybackSettingsSection(
                         onSelected = PlayerSettingsRepository::setDesktopSeekThumbnailMode,
                     )
                     SettingsGroupDivider(isTablet = isTablet)
+                    DesktopSeekBufferSettingsRow(isTablet = isTablet) // Seek buffer hook
+                    SettingsGroupDivider(isTablet = isTablet)
                     SettingsSwitchRow(
                         title = stringResource(Res.string.settings_playback_desktop_audio_passthrough),
                         description = stringResource(Res.string.settings_playback_desktop_audio_passthrough_desc),
@@ -1633,6 +1635,13 @@ private fun PlaybackSettingsSection(
                     enabled = otherSubtitleOptionsEnabled,
                     preferredSubtitleLanguage = preferredSubtitleLanguage,
                 )
+                if (isDesktop) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SubtitleFontImportSettingsRow( // Subtitle font import hook
+                        isTablet = isTablet,
+                        enabled = otherSubtitleOptionsEnabled,
+                    )
+                }
                 SettingsGroupDivider(isTablet = isTablet)
                 SettingsMultiSelectRow(
                     title = stringResource(Res.string.settings_playback_reject_subtitle_keywords),

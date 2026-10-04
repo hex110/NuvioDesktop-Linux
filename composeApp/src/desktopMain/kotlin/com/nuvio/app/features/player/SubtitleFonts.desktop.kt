@@ -9,7 +9,20 @@ import java.awt.GraphicsEnvironment
 // names go to mpv, which does its own matching and takes AWT's style variants ("Arial Black",
 // "Calibri Light") as families in their own right. Narrowing this to Skia's typographic families
 // would drop subtitle fonts that work today.
-private val systemSubtitleFontFamilies: List<String> by lazy {
+@Volatile
+private var cachedSubtitleFontFamilies: List<String>? = null
+
+private val systemSubtitleFontFamilies: List<String>
+    get() = cachedSubtitleFontFamilies ?: loadSubtitleFontFamilies().also { cachedSubtitleFontFamilies = it }
+
+/** Re-reads the family list, after a subtitle font import. */
+internal fun refreshSubtitleFontFamilies() {
+    cachedSubtitleFontFamilies = loadSubtitleFontFamilies()
+}
+
+private fun loadSubtitleFontFamilies(): List<String> {
+    // Imported subtitle fonts are not installed system-wide; register them so they are listed.
+    registerImportedSubtitleFonts()
     val families = runCatching {
         GraphicsEnvironment.getLocalGraphicsEnvironment()
             .availableFontFamilyNames
@@ -20,7 +33,7 @@ private val systemSubtitleFontFamilies: List<String> by lazy {
             .sortedBy { it.lowercase() }
             .toList()
     }.getOrDefault(emptyList())
-    listOf("") + families
+    return listOf("") + families
 }
 
 actual fun availableSubtitleFontFamilies(): List<String> = systemSubtitleFontFamilies

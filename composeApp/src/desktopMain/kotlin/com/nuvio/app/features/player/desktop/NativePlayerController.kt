@@ -9,6 +9,10 @@ import com.nuvio.app.features.autosync.DesktopAutoSyncCoordinator
 import com.nuvio.app.features.streams.PlaybackThroughputSampler
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.player.DesktopHudLayout
+import com.nuvio.app.features.player.DesktopSeekBufferPreference
+import com.nuvio.app.features.player.desktopTotalMemoryBytes
+import com.nuvio.app.features.player.subtitleFontsDirectory
+import com.nuvio.app.features.player.desktopSeekBufferMpvOptions
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
 import com.nuvio.app.features.player.PlayerControlAudioTrackItem
 import com.nuvio.app.features.player.PlayerControlBuiltInSubtitleItem
@@ -288,6 +292,20 @@ internal class NativePlayerController(
                 if (isProviderPlaybackEndpoint(sourceUrl) || isExplicitProviderDiagnosticVideoUrl(sourceUrl)) {
                     add("ytdl=no")
                 }
+                if (enableUserMpvOptions) {
+                    // Seek buffer (main player only). Pre-init options; before the user's custom
+                    // options so an explicit demuxer-max-bytes there still wins.
+                    addAll(
+                        desktopSeekBufferMpvOptions(
+                            size = DesktopSeekBufferPreference.current(),
+                            preset = PlayerSettingsRepository.uiState.value.desktopBufferPreset,
+                            sourceUrl = sourceUrl,
+                            totalMemoryBytes = desktopTotalMemoryBytes(),
+                        ),
+                    )
+                }
+                // Imported subtitle fonts (Settings > Playback): libass loads every font in here.
+                subtitleFontsDirectory()?.let { add("sub-fonts-dir=${it.absolutePath}") }
                 if (enableUserMpvOptions) addAll(buildDesktopUserMpvOptions(initialPlaybackSpeed))
                 // An init option rather than a runtime property: mpv filters text subtitles as it
                 // parses them, so it has to be set before the first track loads. Only ever turned
