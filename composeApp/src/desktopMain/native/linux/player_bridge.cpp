@@ -64,6 +64,10 @@ struct Player {
     // list is built on the GTK timer, hence the mutex.
     std::set<std::string> appAddedSubtitleUrls;
     std::mutex appAddedSubtitleUrlsMutex;
+    // Volume as the app sees it, 0..kMaxVolumePercent. Above 100 mpv's own volume stays at 100
+    // and the boost runs in the @nuvioboost filter instead; see applyVolumePercent.
+    double volumePercent = 100.0;
+    double boostGain = 1.0;
     // Seek-bar previews: a second, headless libmpv opened against the same source on its own
     // thread, started by the first request (see requestSeekThumbnail). Ported from the Windows
     // bridge; requests carry a generation so a newer hover supersedes an older one mid-seek.
@@ -929,7 +933,7 @@ gboolean pushPlayerUpdate(gpointer data) {
     }
     double duration = mpvGetDouble(player->mpv, "duration");
     double position = mpvGetDouble(player->mpv, "time-pos");
-    double volumeLevel = mpvGetDouble(player->mpv, "volume") / 100.0;
+    double volumeLevel = player->volumePercent / 100.0;
     volumeLevel = std::max(0.0, std::min(kMaxVolumePercent / 100.0, volumeLevel));
     bool paused = mpvGetFlag(player->mpv, "pause");
     bool loading = playerLoading(player);
@@ -2043,29 +2047,49 @@ JNIEXPORT void JNICALL NP(setSpeed)(JNIEnv *, jobject, jlong handle, jfloat spee
     if (p) mpvSetDouble(p->mpv, "speed", speed);
 }
 
-JNIEXPORT void JNICALL NP(setVolume)(JNIEnv *, jobject, jlong handle, jfloat level) {
-    Player *p = asPlayer(handle);
-    if (!p) return;
-    double next = level * 100.0;
-    if (next < 0) next = 0;
-    if (next > kMaxVolumePercent) next = kMaxVolumePercent;
-    mpvSetDouble(p->mpv, "volume", next);
+// Volume boost above 100%. mpv applies its software volume after the whole
+// filter chain, so a limiter in "af" never sees the boost and loud peaks clip.
+// Above 100 the boost therefore moves into the chain: mpv's volume stays at 100
+// and @nuvioboost applies the same cubic gain mpv would ((v/100)^3), followed by
+// a limiter just under full scale. Replacing a labelled filter is how the gain
+// changes (af-command does not reach lavfi graphs in mpv 0.41).
+void applyVolumePercent(Player *p, double percent) {
+    percent = std::max(0.0, std::min(kMaxVolumePercent, percent));
+    p->volumePercent = percent;
+    double gain = percent > 100.0 ? std::pow(percent / 100.0, 3.0) : 1.0;
+    if (gain > 1.0 && std::fabs(gain - p->boostGain) > 1e-3) {
+        char filter[160];
+        snprintf(filter, sizeof(filter),
+                 "@nuvioboost:lavfi=[volume=volume=%.4f:precision=float,"
+                 "alimiter=limit=0.97:level=disabled]", gain);
+        const char *cmd[] = {"af", "add", filter, nullptr};
+        if (mpv_command(p->mpv, cmd) >= 0) p->boostGain = gain;
+    }
+    mpvSetDouble(p->mpv, "volume", std::min(percent, 100.0));
+    if (gain == 1.0 && p->boostGain != 1.0) {
+        const char *cmd[] = {"af", "remove", "@nuvioboost", nullptr};
+        mpv_command(p->mpv, cmd);
+        p->boostGain = 1.0;
+    }
 }
 
-JNIEXPORT void JNICALL NP(adjustVolume)(JNIEnv *, jobject, jlong handle, jfloat delta) {
+// Volume crosses JNI as percent (0..kMaxVolumePercent), as on Windows:
+// NativePlayerController scales its 0..2 fraction by 100 before calling in.
+// (This bridge used to multiply by 100 again, which pinned any volume >= 2% at 200%.)
+JNIEXPORT void JNICALL NP(setVolume)(JNIEnv *, jobject, jlong handle, jfloat percent) {
     Player *p = asPlayer(handle);
-    if (!p) return;
-    double current = mpvGetDouble(p->mpv, "volume");
-    double next = current + delta * 100.0;
-    if (next < 0) next = 0;
-    if (next > kMaxVolumePercent) next = kMaxVolumePercent;
-    mpvSetDouble(p->mpv, "volume", next);
+    if (p) applyVolumePercent(p, percent);
+}
+
+JNIEXPORT void JNICALL NP(adjustVolume)(JNIEnv *, jobject, jlong handle, jfloat deltaPercent) {
+    Player *p = asPlayer(handle);
+    if (p) applyVolumePercent(p, p->volumePercent + deltaPercent);
 }
 
 JNIEXPORT jfloat JNICALL NP(volume)(JNIEnv *, jobject, jlong handle) {
     Player *p = asPlayer(handle);
     if (!p) return 0.0f;
-    return static_cast<jfloat>(mpvGetDouble(p->mpv, "volume") / 100.0);
+    return static_cast<jfloat>(p->volumePercent);
 }
 
 JNIEXPORT jlong JNICALL NP(durationMs)(JNIEnv *, jobject, jlong handle) {
