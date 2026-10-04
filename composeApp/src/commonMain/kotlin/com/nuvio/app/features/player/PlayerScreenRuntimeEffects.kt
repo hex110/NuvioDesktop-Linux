@@ -445,6 +445,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     BindPlayerUiVisibilityEffects()
+    BindAutoSyncRuntimeEffects() // AutoSync hook
     BindPlayerMetadataAndSkipEffects()
     BindDiscordRichPresenceEffect()
     BindLightsEffect()

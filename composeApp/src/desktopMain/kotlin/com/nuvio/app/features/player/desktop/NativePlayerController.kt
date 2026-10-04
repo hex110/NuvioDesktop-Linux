@@ -2,6 +2,10 @@ package com.nuvio.app.features.player.desktop
 
 import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
+import com.nuvio.app.features.autosync.AutoSyncCandidateScope
+import com.nuvio.app.features.autosync.AutoSyncPlayerController
+import com.nuvio.app.features.autosync.AutoSyncSubtitleCandidate
+import com.nuvio.app.features.autosync.DesktopAutoSyncCoordinator
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.player.DesktopHudLayout
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
@@ -82,7 +86,7 @@ internal const val TRAILER_AUDIO_NORMALIZATION_FILTER = "dynaudnorm=f=150:g=15"
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
-) : PlayerEngineController {
+) : PlayerEngineController, AutoSyncPlayerController {
     private var diagnosticsOverlayEnabled = false
     private data class AnimeShaderChoice(
         val mode: DesktopAnimeMode,
@@ -163,6 +167,21 @@ internal class NativePlayerController(
     private var onEvent: (String, Double) -> Boolean = { _, _ -> false }
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
+    private val autoSync = DesktopAutoSyncCoordinator(
+        currentSource = { pendingSource?.let { it.sourceUrl to it.headerLines.toHeaderMap() } },
+        attachSubtitle = ::attachSubtitleNow,
+        replaceSubtitles = { path ->
+            handle.takeIf { it != 0L }?.let { current ->
+                NativePlayerBridge.clearExternalSubtitles(current)
+                NativePlayerBridge.addSubtitleUrl(current, path)
+                applyPendingSubtitleConfiguration(current)
+            }
+        },
+        setPlayerSubtitleDelayMs = ::setSubtitleDelayMs,
+        // Upstream shows Android toasts; the HUD's message pill is the desktop equivalent.
+        showMessage = { message -> showTransientMessage("Auto Sync", message) },
+    )
+
     fun attach(
         sourceUrl: String,
         sourceAudioUrl: String?,
@@ -193,6 +212,7 @@ internal class NativePlayerController(
         restoreVolume: Boolean = false,
     ) {
         if (disposed) return
+        if (pendingSource?.sourceUrl != sourceUrl) autoSync.onSourceChanged()
         // Re-attaching the same stream (surface recreation, RTX/settings toggles) must resume
         // from where playback currently is — restarting at the original initialPositionMs
         // looks like playback randomly jumping back. New sources keep the caller's position.
@@ -1187,6 +1207,7 @@ internal class NativePlayerController(
 
     fun dispose() {
         disposed = true
+        autoSync.dispose()
         attachGeneration.incrementAndGet()
         pendingSource = null
         host.onPeerReady = null
@@ -1416,6 +1437,7 @@ internal class NativePlayerController(
     }
 
     override fun selectSubtitleTrack(index: Int): Boolean {
+        autoSync.onSubtitleCleared()
         val current = handle.takeIf { it != 0L } ?: return false
         if (index < 0) {
             return NativePlayerBridge.selectSubtitleTrack(current, -1)
@@ -1445,18 +1467,36 @@ internal class NativePlayerController(
         }.getOrDefault(emptyList())
     }
 
-    override fun setSubtitleUri(url: String) {
+    override fun setSubtitleUri(url: String) = autoSync.attachWithoutAutoSync(url)
+
+    private fun attachSubtitleNow(url: String) {
         handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.addSubtitleUrl(current, url)
             applyPendingSubtitleConfiguration(current)
         }
     }
 
+    override fun setSubtitleUriWithAutoSync(url: String) =
+        autoSync.start(url, AutoSyncCandidateScope.STARTUP_SEARCH)
+
+    override fun setSubtitleUriWithSelectedAutoSync(url: String) =
+        autoSync.start(url, AutoSyncCandidateScope.SELECTED_ONLY)
+
+    override fun setAutoSyncSubtitleCandidates(candidates: List<AutoSyncSubtitleCandidate>) =
+        autoSync.setCandidates(candidates)
+
+    override fun setAutoSyncAppliedListener(listener: ((subtitleUrl: String, delayMs: Int) -> Unit)?) =
+        autoSync.setAppliedListener(listener)
+
+    override fun cancelForManualSubtitleDelay() = autoSync.cancel()
+
     override fun clearExternalSubtitle() {
+        autoSync.onSubtitleCleared()
         handle.takeIf { it != 0L }?.let(NativePlayerBridge::clearExternalSubtitles)
     }
 
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
+        autoSync.onSubtitleCleared()
         val current = handle.takeIf { it != 0L } ?: return
         val trackId = if (trackIndex < 0) {
             -1

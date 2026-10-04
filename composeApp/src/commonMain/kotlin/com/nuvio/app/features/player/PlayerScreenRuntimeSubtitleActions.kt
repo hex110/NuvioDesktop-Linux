@@ -12,6 +12,7 @@ internal fun PlayerScreenRuntime.fetchAddonSubtitlesForActiveItem(): Job? {
 
 internal fun PlayerScreenRuntime.setSubtitleDelay(delayMs: Int) {
     val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
+    cancelAutoSyncForManualDelay() // AutoSync hook
     subtitleDelayMs = clamped
     PlayerTrackPreferenceStorage.saveSubtitleDelayMs(playbackSession.videoId, clamped)
     playerController?.setSubtitleDelayMs(clamped)

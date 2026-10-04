@@ -1628,6 +1628,12 @@ private fun PlaybackSettingsSection(
                     onCheckedChange = PlayerSettingsRepository::setPreferAddonSubtitles,
                 )
                 SettingsGroupDivider(isTablet = isTablet)
+                AutoSyncPlaybackSettingsRows( // AutoSync hook
+                    isTablet = isTablet,
+                    enabled = otherSubtitleOptionsEnabled,
+                    preferredSubtitleLanguage = preferredSubtitleLanguage,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
                 SettingsMultiSelectRow(
                     title = stringResource(Res.string.settings_playback_reject_subtitle_keywords),
                     description = stringResource(Res.string.settings_playback_reject_subtitle_keywords_description),

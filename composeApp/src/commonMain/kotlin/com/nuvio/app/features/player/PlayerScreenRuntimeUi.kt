@@ -1248,7 +1248,7 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             useCustomSubtitles = true
             markSubtitleChosenByViewer()
             persistAddonSubtitlePreference(addon)
-            playerController?.setSubtitleUri(addon.url)
+            attachChosenAddonSubtitle(addon.url) // AutoSync hook
             secondarySubtitleSelectionApplied = false
             applySecondarySubtitleSelectionIfNeeded()
         }
@@ -2149,7 +2149,7 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
             useCustomSubtitles = true
             markSubtitleChosenByViewer()
             persistAddonSubtitlePreference(addon)
-            playerController?.setSubtitleUri(addon.url)
+            attachChosenAddonSubtitle(addon.url) // AutoSync hook
             secondarySubtitleSelectionApplied = false
             applySecondarySubtitleSelectionIfNeeded()
         },

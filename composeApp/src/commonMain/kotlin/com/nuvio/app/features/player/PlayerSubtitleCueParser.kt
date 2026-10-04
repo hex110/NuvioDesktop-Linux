@@ -30,7 +30,7 @@ object PlayerSubtitleCueParser {
                 val body = lines.drop(timingIndex + 1)
                     .joinToString(" ")
                     .cleanSubtitleCueText()
-                if (body.isBlank()) null else SubtitleSyncCue(start, body)
+                if (body.isBlank()) null else SubtitleSyncCue(startTimeMs = start, text = body)
             }
             .sortedBy { it.startTimeMs }
 
@@ -49,7 +49,7 @@ object PlayerSubtitleCueParser {
                 val body = lines.drop(timingIndex + 1)
                     .joinToString(" ")
                     .cleanSubtitleCueText()
-                if (body.isBlank()) null else SubtitleSyncCue(start, body)
+                if (body.isBlank()) null else SubtitleSyncCue(startTimeMs = start, text = body)
             }
             .sortedBy { it.startTimeMs }
 

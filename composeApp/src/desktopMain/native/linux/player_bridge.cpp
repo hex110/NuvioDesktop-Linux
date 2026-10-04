@@ -55,6 +55,13 @@ constexpr double kMaxVolumePercent = 200.0;
 
 struct Player {
     mpv_handle *mpv = nullptr;
+    // Subtitle URLs/paths the app added through addSubtitleUrl (addon subtitles and AutoSync's
+    // retimed copies). mpv lists these as external tracks alongside its own sibling-file
+    // autoloads; only the app-added ones are kept out of the built-in list and removed by
+    // clearExternalSubtitles, as on Windows. addSubtitleUrl runs on the UI thread and the track
+    // list is built on the GTK timer, hence the mutex.
+    std::set<std::string> appAddedSubtitleUrls;
+    std::mutex appAddedSubtitleUrlsMutex;
     std::thread eventThread;
     std::atomic<bool> running{false};
     std::atomic<bool> ended{false};
@@ -806,7 +813,15 @@ std::string mpvGetStr(mpv_handle *mpv, const std::string &name) {
 // NativeMpvTrack decoder expect (macOS parity — mirrors tracksJsonForType):
 // [{"index":N,"id":"..","label":"..","language":"..","selected":bool,"forced":bool}]
 // (raw mpv track-list JSON does NOT match: id is an int, no index/label, lang!=language.)
-std::string buildTracksJson(mpv_handle *mpv, const char *wantedType) {
+bool isAppAddedSubtitle(Player *owner, mpv_handle *mpv, const std::string &trackPrefix) {
+    if (!owner || !mpvGetFlag(mpv, (trackPrefix + "/external").c_str())) return false;
+    std::string filename = mpvGetStr(mpv, trackPrefix + "/external-filename");
+    if (filename.empty()) return false;
+    std::lock_guard<std::mutex> lock(owner->appAddedSubtitleUrlsMutex);
+    return owner->appAddedSubtitleUrls.count(filename) > 0;
+}
+
+std::string buildTracksJson(mpv_handle *mpv, const char *wantedType, Player *owner = nullptr) {
     if (!mpv) return "[]";
     int64_t count = mpvGetInt(mpv, "track-list/count");
     bool isSub = std::string(wantedType) == "sub";
@@ -817,6 +832,9 @@ std::string buildTracksJson(mpv_handle *mpv, const char *wantedType) {
     for (int64_t i = 0; i < count; i++) {
         std::string pfx = "track-list/" + std::to_string(i);
         if (mpvGetStr(mpv, pfx + "/type") != wantedType) continue;
+        // App-added subtitles have the addon list; showing them here as well made a selected
+        // addon subtitle appear twice, once as a phantom built-in track.
+        if (isSub && isAppAddedSubtitle(owner, mpv, pfx)) continue;
         int64_t id = mpvGetInt(mpv, (pfx + "/id").c_str());
         std::string title = mpvGetStr(mpv, pfx + "/title");
         std::string lang = mpvGetStr(mpv, pfx + "/lang");
@@ -903,7 +921,7 @@ gboolean pushPlayerUpdate(gpointer data) {
     bool paused = mpvGetFlag(player->mpv, "pause");
     bool loading = playerLoading(player);
     std::string audioTracks = buildTracksJson(player->mpv, "audio");
-    std::string subtitleTracks = buildTracksJson(player->mpv, "sub");
+    std::string subtitleTracks = buildTracksJson(player->mpv, "sub", player);
     char head[224];
     snprintf(head, sizeof(head),
              "window.playerUpdate&&window.playerUpdate({duration:%0.3f,position:%0.3f,volumeLevel:%0.3f,paused:%s,loading:%s,audioTracks:",
@@ -1973,7 +1991,7 @@ JNIEXPORT jstring JNICALL NP(audioTracksJson)(JNIEnv *env, jobject, jlong handle
 JNIEXPORT jstring JNICALL NP(subtitleTracksJson)(JNIEnv *env, jobject, jlong handle) {
     Player *p = asPlayer(handle);
     if (!p) return utf8ToJstring(env, "[]");
-    return utf8ToJstring(env, buildTracksJson(p->mpv, "sub"));
+    return utf8ToJstring(env, buildTracksJson(p->mpv, "sub", p));
 }
 
 JNIEXPORT jboolean JNICALL NP(selectAudioTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
@@ -1998,22 +2016,39 @@ JNIEXPORT void JNICALL NP(addSubtitleUrl)(JNIEnv *env, jobject, jlong handle, js
     Player *p = asPlayer(handle);
     if (!p) return;
     std::string sub = jstringToUtf8(env, url);
+    {
+        std::lock_guard<std::mutex> lock(p->appAddedSubtitleUrlsMutex);
+        p->appAddedSubtitleUrls.insert(sub);
+    }
     const char *cmd[] = {"sub-add", sub.c_str(), "select", nullptr};
     mpv_command(p->mpv, cmd);
+}
+
+// Removes every subtitle the app added, not just the selected one: a bare "sub-remove" left the
+// earlier addon subtitles (and AutoSync's retimed copies) loaded in mpv for the whole session.
+void removeAppAddedSubtitles(Player *p) {
+    int64_t count = mpvGetInt(p->mpv, "track-list/count");
+    for (int64_t i = count - 1; i >= 0; i--) {
+        std::string pfx = "track-list/" + std::to_string(i);
+        if (mpvGetStr(p->mpv, pfx + "/type") != "sub" || !isAppAddedSubtitle(p, p->mpv, pfx)) continue;
+        std::string id = std::to_string(mpvGetInt(p->mpv, (pfx + "/id").c_str()));
+        const char *cmd[] = {"sub-remove", id.c_str(), nullptr};
+        mpv_command(p->mpv, cmd);
+    }
+    std::lock_guard<std::mutex> lock(p->appAddedSubtitleUrlsMutex);
+    p->appAddedSubtitleUrls.clear();
 }
 
 JNIEXPORT void JNICALL NP(clearExternalSubtitles)(JNIEnv *, jobject, jlong handle) {
     Player *p = asPlayer(handle);
     if (!p) return;
-    const char *cmd[] = {"sub-remove", nullptr};
-    mpv_command(p->mpv, cmd);
+    removeAppAddedSubtitles(p);
 }
 
 JNIEXPORT void JNICALL NP(clearExternalSubtitlesAndSelect)(JNIEnv *, jobject, jlong handle, jint trackId) {
     Player *p = asPlayer(handle);
     if (!p) return;
-    const char *cmd[] = {"sub-remove", nullptr};
-    mpv_command(p->mpv, cmd);
+    removeAppAddedSubtitles(p);
     int64_t id = trackId;
     if (trackId < 0) mpv_set_property_string(p->mpv, "sid", "no");
     else mpv_set_property(p->mpv, "sid", MPV_FORMAT_INT64, &id);
