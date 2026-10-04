@@ -60,6 +60,8 @@ internal object NativePlayerBridge {
     external fun updateControls(handle: Long, controlsJson: String)
     external fun runJavaScript(handle: Long, script: String)
     external fun requestSeekThumbnail(handle: Long, positionMs: Long)
+    /** Linux bridge only (connection-speed sampling); other bridges throw UnsatisfiedLinkError. */
+    external fun downloadRateBytesPerSecond(handle: Long): Long
     external fun setCursorHidden(handle: Long, hidden: Boolean)
     external fun setPaused(handle: Long, paused: Boolean)
 

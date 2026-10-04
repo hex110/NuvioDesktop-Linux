@@ -181,6 +181,13 @@ object StreamsRepository {
         val playerSettings = PlayerSettingsRepository.uiState.value
         val debridSettings = DebridSettingsRepository.snapshot()
         val streamBadgeRules = StreamBadgeSettingsRepository.snapshot()
+        val connectionFit = StreamConnectionFit.capture( // Connection-fit hook
+            type = type,
+            videoId = effectiveVideoId,
+            parentMetaId = parentMetaId,
+            season = effectiveSeason,
+            episode = effectiveEpisode,
+        )
         currentCoroutineContext().ensureActive()
         PlaybackStartTrace.markPendingOrActive("streamsPrepare:settings")
         val localStreams = MetaDetailsRepository.findLocalStreams(effectiveVideoId)
@@ -449,10 +456,11 @@ object StreamsRepository {
                     groups = listOf(group),
                     rules = streamBadgeRules,
                 ).firstOrNull() ?: group
-                return DebridStreamPresentation.apply(
+                val presentedGroup = DebridStreamPresentation.apply(
                     groups = listOf(badgeGroup),
                     settings = debridSettings,
                 ).firstOrNull() ?: badgeGroup
+                return connectionFit?.apply(presentedGroup) ?: presentedGroup
             }
 
             fun publishAddonGroup(group: AddonStreamGroup) {
@@ -795,6 +803,7 @@ object StreamsRepository {
                                             group.streams
                                         } else {
                                             (group.streams + completion.streams).sortedForGroupedDisplay()
+                                                .let { streams -> connectionFit?.apply(streams) ?: streams }
                                         }
                                         val stillLoading = remaining > 0
                                         val finalError = if (mergedStreams.isEmpty() && !stillLoading) {

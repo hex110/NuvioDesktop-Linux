@@ -185,6 +185,8 @@ internal fun LazyListScope.streamsSettingsContent(
                     modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("stream-addon-logo")),
                     onCheckedChange = StreamBadgeSettingsRepository::setShowAddonLogo,
                 )
+                SettingsGroupDivider(isTablet = isTablet)
+                ConnectionFitSettingsRow(isTablet = isTablet) // Connection-fit hook
             }
         }
 

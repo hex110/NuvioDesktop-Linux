@@ -8,6 +8,7 @@ import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.debrid.DebridSettingsRepository
 import com.nuvio.app.features.debrid.DebridStreamPresentation
+import com.nuvio.app.features.streams.StreamConnectionFit
 import com.nuvio.app.features.streams.StreamScoreContexts
 import com.nuvio.app.features.streams.StreamScoreRepository
 import com.nuvio.app.features.streams.StreamScoring
@@ -192,6 +193,13 @@ object PlayerStreamsRepository {
         stateFlow.value = StreamsUiState()
 
         val streamBadgeRules = StreamBadgeSettingsRepository.snapshot()
+        val connectionFit = StreamConnectionFit.capture( // Connection-fit hook
+            type = type,
+            videoId = effectiveVideoId,
+            parentMetaId = parentMetaId,
+            season = effectiveSeason,
+            episode = effectiveEpisode,
+        )
         // Same key shape and same forced-refresh rule as StreamsRepository, so a background search
         // serves both. forceRefresh must keep bypassing this: next-episode auto-play forces a
         // refresh on purpose, having once stalled on a reused terminal-empty result.
@@ -395,7 +403,7 @@ object PlayerStreamsRepository {
                             contentType = type,
                         ),
                     ),
-                ).firstOrNull() ?: badgeGroup
+                ).firstOrNull()?.let { presented -> connectionFit?.apply(presented) ?: presented } ?: badgeGroup
             }
 
             fun publishStreamGroup(group: AddonStreamGroup) {
@@ -623,6 +631,7 @@ object PlayerStreamsRepository {
                                             group.streams
                                         } else {
                                             (group.streams + completion.streams).sortedForGroupedDisplay()
+                                                .let { streams -> connectionFit?.apply(streams) ?: streams }
                                         }
                                         val stillLoading = remaining > 0
                                         val finalError = if (mergedStreams.isEmpty() && !stillLoading) {

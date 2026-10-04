@@ -2089,6 +2089,17 @@ JNIEXPORT jlong JNICALL NP(bufferedPositionMs)(JNIEnv *, jobject, jlong handle) 
     return static_cast<jlong>(buffered * 1000.0);
 }
 
+// Network input rate while the demuxer is actually fetching, else -1. Feeds the
+// connection-speed estimate that ranks streams; a full (idle) cache says nothing
+// about the connection, so it reads as "not fetching". Linux-only so far: the
+// Kotlin caller tolerates a missing symbol on the other bridges.
+JNIEXPORT jlong JNICALL NP(downloadRateBytesPerSecond)(JNIEnv *, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p || !p->mpv) return -1;
+    if (mpvGetFlag(p->mpv, "demuxer-cache-idle")) return -1;
+    return static_cast<jlong>(mpvGetInt(p->mpv, "cache-speed"));
+}
+
 JNIEXPORT jboolean JNICALL NP(isLoading)(JNIEnv *, jobject, jlong handle) {
     Player *p = asPlayer(handle);
     if (!p) return JNI_TRUE;

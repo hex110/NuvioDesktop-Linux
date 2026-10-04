@@ -6,6 +6,7 @@ import com.nuvio.app.features.autosync.AutoSyncCandidateScope
 import com.nuvio.app.features.autosync.AutoSyncPlayerController
 import com.nuvio.app.features.autosync.AutoSyncSubtitleCandidate
 import com.nuvio.app.features.autosync.DesktopAutoSyncCoordinator
+import com.nuvio.app.features.streams.PlaybackThroughputSampler
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.player.DesktopHudLayout
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
@@ -182,6 +183,29 @@ internal class NativePlayerController(
         showMessage = { message -> showTransientMessage("Auto Sync", message) },
     )
 
+    // Learns the connection's real throughput from main-player playback, for stream ranking
+    // (StreamConnectionFit). One sampler per source; it reports once and then goes quiet.
+    private var throughputSampler: PlaybackThroughputSampler? = null
+    @Volatile
+    private var downloadRateAvailable = true
+
+    private fun sampleThroughput(current: Long) {
+        val sampler = throughputSampler ?: return
+        if (!downloadRateAvailable) return
+        val rate = try {
+            NativePlayerBridge.downloadRateBytesPerSecond(current)
+        } catch (_: UnsatisfiedLinkError) {
+            downloadRateAvailable = false
+            return
+        }
+        sampler.onRateTick(bytesPerSecond = rate.coerceAtLeast(0L), isFetching = rate >= 0L)
+    }
+
+    private fun finishThroughputSample() {
+        throughputSampler?.finish()
+        throughputSampler = null
+    }
+
     fun attach(
         sourceUrl: String,
         sourceAudioUrl: String?,
@@ -212,7 +236,12 @@ internal class NativePlayerController(
         restoreVolume: Boolean = false,
     ) {
         if (disposed) return
-        if (pendingSource?.sourceUrl != sourceUrl) autoSync.onSourceChanged()
+        if (pendingSource?.sourceUrl != sourceUrl) {
+            autoSync.onSourceChanged()
+            finishThroughputSample()
+            // tracePlaybackStart marks the main player; hero trailers must not count.
+            if (tracePlaybackStart) throughputSampler = PlaybackThroughputSampler(sourceUrl)
+        }
         // Re-attaching the same stream (surface recreation, RTX/settings toggles) must resume
         // from where playback currently is — restarting at the original initialPositionMs
         // looks like playback randomly jumping back. New sources keep the caller's position.
@@ -1186,6 +1215,7 @@ internal class NativePlayerController(
             val isPaused = NativePlayerBridge.isPaused(current)
             val positionMs = NativePlayerBridge.positionMs(current)
             val bufferedPositionMs = NativePlayerBridge.bufferedPositionMs(current)
+            sampleThroughput(current)
             updateMeteredPrefetchFreeze(
                 isPaused = isPaused,
                 isLoading = isLoading,
@@ -1208,6 +1238,7 @@ internal class NativePlayerController(
     fun dispose() {
         disposed = true
         autoSync.dispose()
+        finishThroughputSample()
         attachGeneration.incrementAndGet()
         pendingSource = null
         host.onPeerReady = null
