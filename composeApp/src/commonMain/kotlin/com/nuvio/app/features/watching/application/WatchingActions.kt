@@ -8,6 +8,7 @@ import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.effectiveEpisodeNumber
 import com.nuvio.app.features.details.effectiveSeasonNumber
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.ratings.EpisodeRatingsRepository
 import com.nuvio.app.features.watched.WatchedItem
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watched.episodePlaybackIds
@@ -184,6 +185,23 @@ object WatchingActions {
         // reconstructed out of a remote snapshot. Only the former should ask for a rating.
         if (!syncRemote) return
         SimklRewatchRepository.onPlaybackCompleted(entry)
+
+        // ARI: queue the local per-episode rating prompt. Independent of the provider-backed
+        // finale prompt below -- this one is stored locally, so it still records a rating with
+        // no tracking service connected, and it fires for every episode rather than finales.
+        val ratedSeason = entry.seasonNumber
+        val ratedEpisode = entry.episodeNumber
+        if (entry.isEpisode && ratedSeason != null && ratedEpisode != null) {
+            EpisodeRatingsRepository.enqueuePrompt(
+                metaId = entry.parentMetaId,
+                metaType = entry.parentMetaType,
+                showName = resolvedName,
+                season = ratedSeason,
+                episode = ratedEpisode,
+                completedAtEpochMs = entry.lastUpdatedEpochMs,
+            )
+        }
+
         if (!entry.isEpisode) {
             offerRatingPrompt(
                 contentId = entry.parentMetaId,

@@ -17,6 +17,7 @@ import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.plugins.PluginRepository
 import com.nuvio.app.features.player.SubtitleRepository
 import com.nuvio.app.features.profiles.ProfileRepository
+import com.nuvio.app.features.ratings.EpisodeRatingsRepository
 import com.nuvio.app.features.search.SearchRepository
 import com.nuvio.app.features.settings.ThemeSettingsRepository
 import com.nuvio.app.features.streams.StreamContextStore
@@ -47,6 +48,7 @@ internal object LocalAccountDataCleaner {
         LibraryRepository.clearLocalState()
         WatchProgressRepository.clearLocalState()
         WatchedRepository.clearLocalState()
+        EpisodeRatingsRepository.clearLocalState()
         ContinueWatchingPreferencesRepository.clearLocalState()
         EpisodeReleaseNotificationsRepository.clearLocalState()
         CollectionMobileSettingsRepository.clearLocalState()

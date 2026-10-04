@@ -34,6 +34,7 @@ import com.nuvio.app.features.settings.ThemeSettingsRepository
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
 import com.nuvio.app.features.streams.StreamScoreRepository
 import com.nuvio.app.features.tracking.CalendarSourceRepository
+import com.nuvio.app.features.ratings.EpisodeRatingsRepository
 import com.nuvio.app.features.tracking.RatingPromptRepository
 import com.nuvio.app.features.tracking.ContinueWatchingSourceRepository
 import com.nuvio.app.features.tracking.LibrarySourceRepository
@@ -259,6 +260,7 @@ object ProfileRepository {
         ContinueWatchingSourceRepository.onProfileChanged()
         LibrarySourceRepository.onProfileChanged()
         RatingPromptRepository.onProfileChanged()
+        EpisodeRatingsRepository.onProfileChanged(profileIndex)
         SearchHistoryRepository.onProfileChanged()
         CollectionRepository.onProfileChanged()
         com.nuvio.app.features.playlist.PlaylistRepository.onProfileChanged()

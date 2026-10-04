@@ -1501,6 +1501,9 @@
     <string name="rating_prompt_season_finale_body">That was the season finale. Rate the show on %1$s.</string>
     <string name="rating_prompt_series_finale_body">That was the series finale. Rate the show on %1$s.</string>
     <string name="rating_prompt_not_now">Not now</string>
+    <!-- ARI: per-episode local rating prompt + Reddit discussion link -->
+    <string name="rating_prompt_episode_body">Season %1$d · Episode %2$d</string>
+    <string name="rating_prompt_find_discussion">Find the Reddit discussion</string>
     <string name="settings_rating_prompt_title">Ask me to rate after a finale</string>
     <string name="settings_rating_prompt_description">Prompts to review on your chosen library service.</string>
     <string name="settings_rating_prompt_unavailable">Set Library source to MDBList, SIMKL or Floppy and connect it to enable ratings.</string>

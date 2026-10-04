@@ -384,7 +384,9 @@ import com.nuvio.app.features.simkl.SimklRatingWriter
 import com.nuvio.app.features.tracking.CalendarSourceRepository
 import com.nuvio.app.features.tracking.ContinueWatchingSource
 import com.nuvio.app.features.tracking.ContinueWatchingSourceRepository
+import com.nuvio.app.features.ratings.EpisodeRatingPromptHost
 import com.nuvio.app.features.tracking.RatingPromptHost
+import com.nuvio.app.features.tracking.isProviderRatingPromptVisible
 import com.nuvio.app.features.tracking.RatingPromptRepository
 import com.nuvio.app.features.tracking.LibrarySourceRepository
 import com.nuvio.app.features.tracking.migratedCalendarSource
@@ -5192,9 +5194,17 @@ private fun MainAppContent(
 
             // Held back while the player is on screen: the prompt is queued the moment a title
             // finishes, which during a binge is mid auto-play into the next episode.
-            RatingPromptHost(
-                isSuppressed = currentBackStackEntry?.destination?.hasRoute<PlayerRoute>() == true ||
-                    streamPickerRequest != null,
+            val isPlaybackRouteActive =
+                currentBackStackEntry?.destination?.hasRoute<PlayerRoute>() == true ||
+                    streamPickerRequest != null
+            RatingPromptHost(isSuppressed = isPlaybackRouteActive)
+
+            // ARI: the local per-episode prompt. Queued behind the provider-backed prompt above so
+            // finishing a season finale asks about the season first and the episode after, rather
+            // than stacking both dialogs at once.
+            EpisodeRatingPromptHost(
+                isSuppressed = isPlaybackRouteActive ||
+                    isProviderRatingPromptVisible(isPlaybackRouteActive),
             )
 
             NuvioToastHost(

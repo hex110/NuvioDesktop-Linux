@@ -47,6 +47,7 @@ import nuvio.composeapp.generated.resources.action_cancel
 import nuvio.composeapp.generated.resources.details_rating_clear
 import nuvio.composeapp.generated.resources.details_rating_high_score
 import nuvio.composeapp.generated.resources.details_rating_low_score
+import nuvio.composeapp.generated.resources.rating_prompt_find_discussion
 import org.jetbrains.compose.resources.stringResource
 
 private val RatingAccent = Color(0xFFF2B84B)
@@ -74,6 +75,9 @@ fun TrackingRatingDialog(
     onDismiss: () -> Unit,
     onClear: (() -> Unit)? = null,
     dismissLabel: String? = null,
+    // ARI: optional link out to the episode/title's Reddit thread. Null keeps the dialog
+    // exactly as it was for call sites that have nothing to link to.
+    onFindDiscussion: (() -> Unit)? = null,
 ) {
     if (!visible) return
 
@@ -193,6 +197,20 @@ fun TrackingRatingDialog(
                                 color = RatingAccent,
                                 style = MaterialTheme.typography.bodySmall,
                             )
+                        }
+
+                        if (onFindDiscussion != null) {
+                            Spacer(Modifier.height(12.dp))
+                            TextButton(
+                                onClick = onFindDiscussion,
+                                enabled = !isPending,
+                            ) {
+                                Text(
+                                    text = stringResource(Res.string.rating_prompt_find_discussion),
+                                    color = RatingAccent,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
 
                         when {
