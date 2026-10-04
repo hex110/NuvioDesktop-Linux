@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <condition_variable>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include <utility>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 // Diagnostic logging is opt-in via NUVIO_BRIDGE_DEBUG=1 so a normal run is quiet;
 // genuine errors always log via NUVIO_ERR.
@@ -62,6 +64,17 @@ struct Player {
     // list is built on the GTK timer, hence the mutex.
     std::set<std::string> appAddedSubtitleUrls;
     std::mutex appAddedSubtitleUrlsMutex;
+    // Seek-bar previews: a second, headless libmpv opened against the same source on its own
+    // thread, started by the first request (see requestSeekThumbnail). Ported from the Windows
+    // bridge; requests carry a generation so a newer hover supersedes an older one mid-seek.
+    std::string thumbnailSourceUrl;
+    std::string thumbnailHeaderFields;
+    std::thread thumbnailThread;
+    std::mutex thumbnailMutex;
+    std::condition_variable thumbnailCv;
+    std::atomic<bool> thumbnailStopping{false};
+    std::atomic<uint64_t> thumbnailRequestGeneration{0};
+    int64_t thumbnailRequestedPositionMs = 0;
     std::thread eventThread;
     std::atomic<bool> running{false};
     std::atomic<bool> ended{false};
@@ -1605,6 +1618,140 @@ JNIEXPORT jboolean JNICALL NP(initGtkEarly)(JNIEnv *, jobject) {
     return JNI_TRUE;
 }
 
+// ---- Seek thumbnails ------------------------------------------------------
+
+std::string base64Encode(const std::vector<unsigned char> &bytes) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3) {
+        uint32_t n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+        out.push_back(table[(n >> 18) & 63]);
+        out.push_back(table[(n >> 12) & 63]);
+        out.push_back(table[(n >> 6) & 63]);
+        out.push_back(table[n & 63]);
+    }
+    if (i < bytes.size()) {
+        uint32_t n = bytes[i] << 16;
+        if (i + 1 < bytes.size()) n |= bytes[i + 1] << 8;
+        out.push_back(table[(n >> 18) & 63]);
+        out.push_back(table[(n >> 12) & 63]);
+        out.push_back(i + 1 < bytes.size() ? table[(n >> 6) & 63] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+// Mirrors the Windows bridge's runThumbnailWorker, with plain libmpv calls and a /tmp file.
+void runThumbnailWorker(Player *p) {
+    if (p->thumbnailStopping.load()) return;
+    mpv_handle *thumb = mpv_create();
+    if (!thumb) return;
+    mpv_set_option_string(thumb, "config", "no");
+    mpv_set_option_string(thumb, "osc", "no");
+    mpv_set_option_string(thumb, "audio", "no");
+    mpv_set_option_string(thumb, "vo", "null");
+    mpv_set_option_string(thumb, "pause", "yes");
+    mpv_set_option_string(thumb, "hwdec", "no");
+    // Read only what each seek needs: a cache here is invisible to the main player's buffer bar
+    // and would keep downloading while paused.
+    mpv_set_option_string(thumb, "cache", "no");
+    // Keyframe seeks, and decode close to the rendered size, so the first preview arrives sooner.
+    mpv_set_option_string(thumb, "hr-seek", "no");
+    mpv_set_option_string(thumb, "vf", "lavfi=[scale=256:-2]");
+    mpv_set_option_string(thumb, "screenshot-format", "jpg");
+    mpv_set_option_string(thumb, "screenshot-jpeg-quality", "64");
+    if (!p->thumbnailHeaderFields.empty()) {
+        mpv_set_option_string(thumb, "http-header-fields", p->thumbnailHeaderFields.c_str());
+    }
+    if (mpv_initialize(thumb) < 0) {
+        mpv_terminate_destroy(thumb);
+        return;
+    }
+    const char *loadCommand[] = {"loadfile", p->thumbnailSourceUrl.c_str(), nullptr};
+    if (mpv_command(thumb, loadCommand) < 0) {
+        mpv_terminate_destroy(thumb);
+        return;
+    }
+    const auto loadDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < loadDeadline && !p->thumbnailStopping.load()) {
+        mpv_event *event = mpv_wait_event(thumb, 0.05);
+        if (event->event_id == MPV_EVENT_FILE_LOADED) break;
+    }
+
+    const std::string tmpBase = std::string(g_get_tmp_dir()) + "/nuvio-seek-" +
+        std::to_string(getpid()) + "-" + std::to_string(reinterpret_cast<uintptr_t>(p)) + "-";
+    uint64_t processedGeneration = 0;
+    while (!p->thumbnailStopping.load()) {
+        int64_t positionMs = 0;
+        uint64_t generation = 0;
+        {
+            std::unique_lock<std::mutex> lock(p->thumbnailMutex);
+            p->thumbnailCv.wait(lock, [&] {
+                return p->thumbnailStopping.load() || p->thumbnailRequestGeneration.load() > processedGeneration;
+            });
+            if (p->thumbnailStopping.load()) break;
+            positionMs = p->thumbnailRequestedPositionMs;
+            generation = p->thumbnailRequestGeneration.load();
+        }
+        while (mpv_wait_event(thumb, 0.0)->event_id != MPV_EVENT_NONE) {}
+        std::string seconds = std::to_string(positionMs / 1000.0);
+        const char *seekCommand[] = {"seek", seconds.c_str(), "absolute+keyframes", nullptr};
+        if (mpv_command(thumb, seekCommand) < 0) {
+            processedGeneration = generation;
+            continue;
+        }
+        bool frameReady = false;
+        const auto seekDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < seekDeadline && !p->thumbnailStopping.load()) {
+            if (p->thumbnailRequestGeneration.load() != generation) break;
+            mpv_event *event = mpv_wait_event(thumb, 0.04);
+            if (event->event_id == MPV_EVENT_PLAYBACK_RESTART) {
+                frameReady = true;
+                break;
+            }
+        }
+        processedGeneration = generation;
+        if (!frameReady || p->thumbnailRequestGeneration.load() != generation) continue;
+
+        std::string path = tmpBase + std::to_string(generation) + ".jpg";
+        std::remove(path.c_str());
+        const char *screenshotCommand[] = {"screenshot-to-file", path.c_str(), "video", nullptr};
+        if (mpv_command(thumb, screenshotCommand) < 0) continue;
+        std::vector<unsigned char> bytes;
+        if (FILE *f = std::fopen(path.c_str(), "rb")) {
+            unsigned char buffer[16384];
+            size_t n;
+            while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) bytes.insert(bytes.end(), buffer, buffer + n);
+            std::fclose(f);
+        }
+        std::remove(path.c_str());
+        if (bytes.empty() || p->thumbnailRequestGeneration.load() != generation) continue;
+        auto *payload = new std::pair<Player *, std::string>(
+            p, "window.nuvioSeekThumbnailReady && window.nuvioSeekThumbnailReady(" +
+                   std::to_string(positionMs) + ",'data:image/jpeg;base64," + base64Encode(bytes) + "')");
+        g_main_context_invoke(nullptr,
+                              +[](gpointer data) -> gboolean {
+                                  auto *pair = static_cast<std::pair<Player *, std::string> *>(data);
+                                  if (playerAlive(pair->first)) evalJs(pair->first->webview, pair->second);
+                                  delete pair;
+                                  return G_SOURCE_REMOVE;
+                              },
+                              payload);
+    }
+    mpv_terminate_destroy(thumb);
+}
+
+void stopThumbnailWorker(Player *p) {
+    {
+        std::lock_guard<std::mutex> lock(p->thumbnailMutex);
+        p->thumbnailStopping.store(true);
+    }
+    p->thumbnailCv.notify_all();
+    if (p->thumbnailThread.joinable()) p->thumbnailThread.join();
+}
+
 JNIEXPORT jlong JNICALL NP(create)(
     JNIEnv *env, jobject /*thiz*/, jlong hostViewPtr, jstring sourceUrl,
     jstring sourceAudioUrl, jobjectArray headerLines, jboolean playWhenReady,
@@ -1827,6 +1974,8 @@ JNIEXPORT jlong JNICALL NP(create)(
     std::string url = jstringToUtf8(env, sourceUrl);
     const char *cmd[] = {"loadfile", url.c_str(), nullptr};
     mpv_command(player->mpv, cmd);
+    player->thumbnailSourceUrl = url;
+    player->thumbnailHeaderFields = headerFields;
 
     // Bring up the WebKitGTK controls overlay now so it can render the loading
     // screen (poster + title + spinner) over mpv's black frame while the stream
@@ -1857,6 +2006,7 @@ JNIEXPORT void JNICALL NP(dispose)(JNIEnv *env, jobject, jlong handle) {
     // invoke queue is FIFO — a pending create bails on !playerAlive first, and
     // destroyWebviewOnGtk checks every field it touches.
     gtkSync([player] { destroyWebviewOnGtk(player); });
+    stopThumbnailWorker(player);
     player->running.store(false);
     if (player->mpv) mpv_wakeup(player->mpv);
     if (player->eventThread.joinable()) player->eventThread.join();
@@ -2326,9 +2476,23 @@ JNIEXPORT jboolean JNICALL NP(isForegroundProcess)(JNIEnv *, jobject) { return J
 // that here means resizing a window AWT owns, so it is left for a follow-up.
 JNIEXPORT void JNICALL NP(forceVideoRedraw)(JNIEnv *, jobject, jlong) {}
 
-// Seek-bar thumbnail previews. The Windows bridge decodes them out-of-band;
-// until that is ported the controls page simply receives no thumbnail.
-JNIEXPORT void JNICALL NP(requestSeekThumbnail)(JNIEnv *, jobject, jlong, jlong) {}
+// Seek-bar thumbnail previews, decoded out-of-band as on Windows. Whether a
+// source may have previews at all (mode, Metered preset, torrents) is decided
+// in Kotlin before this is ever called.
+JNIEXPORT void JNICALL NP(requestSeekThumbnail)(JNIEnv *, jobject, jlong handle, jlong positionMs) {
+    Player *p = asPlayer(handle);
+    if (!p || p->thumbnailSourceUrl.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(p->thumbnailMutex);
+        if (p->thumbnailStopping.load()) return;
+        p->thumbnailRequestedPositionMs = positionMs;
+        ++p->thumbnailRequestGeneration;
+        // The decoder opens the media a second time, so it starts with the first hover, not
+        // with playback.
+        if (!p->thumbnailThread.joinable()) p->thumbnailThread = std::thread(runThumbnailWorker, p);
+    }
+    p->thumbnailCv.notify_one();
+}
 
 // Picture-in-Picture: a floating, draggable, resizable player window driven by
 // Win32 hit-testing and SetWindowPos. Needs a GTK/X11 equivalent.
