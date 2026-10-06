@@ -2,6 +2,7 @@ package com.nuvio.app.features.player.desktop
 
 import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
+import com.nuvio.app.isWindows
 import com.nuvio.app.features.autosync.AutoSyncCandidateScope
 import com.nuvio.app.features.autosync.AutoSyncPlayerController
 import com.nuvio.app.features.autosync.AutoSyncSubtitleCandidate
@@ -1041,6 +1042,17 @@ internal class NativePlayerController(
         }
         if (type == "selectDesktopHudLayout") {
             DesktopHudLayout.entries.getOrNull(value.toInt())?.let(PlayerSettingsRepository::setDesktopHudLayout)
+            return
+        }
+        if (type == "seekThumbnailWarm") {
+            // The pointer reached the seek bar: open the preview decoder now so the first hover
+            // doesn't pay for the stream open. Only the Linux bridge understands the -1 sentinel.
+            if (isWindows || !controlsState.seekThumbnailsEnabled || SeekThumbnailRateLimitGate.isSuppressed()) {
+                return
+            }
+            // -1 warms the decoder; -2 also lets it prefetch neighbouring frames (local sources only).
+            val sentinel = if (controlsState.seekThumbnailsLocalSource) -2L else -1L
+            handle.takeIf { it != 0L }?.let { NativePlayerBridge.requestSeekThumbnail(it, sentinel) }
             return
         }
         if (type == "seekThumbnail") {
@@ -2140,6 +2152,8 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonField("activeSubtitleLabel", activeSubtitleLabel)
         append(',')
         appendJsonField("seekThumbnailsEnabled", seekThumbnailsEnabled)
+        append(',')
+        appendJsonField("seekThumbnailsLocalSource", seekThumbnailsLocalSource)
         append(',')
         appendJsonField("seekStepSeconds", seekStepSeconds)
         append(',')

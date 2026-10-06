@@ -79,6 +79,8 @@ struct Player {
     std::atomic<bool> thumbnailStopping{false};
     std::atomic<uint64_t> thumbnailRequestGeneration{0};
     int64_t thumbnailRequestedPositionMs = 0;
+    // Local sources only: idle time is spent decoding the neighbouring 5 s buckets.
+    std::atomic<bool> thumbnailPrefetch{false};
     std::thread eventThread;
     std::atomic<bool> running{false};
     std::atomic<bool> ended{false};
@@ -1650,6 +1652,7 @@ std::string base64Encode(const std::vector<unsigned char> &bytes) {
 // Mirrors the Windows bridge's runThumbnailWorker, with plain libmpv calls and a /tmp file.
 void runThumbnailWorker(Player *p) {
     if (p->thumbnailStopping.load()) return;
+    const auto workerStart = std::chrono::steady_clock::now();
     mpv_handle *thumb = mpv_create();
     if (!thumb) return;
     mpv_set_option_string(thumb, "config", "no");
@@ -1658,6 +1661,17 @@ void runThumbnailWorker(Player *p) {
     mpv_set_option_string(thumb, "vo", "null");
     mpv_set_option_string(thumb, "pause", "yes");
     mpv_set_option_string(thumb, "hwdec", "no");
+    // Nothing but one video stream is ever needed: skip other tracks, scripts and sidecar lookups
+    // so the open has less to probe, and decode with the cheap paths.
+    mpv_set_option_string(thumb, "aid", "no");
+    mpv_set_option_string(thumb, "sid", "no");
+    mpv_set_option_string(thumb, "sub-auto", "no");
+    mpv_set_option_string(thumb, "load-scripts", "no");
+    mpv_set_option_string(thumb, "ytdl", "no");
+    mpv_set_option_string(thumb, "demuxer-lavf-analyzeduration", "1");
+    mpv_set_option_string(thumb, "vd-lavc-fast", "yes");
+    mpv_set_option_string(thumb, "vd-lavc-skiploopfilter", "all");
+    mpv_set_option_string(thumb, "vd-lavc-threads", "4");
     // Read only what each seek needs: a cache here is invisible to the main player's buffer bar
     // and would keep downloading while paused.
     mpv_set_option_string(thumb, "cache", "no");
@@ -1686,43 +1700,35 @@ void runThumbnailWorker(Player *p) {
 
     const std::string tmpBase = std::string(g_get_tmp_dir()) + "/nuvio-seek-" +
         std::to_string(getpid()) + "-" + std::to_string(reinterpret_cast<uintptr_t>(p)) + "-";
-    uint64_t processedGeneration = 0;
-    while (!p->thumbnailStopping.load()) {
-        int64_t positionMs = 0;
-        uint64_t generation = 0;
-        {
-            std::unique_lock<std::mutex> lock(p->thumbnailMutex);
-            p->thumbnailCv.wait(lock, [&] {
-                return p->thumbnailStopping.load() || p->thumbnailRequestGeneration.load() > processedGeneration;
-            });
-            if (p->thumbnailStopping.load()) break;
-            positionMs = p->thumbnailRequestedPositionMs;
-            generation = p->thumbnailRequestGeneration.load();
-        }
+    NUVIO_LOG("thumb: decoder ready after %lld ms",
+              (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - workerStart).count());
+
+    // Seeks to positionMs, grabs a JPEG and hands it to the controls page. Returns false when the
+    // request was superseded or produced nothing. A prefetch is superseded by any new request.
+    auto captureAndDeliver = [&](int64_t positionMs, uint64_t generation) -> bool {
+        const auto begun = std::chrono::steady_clock::now();
         while (mpv_wait_event(thumb, 0.0)->event_id != MPV_EVENT_NONE) {}
         std::string seconds = std::to_string(positionMs / 1000.0);
         const char *seekCommand[] = {"seek", seconds.c_str(), "absolute+keyframes", nullptr};
-        if (mpv_command(thumb, seekCommand) < 0) {
-            processedGeneration = generation;
-            continue;
-        }
+        if (mpv_command(thumb, seekCommand) < 0) return false;
         bool frameReady = false;
         const auto seekDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (std::chrono::steady_clock::now() < seekDeadline && !p->thumbnailStopping.load()) {
-            if (p->thumbnailRequestGeneration.load() != generation) break;
+            if (p->thumbnailRequestGeneration.load() != generation) return false;
             mpv_event *event = mpv_wait_event(thumb, 0.04);
             if (event->event_id == MPV_EVENT_PLAYBACK_RESTART) {
                 frameReady = true;
                 break;
             }
         }
-        processedGeneration = generation;
-        if (!frameReady || p->thumbnailRequestGeneration.load() != generation) continue;
+        if (!frameReady || p->thumbnailRequestGeneration.load() != generation) return false;
+        const auto seeked = std::chrono::steady_clock::now();
 
-        std::string path = tmpBase + std::to_string(generation) + ".jpg";
+        std::string path = tmpBase + std::to_string(generation) + "-" + std::to_string(positionMs) + ".jpg";
         std::remove(path.c_str());
         const char *screenshotCommand[] = {"screenshot-to-file", path.c_str(), "video", nullptr};
-        if (mpv_command(thumb, screenshotCommand) < 0) continue;
+        if (mpv_command(thumb, screenshotCommand) < 0) return false;
         std::vector<unsigned char> bytes;
         if (FILE *f = std::fopen(path.c_str(), "rb")) {
             unsigned char buffer[16384];
@@ -1731,7 +1737,7 @@ void runThumbnailWorker(Player *p) {
             std::fclose(f);
         }
         std::remove(path.c_str());
-        if (bytes.empty() || p->thumbnailRequestGeneration.load() != generation) continue;
+        if (bytes.empty() || p->thumbnailRequestGeneration.load() != generation) return false;
         auto *payload = new std::pair<Player *, std::string>(
             p, "window.nuvioSeekThumbnailReady && window.nuvioSeekThumbnailReady(" +
                    std::to_string(positionMs) + ",'data:image/jpeg;base64," + base64Encode(bytes) + "')");
@@ -1743,6 +1749,59 @@ void runThumbnailWorker(Player *p) {
                                   return G_SOURCE_REMOVE;
                               },
                               payload);
+        const auto done = std::chrono::steady_clock::now();
+        NUVIO_LOG("thumb: %lld ms seek %lld ms, shot+deliver %lld ms (%zu bytes)", (long long)positionMs,
+                  (long long)std::chrono::duration_cast<std::chrono::milliseconds>(seeked - begun).count(),
+                  (long long)std::chrono::duration_cast<std::chrono::milliseconds>(done - seeked).count(),
+                  bytes.size());
+        return true;
+    };
+
+    // Neighbouring buckets to decode while idle, nearest first; refilled after each real request.
+    constexpr int64_t kBucketMs = 5000;
+    std::vector<int64_t> prefetchQueue;
+    std::set<int64_t> prefetched;
+    uint64_t processedGeneration = 0;
+    while (!p->thumbnailStopping.load()) {
+        int64_t positionMs = 0;
+        uint64_t generation = 0;
+        bool prefetching = false;
+        {
+            std::unique_lock<std::mutex> lock(p->thumbnailMutex);
+            auto hasRequest = [&] {
+                return p->thumbnailStopping.load() || p->thumbnailRequestGeneration.load() > processedGeneration;
+            };
+            if (!hasRequest() && !prefetchQueue.empty()) {
+                // Idle: take the next neighbour unless a request lands first.
+                prefetching = true;
+            } else {
+                p->thumbnailCv.wait(lock, hasRequest);
+            }
+            if (p->thumbnailStopping.load()) break;
+            if (hasRequest()) {
+                prefetching = false;
+                positionMs = p->thumbnailRequestedPositionMs;
+                generation = p->thumbnailRequestGeneration.load();
+            } else {
+                positionMs = prefetchQueue.front();
+                prefetchQueue.erase(prefetchQueue.begin());
+                generation = p->thumbnailRequestGeneration.load();
+            }
+        }
+        if (prefetching) {
+            if (prefetched.insert(positionMs).second) captureAndDeliver(positionMs, generation);
+            continue;
+        }
+        prefetchQueue.clear();
+        const bool delivered = captureAndDeliver(positionMs, generation);
+        processedGeneration = generation;
+        if (delivered && p->thumbnailPrefetch.load()) {
+            prefetched.insert(positionMs);
+            for (int64_t step : {1, -1, 2, -2}) {
+                const int64_t neighbour = positionMs + step * kBucketMs;
+                if (neighbour >= 0 && !prefetched.count(neighbour)) prefetchQueue.push_back(neighbour);
+            }
+        }
     }
     mpv_terminate_destroy(thumb);
 }
@@ -2520,6 +2579,12 @@ JNIEXPORT void JNICALL NP(requestSeekThumbnail)(JNIEnv *, jobject, jlong handle,
     {
         std::lock_guard<std::mutex> lock(p->thumbnailMutex);
         if (p->thumbnailStopping.load()) return;
+        // Negative positions only start the decoder: -1 plain, -2 with neighbour prefetch.
+        if (positionMs < 0) {
+            p->thumbnailPrefetch.store(positionMs == -2);
+            if (!p->thumbnailThread.joinable()) p->thumbnailThread = std::thread(runThumbnailWorker, p);
+            return;
+        }
         p->thumbnailRequestedPositionMs = positionMs;
         ++p->thumbnailRequestGeneration;
         // The decoder opens the media a second time, so it starts with the first hover, not

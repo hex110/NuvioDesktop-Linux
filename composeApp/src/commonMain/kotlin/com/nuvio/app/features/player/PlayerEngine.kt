@@ -142,6 +142,8 @@ data class PlayerControlsState(
      */
     val activeSubtitleLabel: String = "",
     val seekThumbnailsEnabled: Boolean = true,
+    /** The source is on this machine or LAN, so the HUD may ask for previews with a short settle delay. */
+    val seekThumbnailsLocalSource: Boolean = false,
     /** Drives the HUD's seek button/command-palette labels so they name the real jump distance. */
     val seekStepSeconds: Int = 10,
     val tapToUnlockLabel: String = "Tap to unlock",

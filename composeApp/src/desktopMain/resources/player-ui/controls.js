@@ -284,6 +284,7 @@ let state = {
   desktopAnimeModeLabel: "Off",
   desktopAnimeSvpEnabled: false,
   seekThumbnailsEnabled: true,
+  seekThumbnailsLocalSource: false,
   seekStepSeconds: 10,
   tapToUnlockLabel: "Tap to unlock",
   playbackErrorTitle: "Playback error",
@@ -992,7 +993,10 @@ const hideChapterTooltip = () => {
   chapterTooltip.textContent = "";
 };
 
+// Sources on this machine or LAN have no CDN open-rate limit to trip, so they settle quickly.
 const SEEK_THUMBNAIL_SETTLE_MS = 220;
+const SEEK_THUMBNAIL_LOCAL_SETTLE_MS = 70;
+let seekThumbnailWarmSent = false;
 const seekThumbnailCache = new Map();
 let seekThumbnailRequestTimer = 0;
 let pendingSeekThumbnailPosition = -1;
@@ -1048,7 +1052,15 @@ const showSeekThumbnailAt = event => {
   // the *next real seek* fail with a 429.
   seekThumbnailRequestTimer = window.setTimeout(() => {
     send("seekThumbnail", thumbnailPositionMs);
-  }, SEEK_THUMBNAIL_SETTLE_MS);
+  }, state.seekThumbnailsLocalSource ? SEEK_THUMBNAIL_LOCAL_SETTLE_MS : SEEK_THUMBNAIL_SETTLE_MS);
+};
+
+// Ask the native side to open its preview decoder as soon as the pointer reaches the bar, once
+// per player; it costs one stream open, which the first hover would have paid anyway.
+const warmSeekThumbnailDecoder = () => {
+  if (seekThumbnailWarmSent || !state.seekThumbnailsEnabled) return;
+  seekThumbnailWarmSent = true;
+  send("seekThumbnailWarm", 0);
 };
 
 window.nuvioSeekThumbnailReady = (positionMs, dataUrl) => {
@@ -5811,6 +5823,7 @@ playerVolumeSlider.addEventListener("pointerdown", () => {
   playerVolumeControl?.classList.remove("dragging");
 }));
 
+timeline.addEventListener("pointerenter", warmSeekThumbnailDecoder);
 timeline.addEventListener("pointermove", showSeekThumbnailAt);
 timeline.addEventListener("pointerleave", () => {
   hideChapterTooltip();

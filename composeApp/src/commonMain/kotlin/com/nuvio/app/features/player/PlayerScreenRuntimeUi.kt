@@ -353,6 +353,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             sourceUrl = activeSourceUrl,
             isTorrent = activeTorrentInfoHash != null,
         ),
+        seekThumbnailsLocalSource = activeTorrentInfoHash == null && isUserControlledSource(activeSourceUrl),
         seekStepSeconds = playerSettingsUiState.seekStepSeconds,
         tapToUnlockLabel = stringResource(Res.string.compose_player_tap_to_unlock),
         playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
