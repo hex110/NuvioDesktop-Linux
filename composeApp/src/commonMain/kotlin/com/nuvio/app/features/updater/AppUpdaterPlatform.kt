@@ -36,6 +36,26 @@ data class InstalledNightlyBuild(
 expect object AppUpdaterPlatform {
     val isSupported: Boolean
 
+    /**
+     * The Linux build. Owned by the system package manager, so it only announces updates: the
+     * dialog shows the command that installs the new package instead of swapping files itself.
+     */
+    val isLinux: Boolean
+
+    /** The release tag this package was built from (e.g. `v1.15.0-linux3`); null off Linux. */
+    val installedLinuxRelease: String?
+
+    /** Whether the update check runs on launch. Linux only; the Windows updater always checks. */
+    fun isAutoCheckEnabled(): Boolean
+
+    fun setAutoCheckEnabled(enabled: Boolean)
+
+    /** Which release asset suits this system's package manager: pacman takes `.pkg.tar.zst`, the rest `.deb`. */
+    fun preferredLinuxAssetSuffix(): String
+
+    /** The shell command that installs the package at [assetUrl], for the package manager in use. */
+    fun linuxInstallCommand(assetUrl: String, assetName: String): String
+
     fun getSupportedAbis(): List<String>
 
     /** The release channel the updater follows; defaults to [UpdateChannel.Stable]. */

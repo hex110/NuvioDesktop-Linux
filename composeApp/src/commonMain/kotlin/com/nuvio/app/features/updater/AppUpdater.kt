@@ -34,7 +34,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,10 +72,15 @@ import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
 import org.jetbrains.compose.resources.stringResource
 
-private const val gitHubOwner = "UmbraProjects"
-private const val gitHubRepo = "NuvioDesktop"
 private const val gitHubApiBase = "https://api.github.com"
+private const val windowsGitHubOwner = "UmbraProjects"
+private const val windowsGitHubRepo = "NuvioDesktop"
 private const val releaseChannelBranch = "windows-tv-adaptive"
+private const val linuxGitHubOwner = "hex110"
+private const val linuxGitHubRepo = "NuvioDesktop-Linux"
+
+private val gitHubOwner get() = if (AppUpdaterPlatform.isLinux) linuxGitHubOwner else windowsGitHubOwner
+private val gitHubRepo get() = if (AppUpdaterPlatform.isLinux) linuxGitHubRepo else windowsGitHubRepo
 
 /** The rolling prerelease tag every nightly build is uploaded under. */
 private const val nightlyReleaseTag = "Nightly"
@@ -174,9 +182,11 @@ private object VersionUtils {
         val normalized = normalize(raw)
         if (normalized.isBlank()) return null
 
+        // "1.15.0-linux3" is the third Linux build of 1.15.0; without the prefix strip its last
+        // token has no leading digits and would be dropped, making linux2 and linux3 compare equal.
         val parts = normalized.split('.', '-', '_')
             .filter { it.isNotBlank() }
-            .mapNotNull { token -> token.takeWhile { it.isDigit() }.toIntOrNull() }
+            .mapNotNull { token -> token.removePrefix("linux").takeWhile { it.isDigit() }.toIntOrNull() }
 
         return parts.takeIf { it.isNotEmpty() }
     }
@@ -209,8 +219,14 @@ private object AppUpdaterRepository {
             ?: release.name?.takeIf { it.isNotBlank() }
             ?: error(getString(Res.string.updates_release_missing_title))
 
-        val asset = selectBestPortableUpdateAsset(release.assets)
-            ?: error(getString(Res.string.updates_update_asset_missing))
+        // The Linux dialog only shows a command, so a release whose package is missing still gets
+        // announced, with the release page as the way to it.
+        val asset = if (AppUpdaterPlatform.isLinux) {
+            selectLinuxPackageAsset(release.assets, AppUpdaterPlatform.preferredLinuxAssetSuffix())
+        } else {
+            selectBestPortableUpdateAsset(release.assets)
+                ?: error(getString(Res.string.updates_update_asset_missing))
+        }
 
         AppUpdate(
             channel = channel,
@@ -218,13 +234,13 @@ private object AppUpdaterRepository {
             title = release.name?.takeIf { it.isNotBlank() } ?: tag,
             notes = release.body.orEmpty(),
             releaseUrl = release.htmlUrl,
-            assetName = asset.name,
-            assetUrl = asset.browserDownloadUrl,
-            assetSizeBytes = asset.size,
-            assetSha256 = asset.sha256Hex(),
+            assetName = asset?.name.orEmpty(),
+            assetUrl = asset?.browserDownloadUrl.orEmpty(),
+            assetSizeBytes = asset?.size,
+            assetSha256 = asset?.sha256Hex(),
             // The asset's own upload time, not the release's: a nightly's tag and release date stay
             // put while the ZIP behind them is replaced.
-            publishedAt = asset.updatedAt ?: release.publishedAt,
+            publishedAt = asset?.updatedAt ?: release.publishedAt,
         )
     }
 
@@ -284,7 +300,7 @@ private object AppUpdaterRepository {
  * neither channel's blind spot: it stays nightly, and stable still refuses it.
  */
 internal fun GitHubReleaseDto.matchesChannel(channel: UpdateChannel): Boolean {
-    if (draft || !matchesReleaseBranch()) return false
+    if (draft || (!AppUpdaterPlatform.isLinux && !matchesReleaseBranch())) return false
     val isNightly = tagName?.trim().equals(nightlyReleaseTag, ignoreCase = true)
     return when (channel) {
         UpdateChannel.Stable -> !prerelease && !isNightly
@@ -385,6 +401,10 @@ private val utcInstantPattern = Regex("""^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(
 internal fun utcInstantOrNull(value: String?): String? =
     value?.trim()?.let { utcInstantPattern.matchEntire(it)?.groupValues?.get(1) }
 
+/** The package for this system's package manager, or null when the release doesn't carry one. */
+internal fun selectLinuxPackageAsset(assets: List<GitHubAssetDto>, suffix: String): GitHubAssetDto? =
+    assets.firstOrNull { it.name.endsWith(suffix, ignoreCase = true) }
+
 internal fun selectBestPortableUpdateAsset(assets: List<GitHubAssetDto>): GitHubAssetDto? {
     val updateAssets = assets.filter { asset ->
         asset.name.endsWith(".zip", ignoreCase = true) ||
@@ -418,6 +438,7 @@ class AppUpdaterController internal constructor(
         if (autoCheckStarted || !AppFeaturePolicy.inAppUpdaterEnabled || !AppUpdaterPlatform.isSupported) {
             return
         }
+        if (AppUpdaterPlatform.isLinux && !AppUpdaterPlatform.isAutoCheckEnabled()) return
         autoCheckStarted = true
         checkForUpdates(force = false, showNoUpdateFeedback = false)
     }
@@ -449,7 +470,7 @@ class AppUpdaterController internal constructor(
             result.onSuccess { update ->
                 val remoteNewer = UpdateAvailability.isOffered(
                     update = update,
-                    localVersion = AppVersionConfig.DESKTOP_VERSION_NAME,
+                    localVersion = AppUpdaterPlatform.installedLinuxRelease ?: AppVersionConfig.DESKTOP_VERSION_NAME,
                     installedNightlyId = installedNightlyId,
                     runningBuild = runningBuild,
                 )
@@ -524,7 +545,7 @@ class AppUpdaterController internal constructor(
             AppUpdaterRepository.getLatestChannelUpdate(AppUpdaterPlatform.getUpdateChannel()).onSuccess { update ->
                 val remoteNewer = UpdateAvailability.isOffered(
                     update = update,
-                    localVersion = AppVersionConfig.DESKTOP_VERSION_NAME,
+                    localVersion = AppUpdaterPlatform.installedLinuxRelease ?: AppVersionConfig.DESKTOP_VERSION_NAME,
                     installedNightlyId = installedNightlyId,
                     runningBuild = runningBuild,
                 )
@@ -740,6 +761,12 @@ fun AppUpdaterHost(
     if (visibleOverlay != StartupOverlayCoordinator.Overlay.Updater) return
 
     val tokens = MaterialTheme.nuvio
+    val clipboard = LocalClipboardManager.current
+    val uriHandler = LocalUriHandler.current
+    val scope = rememberCoroutineScope()
+    val installCommand = state.update
+        ?.takeIf { AppUpdaterPlatform.isLinux && state.isUpdateAvailable && it.assetUrl.isNotBlank() }
+        ?.let { AppUpdaterPlatform.linuxInstallCommand(it.assetUrl, it.assetName) }
     val showPrimaryAction =
         state.showUnknownSourcesDialog || state.isDownloading || state.downloadedApkPath != null || state.isUpdateAvailable
 
@@ -805,6 +832,8 @@ fun AppUpdaterHost(
                                 Res.string.updates_message_switch_build,
                                 updateChannelLabel(state.update?.channel ?: UpdateChannel.Stable),
                             )
+                            state.isUpdateAvailable && AppUpdaterPlatform.isLinux ->
+                                stringResource(Res.string.updates_message_linux)
                             state.isUpdateAvailable -> stringResource(Res.string.updates_message_ready)
                             // The box below says "No updates found"; the subtitle says what that
                             // means for the user rather than repeating it.
@@ -844,6 +873,24 @@ fun AppUpdaterHost(
                         update = state.update?.takeIf { state.isUpdateAvailable },
                         isChecking = state.isChecking,
                     )
+
+                    installCommand?.let { command ->
+                        Text(
+                            text = command,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = tokens.colors.textPrimary,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(NuvioTokens.Radius.sm))
+                                .background(tokens.colors.surfaceCard)
+                                .border(
+                                    tokens.borders.hairline,
+                                    tokens.colors.borderSubtle,
+                                    RoundedCornerShape(NuvioTokens.Radius.sm),
+                                )
+                                .padding(14.dp),
+                        )
+                    }
 
                     state.update?.let { update ->
                         if (state.isDownloading || state.downloadProgress != null) {
@@ -912,6 +959,13 @@ fun AppUpdaterHost(
                     // children last, so on a narrow window the links shrink and the buttons keep
                     // their width instead of the last one (Update) being squeezed to nothing.
                     UpdaterFooterLinks(modifier = Modifier.weight(1f).padding(start = 6.dp))
+                    state.update?.releaseUrl
+                        ?.takeIf { AppUpdaterPlatform.isLinux && state.isUpdateAvailable && installCommand != null }
+                        ?.let { url ->
+                            TextButton(onClick = { runCatching { uriHandler.openUri(url) } }) {
+                                Text(stringResource(Res.string.updates_view_release))
+                            }
+                        }
                     if (state.isUpdateAvailable && !state.isDownloading && !state.showUnknownSourcesDialog) {
                         TextButton(onClick = controller::ignoreThisVersion) {
                             Text(stringResource(Res.string.action_ignore))
@@ -935,12 +989,27 @@ fun AppUpdaterHost(
                         Button(
                             onClick = {
                                 when {
+                                    AppUpdaterPlatform.isLinux -> {
+                                        // Nothing to download: the package manager does that. The
+                                        // button hands over the command, or the release page when the
+                                        // release carries no package for this system.
+                                        if (installCommand != null) {
+                                            clipboard.setText(AnnotatedString(installCommand))
+                                            scope.launch {
+                                                NuvioToastController.show(getString(Res.string.updates_command_copied))
+                                            }
+                                        } else {
+                                            state.update?.releaseUrl?.let { runCatching { uriHandler.openUri(it) } }
+                                        }
+                                    }
                                     state.showUnknownSourcesDialog -> controller.resumeInstallation()
                                     state.downloadedApkPath != null -> controller.installDownloadedUpdate()
                                     else -> controller.downloadUpdate()
                                 }
                             },
-                            enabled = if (state.showUnknownSourcesDialog || state.downloadedApkPath != null) {
+                            enabled = if (AppUpdaterPlatform.isLinux) {
+                                state.isUpdateAvailable
+                            } else if (state.showUnknownSourcesDialog || state.downloadedApkPath != null) {
                                 true
                             } else {
                                 !state.isChecking && !state.isDownloading && state.isUpdateAvailable
@@ -948,6 +1017,9 @@ fun AppUpdaterHost(
                         ) {
                             Text(
                                 when {
+                                    AppUpdaterPlatform.isLinux -> stringResource(
+                                        if (installCommand != null) Res.string.updates_copy_command else Res.string.updates_view_release,
+                                    )
                                     state.showUnknownSourcesDialog -> stringResource(Res.string.action_continue)
                                     state.downloadedApkPath != null &&
                                         state.update?.assetName?.endsWith(".zip", ignoreCase = true) == true ->
@@ -1043,7 +1115,8 @@ private fun InstalledBuildSummary() {
         Text(
             text = stringResource(
                 Res.string.updates_target_version,
-                "${AppVersionConfig.DESKTOP_VERSION_NAME} (${AppVersionConfig.DESKTOP_VERSION_CODE})",
+                AppUpdaterPlatform.installedLinuxRelease?.removePrefix("v")
+                    ?: "${AppVersionConfig.DESKTOP_VERSION_NAME} (${AppVersionConfig.DESKTOP_VERSION_CODE})",
             ),
             style = MaterialTheme.typography.bodyMedium,
             color = tokens.colors.textPrimary,
@@ -1113,7 +1186,7 @@ private fun UpdaterFooterLinks(modifier: Modifier = Modifier) {
             textDecoration = TextDecoration.Underline,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.clickable { runCatching { uriHandler.openUri(NuvioHtpcRepoUrl) } },
+            modifier = Modifier.clickable { runCatching { uriHandler.openUri(if (AppUpdaterPlatform.isLinux) LinuxRepoUrl else NuvioHtpcRepoUrl) } },
         )
         Text(
             text = stringResource(Res.string.compose_about_open_logs_folder),
@@ -1139,6 +1212,7 @@ private fun UpdaterHairline() {
 }
 
 private const val NuvioHtpcRepoUrl = "https://github.com/UmbraProjects/NuvioDesktop"
+private const val LinuxRepoUrl = "https://github.com/hex110/NuvioDesktop-Linux"
 
 /** Display name for a channel, shared by the update dialog and the settings selector. */
 @Composable

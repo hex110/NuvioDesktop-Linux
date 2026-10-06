@@ -847,6 +847,8 @@
     <string name="settings_updates_channel_description">Nightly builds carry unreleased changes and are less tested than stable.</string>
     <string name="settings_updates_channel_stable">Stable</string>
     <string name="settings_updates_channel_nightly">Nightly</string>
+    <string name="settings_updates_auto_check">Check for Updates on Launch</string>
+    <string name="settings_updates_auto_check_description">Looks for a newer release when Nuvio starts and tells you how to install it.</string>
     <string name="settings_updates_auto_install">Install Updates Automatically</string>
     <string name="settings_updates_auto_install_description">Does not auto accept prompt, just requires no manual extraction.</string>
     <string name="settings_advanced_remember_last_profile">Remember Last Profile</string>
@@ -2472,6 +2474,10 @@
     <string name="updates_target_published">Published %1$s UTC</string>
     <string name="updates_target_version">Version %1$s</string>
     <string name="updates_update_asset_missing">No compatible Windows portable ZIP was found in the release.</string>
+    <string name="updates_message_linux">A new version is out. Install it with your package manager:</string>
+    <string name="updates_copy_command">Copy command</string>
+    <string name="updates_command_copied">Install command copied</string>
+    <string name="updates_view_release">View release</string>
     <string name="updates_open_download">Open download</string>
     <string name="addon_already_installed">That addon is already installed.</string>
     <string name="addon_invalid_url">Enter a valid addon URL</string>

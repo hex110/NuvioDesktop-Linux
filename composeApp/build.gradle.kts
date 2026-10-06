@@ -45,6 +45,11 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     @get:Input
     abstract val desktopAppVersionCode: Property<Int>
 
+    // The fork's own release tag (v1.15.0-linux3). The version name stays at the upstream number
+    // across linux1, linux2, ..., so it cannot tell the in-app updater which of them is running.
+    @get:Input
+    abstract val linuxReleaseTag: Property<String>
+
     @TaskAction
     fun generate() {
         val props = Properties()
@@ -133,6 +138,7 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |    const val VERSION_CODE = ${appVersionCode.get()}
                 |    const val DESKTOP_VERSION_NAME = "${desktopAppVersionName.get()}"
                 |    const val DESKTOP_VERSION_CODE = ${desktopAppVersionCode.get()}
+                |    const val LINUX_RELEASE_TAG = "${linuxReleaseTag.get()}"
                 |}
                 """.trimMargin()
             )
@@ -325,6 +331,13 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
     appVersionCode.set(releaseAppVersionCode)
     desktopAppVersionName.set(desktopReleaseVersionName)
     desktopAppVersionCode.set(desktopReleaseVersionCode)
+    // Set by the release workflow on tag builds; empty for every other build, which the updater
+    // reads as "not a published package, nothing to compare against".
+    linuxReleaseTag.set(
+        (providers.gradleProperty("nuvio.linux.releaseTag").orNull
+            ?: System.getenv("NUVIO_LINUX_RELEASE_TAG")
+            ?: "").trim(),
+    )
 }
 
 val isMacHost = System.getProperty("os.name").contains("mac", ignoreCase = true)

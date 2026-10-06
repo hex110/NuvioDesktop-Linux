@@ -1,5 +1,6 @@
 package com.nuvio.app.features.updater
 
+import com.nuvio.app.core.build.AppVersionConfig
 import com.nuvio.app.core.build.AppVersionPolicy
 import com.nuvio.app.core.storage.DesktopStorage
 import kotlinx.coroutines.Dispatchers
@@ -24,6 +25,7 @@ private const val installedNightlyIdKey = "installed_nightly_id"
 private const val installedNightlyPublishedKey = "installed_nightly_published_at"
 private const val pendingNightlySwapKey = "pending_nightly_swap"
 private const val lastSeenBuildIdKey = "last_seen_build_id"
+private const val autoCheckKey = "auto_check"
 
 private val updaterHttpClient: HttpClient = HttpClient.newBuilder()
     .connectTimeout(Duration.ofSeconds(60))
@@ -33,8 +35,51 @@ private val updaterHttpClient: HttpClient = HttpClient.newBuilder()
 actual object AppUpdaterPlatform {
     private val store = DesktopStorage.store(updaterPreferencesName)
 
-    actual val isSupported: Boolean =
-        System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT).contains("win")
+    private val osName = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
+
+    // The env var lets a self-built or `gradlew run` build pose as a given release to try the
+    // update dialog; packaged releases carry the tag from the build instead.
+    actual val installedLinuxRelease: String? =
+        if (osName.contains("linux")) {
+            (System.getenv("NUVIO_LINUX_RELEASE_TAG") ?: AppVersionConfig.LINUX_RELEASE_TAG)
+                .trim()
+                .takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+
+    actual val isLinux: Boolean = installedLinuxRelease != null
+
+    // On Linux only a build that knows which release it is can be compared with the latest one,
+    // so an unversioned self-build is never nagged about an update.
+    actual val isSupported: Boolean = osName.contains("win") || isLinux
+
+    actual fun isAutoCheckEnabled(): Boolean = store.getString(autoCheckKey) != "off"
+
+    actual fun setAutoCheckEnabled(enabled: Boolean) {
+        store.putString(autoCheckKey, if (enabled) "on" else "off")
+    }
+
+    private val usesPacman: Boolean by lazy {
+        // Reads pacman's package database instead of spawning `pacman -Qo`: this runs while the
+        // dialog composes, and a process launch there stalls the UI thread. An Arch box running
+        // the .deb by hand has no such entry and is told the apt way.
+        val installed = File("/var/lib/pacman/local").listFiles { file ->
+            file.isDirectory && file.name.startsWith("nuvio-htpc")
+        }
+        installed?.isNotEmpty() == true ||
+            (File("/usr/bin/pacman").exists() && !File("/usr/bin/dpkg").exists())
+    }
+
+    actual fun preferredLinuxAssetSuffix(): String = if (usesPacman) ".pkg.tar.zst" else ".deb"
+
+    actual fun linuxInstallCommand(assetUrl: String, assetName: String): String =
+        if (usesPacman) {
+            // pacman -U fetches URLs itself.
+            "sudo pacman -U $assetUrl"
+        } else {
+            "curl -fLo /tmp/$assetName $assetUrl && sudo apt install /tmp/$assetName"
+        }
 
     actual fun getSupportedAbis(): List<String> {
         val arch = System.getProperty("os.arch").orEmpty().lowercase(Locale.ROOT)
@@ -49,7 +94,8 @@ actual object AppUpdaterPlatform {
     // Stable unless explicitly opted in, so an unreadable or missing value never silently moves
     // someone onto prerelease builds.
     actual fun getUpdateChannel(): UpdateChannel =
-        if (UpdateChannel.Nightly.name.equals(store.getString(updateChannelKey), ignoreCase = true)) {
+        // The fork publishes one kind of release, so there is no nightly to follow.
+        if (!isLinux && UpdateChannel.Nightly.name.equals(store.getString(updateChannelKey), ignoreCase = true)) {
             UpdateChannel.Nightly
         } else {
             UpdateChannel.Stable

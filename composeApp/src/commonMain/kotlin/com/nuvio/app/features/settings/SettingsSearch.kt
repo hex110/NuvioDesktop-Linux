@@ -1005,7 +1005,18 @@ private fun settingsSearchEntries(
         category = accountCategory,
         icon = Icons.Rounded.AccountCircle,
     )
-    if (AppUpdaterPlatform.isSupported) {
+    if (AppUpdaterPlatform.isLinux) {
+        addRow(
+            page = SettingsPage.Account,
+            key = "update-auto-check",
+            title = resolve(Res.string.settings_updates_auto_check),
+            description = resolve(Res.string.settings_updates_auto_check_description),
+            pageLabel = accountPage,
+            section = resolve(Res.string.settings_updates_section),
+            category = accountCategory,
+            icon = Icons.Rounded.CloudDownload,
+        )
+    } else if (AppUpdaterPlatform.isSupported) {
         addRow(
             page = SettingsPage.Account,
             key = "update-channel",

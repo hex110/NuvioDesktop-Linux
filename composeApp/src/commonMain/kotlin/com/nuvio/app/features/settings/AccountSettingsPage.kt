@@ -84,6 +84,8 @@ import nuvio.composeapp.generated.resources.settings_sync_stream_display
 import nuvio.composeapp.generated.resources.settings_sync_stream_display_description
 import nuvio.composeapp.generated.resources.settings_sync_trakt
 import nuvio.composeapp.generated.resources.settings_sync_trakt_description
+import nuvio.composeapp.generated.resources.settings_updates_auto_check
+import nuvio.composeapp.generated.resources.settings_updates_auto_check_description
 import nuvio.composeapp.generated.resources.settings_updates_auto_install
 import nuvio.composeapp.generated.resources.settings_updates_auto_install_description
 import nuvio.composeapp.generated.resources.settings_updates_channel
@@ -391,52 +393,71 @@ private fun AccountSettingsBody(
                 isTablet = isTablet,
             ) {
                 SettingsGroup(isTablet = isTablet) {
-                    // Not rememberSaveable: the desktop saveable registry has no saver for enums.
-                    var channel by remember { mutableStateOf(AppUpdaterPlatform.getUpdateChannel()) }
-                    SettingsChoiceRow(
-                        title = stringResource(Res.string.settings_updates_channel),
-                        description = stringResource(Res.string.settings_updates_channel_description),
-                        options = listOf(
-                            SettingsChoiceOption(
-                                value = UpdateChannel.Stable,
-                                label = updateChannelLabel(UpdateChannel.Stable),
+                    if (AppUpdaterPlatform.isLinux) {
+                        // The package manager owns the install, so there is no channel to pick and
+                        // nothing to apply automatically; the only choice is whether to be told.
+                        var autoCheck by remember { mutableStateOf(AppUpdaterPlatform.isAutoCheckEnabled()) }
+                        SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_updates_auto_check),
+                            description = stringResource(Res.string.settings_updates_auto_check_description),
+                            checked = autoCheck,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("update-auto-check"),
                             ),
-                            SettingsChoiceOption(
-                                value = UpdateChannel.Nightly,
-                                label = updateChannelLabel(UpdateChannel.Nightly),
+                            onCheckedChange = { value ->
+                                autoCheck = value
+                                AppUpdaterPlatform.setAutoCheckEnabled(value)
+                            },
+                        )
+                    } else {
+                        // Not rememberSaveable: the desktop saveable registry has no saver for enums.
+                        var channel by remember { mutableStateOf(AppUpdaterPlatform.getUpdateChannel()) }
+                        SettingsChoiceRow(
+                            title = stringResource(Res.string.settings_updates_channel),
+                            description = stringResource(Res.string.settings_updates_channel_description),
+                            options = listOf(
+                                SettingsChoiceOption(
+                                    value = UpdateChannel.Stable,
+                                    label = updateChannelLabel(UpdateChannel.Stable),
+                                ),
+                                SettingsChoiceOption(
+                                    value = UpdateChannel.Nightly,
+                                    label = updateChannelLabel(UpdateChannel.Nightly),
+                                ),
                             ),
-                        ),
-                        selectedValue = channel,
-                        isTablet = isTablet,
-                        modifier = Modifier.settingsScrollAnchor(
-                            SettingsScrollAnchor.searchKey("update-channel"),
-                        ),
-                        onSelected = { value ->
-                            channel = value
-                            AppUpdaterPlatform.setUpdateChannel(value)
-                            // Check straight away: the point of switching is to get the other
-                            // channel's build, and waiting for the next launch to offer it makes
-                            // the toggle look like it did nothing.
-                            AppUpdaterController.recheckActiveController()
-                        },
-                    )
-                    SettingsGroupDivider(isTablet = isTablet)
-                    var autoInstall by rememberSaveable {
-                        mutableStateOf(AppUpdaterPlatform.isInPlaceUpdateEnabled())
+                            selectedValue = channel,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("update-channel"),
+                            ),
+                            onSelected = { value ->
+                                channel = value
+                                AppUpdaterPlatform.setUpdateChannel(value)
+                                // Check straight away: the point of switching is to get the other
+                                // channel's build, and waiting for the next launch to offer it makes
+                                // the toggle look like it did nothing.
+                                AppUpdaterController.recheckActiveController()
+                            },
+                        )
+                        SettingsGroupDivider(isTablet = isTablet)
+                        var autoInstall by rememberSaveable {
+                            mutableStateOf(AppUpdaterPlatform.isInPlaceUpdateEnabled())
+                        }
+                        SettingsSwitchRow(
+                            title = stringResource(Res.string.settings_updates_auto_install),
+                            description = stringResource(Res.string.settings_updates_auto_install_description),
+                            checked = autoInstall,
+                            isTablet = isTablet,
+                            modifier = Modifier.settingsScrollAnchor(
+                                SettingsScrollAnchor.searchKey("auto-install-updates"),
+                            ),
+                            onCheckedChange = { value ->
+                                autoInstall = value
+                                AppUpdaterPlatform.setInPlaceUpdateEnabled(value)
+                            },
+                        )
                     }
-                    SettingsSwitchRow(
-                        title = stringResource(Res.string.settings_updates_auto_install),
-                        description = stringResource(Res.string.settings_updates_auto_install_description),
-                        checked = autoInstall,
-                        isTablet = isTablet,
-                        modifier = Modifier.settingsScrollAnchor(
-                            SettingsScrollAnchor.searchKey("auto-install-updates"),
-                        ),
-                        onCheckedChange = { value ->
-                            autoInstall = value
-                            AppUpdaterPlatform.setInPlaceUpdateEnabled(value)
-                        },
-                    )
                 }
             }
         }
