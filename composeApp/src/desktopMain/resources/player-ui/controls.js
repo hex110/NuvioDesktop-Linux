@@ -139,6 +139,11 @@ const subtitleDelayReset = document.getElementById("subtitleDelayReset");
 const autoSyncLabel = document.getElementById("autoSyncLabel");
 const autoSyncReload = document.getElementById("autoSyncReload");
 const autoSyncCapture = document.getElementById("autoSyncCapture");
+const autoSyncRunStatus = document.getElementById("autoSyncRunStatus");
+const autoSyncAutomaticLabel = document.getElementById("autoSyncAutomaticLabel");
+const autoSyncManualLabel = document.getElementById("autoSyncManualLabel");
+const autoSyncEmbedded = document.getElementById("autoSyncEmbedded");
+const autoSyncListen = document.getElementById("autoSyncListen");
 const autoSyncStatus = document.getElementById("autoSyncStatus");
 const autoSyncCueList = document.getElementById("autoSyncCueList");
 const fontSizeLabel = document.getElementById("fontSizeLabel");
@@ -327,6 +332,10 @@ let state = {
   autoSyncLabel: "Auto Sync",
   reloadSmallLabel: "Reload",
   captureLineLabel: "Capture",
+  autoSyncAutomaticLabel: "Automatic",
+  autoSyncManualLabel: "Manual",
+  autoSyncEmbeddedLabel: "Embedded subs",
+  autoSyncListenLabel: "Listen",
   selectAddonSubtitleFirstLabel: "Select an addon subtitle first",
   loadingSubtitleLinesLabel: "Loading subtitle lines...",
   fontSizeLabel: "Font Size",
@@ -2918,6 +2927,23 @@ const renderSwatches = (container, selectedColor, eventType, availableColors = s
   container.appendChild(custom);
 };
 
+// On-demand automatic sync (embedded subtitles or listening). Kotlin pushes the run's status
+// through window.nuvioSetAutoSyncRunStatus rather than the controls state, so it survives the
+// structure-key dedupe and updates while the panel is open.
+let autoSyncRunning = false;
+const renderAutoSyncRunButtons = () => {
+  const disabled = autoSyncRunning || !state.hasSelectedAddonSubtitle;
+  autoSyncEmbedded.disabled = disabled;
+  autoSyncListen.disabled = disabled;
+};
+window.nuvioSetAutoSyncRunStatus = (text, running) => {
+  autoSyncRunning = Boolean(running);
+  autoSyncRunStatus.textContent = text || "";
+  autoSyncRunStatus.title = text || "";
+  autoSyncRunStatus.classList.toggle("running", autoSyncRunning);
+  renderAutoSyncRunButtons();
+};
+
 const renderAutoSyncCues = () => {
   if (!state.hasSelectedAddonSubtitle) {
     autoSyncStatus.textContent = state.selectAddonSubtitleFirstLabel || "Select an addon subtitle first";
@@ -3029,6 +3055,11 @@ const renderSubtitleStylePanel = () => {
   autoSyncLabel.textContent = state.autoSyncLabel || "Auto Sync";
   autoSyncReload.textContent = state.reloadSmallLabel || "Reload";
   autoSyncCapture.textContent = state.captureLineLabel || "Capture";
+  autoSyncAutomaticLabel.textContent = state.autoSyncAutomaticLabel || "Automatic";
+  autoSyncManualLabel.textContent = state.autoSyncManualLabel || "Manual";
+  autoSyncEmbedded.textContent = state.autoSyncEmbeddedLabel || "Embedded subs";
+  autoSyncListen.textContent = state.autoSyncListenLabel || "Listen";
+  renderAutoSyncRunButtons();
   fontSizeLabel.textContent = state.fontSizeLabel || "Font Size";
   fontSizeValue.textContent = `${Number(style.fontSizeSp) || 18}sp`;
   if (fontFamilySelect) {
@@ -5292,6 +5323,14 @@ autoSyncReload.addEventListener("click", event => {
 autoSyncCapture.addEventListener("click", event => {
   event.stopPropagation();
   send("subtitleAutoSyncCapture", 0);
+});
+autoSyncEmbedded.addEventListener("click", event => {
+  event.stopPropagation();
+  send("subtitleAutoSyncRun", 1);
+});
+autoSyncListen.addEventListener("click", event => {
+  event.stopPropagation();
+  send("subtitleAutoSyncRun", 2);
 });
 fontSizeMinus.addEventListener("click", event => {
   event.stopPropagation();

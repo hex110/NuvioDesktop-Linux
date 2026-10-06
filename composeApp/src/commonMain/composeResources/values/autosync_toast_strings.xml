@@ -7,4 +7,13 @@
     <string name="autosync_toast_synced">Subtitles synced to the video (%1$s)</string>
     <string name="autosync_toast_synced_other">Synced a better-matching subtitle (%1$s)</string>
     <string name="autosync_toast_within_tolerance">Subtitle timing already matches the video</string>
+    <string name="autosync_toast_listening">Listening to the video to sync the subtitles…</string>
+    <string name="autosync_toast_resynced">Subtitles re-synced from %1$s on (%2$s)</string>
+    <string name="autosync_toast_failed_listening">Sync failed: Auto Sync couldn’t match the spoken dialogue to this subtitle.</string>
+    <string name="autosync_run_comparing">Comparing with the video’s embedded subtitles…</string>
+    <string name="autosync_run_downloading_model">Downloading the speech model (%1$d MB)…</string>
+    <string name="autosync_run_model_download_failed">Sync failed: The speech model couldn’t be downloaded.</string>
+    <string name="autosync_run_needs_addon_subtitle">Choose an add-on subtitle first.</string>
+    <string name="autosync_run_embedded_needs_stream">Sync failed: Embedded subtitles can only be read from a streamed video.</string>
+    <string name="autosync_run_needs_ffmpeg">Sync failed: Listening needs ffmpeg installed.</string>
 </resources>

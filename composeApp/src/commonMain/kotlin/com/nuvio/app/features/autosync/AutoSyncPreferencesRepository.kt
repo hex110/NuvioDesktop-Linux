@@ -25,6 +25,10 @@ internal object AutoSyncPreferencesRepository {
     private val _syncToleranceMs = MutableStateFlow(0)
     val syncToleranceMs: StateFlow<Int> = _syncToleranceMs.asStateFlow()
 
+    /** Hear the dialogue to sync when there is no embedded subtitle to compare with. Off by default: it needs a model download. */
+    private val _speechRecognition = MutableStateFlow(false)
+    val speechRecognition: StateFlow<Boolean> = _speechRecognition.asStateFlow()
+
     private var loadedProfileId: Int? = null
     private var persistenceInstalled = false
     private var loadPersistedValue: (() -> Boolean?)? = null
@@ -33,6 +37,8 @@ internal object AutoSyncPreferencesRepository {
     private var saveAggressiveModePersistedValue: ((Boolean) -> Unit)? = null
     private var loadSyncTolerancePersistedValue: (() -> Int?)? = null
     private var saveSyncTolerancePersistedValue: ((Int) -> Unit)? = null
+    private var loadSpeechRecognitionPersistedValue: (() -> Boolean?)? = null
+    private var saveSpeechRecognitionPersistedValue: ((Boolean) -> Unit)? = null
     private var lastStartupSessionKey: Int? = null
     private var lastStartupPlaybackKey: String? = null
 
@@ -43,6 +49,8 @@ internal object AutoSyncPreferencesRepository {
         saveAggressiveMode: (Boolean) -> Unit = {},
         loadSyncToleranceMs: () -> Int? = { null },
         saveSyncToleranceMs: (Int) -> Unit = {},
+        loadSpeechRecognition: () -> Boolean? = { null },
+        saveSpeechRecognition: (Boolean) -> Unit = {},
     ) {
         loadPersistedValue = load
         savePersistedValue = save
@@ -50,6 +58,8 @@ internal object AutoSyncPreferencesRepository {
         saveAggressiveModePersistedValue = saveAggressiveMode
         loadSyncTolerancePersistedValue = loadSyncToleranceMs
         saveSyncTolerancePersistedValue = saveSyncToleranceMs
+        loadSpeechRecognitionPersistedValue = loadSpeechRecognition
+        saveSpeechRecognitionPersistedValue = saveSpeechRecognition
         persistenceInstalled = true
         loadedProfileId = null
     }
@@ -64,6 +74,7 @@ internal object AutoSyncPreferencesRepository {
         _aggressiveMode.value = loadAggressiveModePersistedValue?.invoke() ?: true
         _syncToleranceMs.value = loadSyncTolerancePersistedValue?.invoke()
             ?.takeIf { it in syncToleranceOptionsMs } ?: 0
+        _speechRecognition.value = loadSpeechRecognitionPersistedValue?.invoke() ?: false
         loadedProfileId = profileId
         lastStartupSessionKey = null
         lastStartupPlaybackKey = null
@@ -88,6 +99,13 @@ internal object AutoSyncPreferencesRepository {
         if (toleranceMs !in syncToleranceOptionsMs || _syncToleranceMs.value == toleranceMs) return
         _syncToleranceMs.value = toleranceMs
         saveSyncTolerancePersistedValue?.invoke(toleranceMs)
+    }
+
+    fun setSpeechRecognition(enabled: Boolean) {
+        ensureLoaded()
+        if (_speechRecognition.value == enabled) return
+        _speechRecognition.value = enabled
+        saveSpeechRecognitionPersistedValue?.invoke(enabled)
     }
 
     fun claimStartupRun(sessionKey: Int, playbackKey: String): Boolean {

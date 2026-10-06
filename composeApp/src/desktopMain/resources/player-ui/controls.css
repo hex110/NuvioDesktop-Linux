@@ -2367,6 +2367,27 @@ button:disabled {
   padding: 8px 4px 4px;
 }
 #subtitleModal #autoSyncCueList:empty { display: none; }
+/* On-demand sync: the run's progress/result sits beside the card title. */
+#subtitleModal #autoSyncRunStatus {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: rgba(255,255,255,.52);
+  font-size: 11px;
+  line-height: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#subtitleModal #autoSyncRunStatus.running { color: rgba(255,255,255,.8); }
+#subtitleModal .auto-sync-mode {
+  flex: 0 0 auto;
+  min-width: 64px;
+  color: rgba(255,255,255,.52);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
 .speed-control { position: relative; display: flex; align-items: center; }
 .speed-control .action { position: relative; z-index: 1; }
 #speedPicker {

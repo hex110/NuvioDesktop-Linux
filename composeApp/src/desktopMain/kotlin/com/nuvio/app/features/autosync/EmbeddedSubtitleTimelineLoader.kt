@@ -1,5 +1,6 @@
 package com.nuvio.app.features.autosync
 
+import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.DesktopIPv4FirstDns
 import com.nuvio.app.features.player.SubtitleSyncCue
 import kotlinx.coroutines.CancellationException
@@ -238,7 +239,10 @@ internal object EmbeddedSubtitleTimelineLoader {
         val segment = findSegment(initial.bytes)
         // Not Matroska. Upstream also indexes MP4 sample tables through Media3's box parser,
         // which has no desktop counterpart; such sources report no indexed reference.
-        if (segment == null) return null
+        if (segment == null) {
+            Logger.withTag("AutoSync").i { "reference: source is not Matroska/WebM (MP4 is not indexed on desktop)" }
+            return null
+        }
 
         val initialMetadata = InitialMetadata(
             segmentDataStart = segment.dataStart.toLong(),
@@ -328,6 +332,7 @@ internal object EmbeddedSubtitleTimelineLoader {
             )
             )?.let(::parseSubtitleTracks).orEmpty()
         if (subtitleTracks.isEmpty()) {
+            Logger.withTag("AutoSync").i { "reference: the Matroska file has no embedded subtitle tracks" }
             return IndexedEmbeddedTimeline(
                 tracks = emptyList(),
                 source = "matroska-no-subtitle-tracks",
@@ -373,6 +378,10 @@ internal object EmbeddedSubtitleTimelineLoader {
             stats = stats,
         ) ?: return null
 
+        Logger.withTag("AutoSync").i {
+            "reference: ${subtitleTracks.size} embedded subtitle track(s), cues per track: " +
+                subtitleTracks.joinToString { "${it.number}=${parsedCues[it.number]?.cues?.size ?: 0}" }
+        }
         if (subtitleTracks.all { track -> parsedCues[track.number]?.cues.orEmpty().isEmpty() }) {
             return IndexedEmbeddedTimeline(
                 tracks = emptyList(),

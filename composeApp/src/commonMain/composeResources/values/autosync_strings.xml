@@ -10,4 +10,15 @@
     <string name="settings_playback_auto_sync_tolerance_description">Keep the original subtitle timing when the sync would move it by no more than this. Tap to change.</string>
     <string name="settings_playback_auto_sync_tolerance_off">Off</string>
     <string name="settings_playback_auto_sync_tolerance_value">%1$d ms</string>
+    <string name="settings_playback_auto_sync_speech">Auto Sync by Listening (Beta)</string>
+    <string name="settings_playback_auto_sync_speech_description">When there is no embedded subtitle to compare with, listen to the English dialogue at a few points in the video and sync to it. Runs on this device; needs a one-time %1$d MB speech model and ffmpeg.</string>
+    <string name="settings_playback_auto_sync_speech_downloading">Downloading the speech model… %1$d%%</string>
+    <string name="settings_playback_auto_sync_speech_error">Speech model download failed: %1$s. Tap to retry.</string>
+    <string name="settings_playback_auto_sync_speech_no_tools">ffmpeg and ffprobe are not installed, so Auto Sync cannot listen to the video. Install ffmpeg and restart.</string>
+    <string name="settings_playback_auto_sync_speech_remove">Remove the speech model (%1$d MB)</string>
+    <string name="settings_playback_auto_sync_speech_remove_description">Frees the disk space. Listening is turned off until the model is downloaded again.</string>
+    <string name="autosync_player_automatic">Automatic</string>
+    <string name="autosync_player_manual">Manual</string>
+    <string name="autosync_player_embedded">Embedded subs</string>
+    <string name="autosync_player_listen">Listen</string>
 </resources>

@@ -1,3 +1,5 @@
+import java.net.URI
+import java.security.MessageDigest
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
@@ -285,6 +287,35 @@ val isAndroidAppBundleBuild = requestedGradleTasks.any { taskName ->
         taskName.startsWith("bundleplaystore") ||
         taskName.startsWith("bundlefull") ||
         taskName.endsWith("bundle")
+}
+
+// sherpa-onnx (Apache-2.0) powers desktop AutoSync's speech recognition. The JVM API and the
+// Linux x64 native library are release assets of k2-fsa/sherpa-onnx, not on Maven Central, so
+// they are fetched once into the build directory and checked against pinned hashes.
+val sherpaOnnxVersion = "1.13.8"
+val sherpaOnnxJars = mapOf(
+    "sherpa-onnx-jvm-$sherpaOnnxVersion.jar" to "77b7b047fade4eadada96b568eb92615049aaf1dc317c7244e46c1ea38b9a63b",
+    "sherpa-onnx-native-lib-linux-x64-$sherpaOnnxVersion.jar" to "30c93b59381113f9c20aedbbf9fc1ad399158f6bc03dddc0f8934a6e28e069ba",
+)
+val sherpaOnnxDir = layout.buildDirectory.dir("sherpa-onnx")
+val fetchSherpaOnnx = tasks.register("fetchSherpaOnnx") {
+    val dir = sherpaOnnxDir
+    val jars = sherpaOnnxJars
+    val version = sherpaOnnxVersion
+    outputs.dir(dir)
+    doLast {
+        val target = dir.get().asFile.apply { mkdirs() }
+        fun sha256(file: File) = MessageDigest.getInstance("SHA-256")
+            .digest(file.readBytes()).joinToString("") { "%02x".format(it) }
+        for ((name, hash) in jars) {
+            val file = File(target, name)
+            if (file.exists() && sha256(file) == hash) continue
+            val url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$version/$name"
+            logger.lifecycle("Downloading $url")
+            URI(url).toURL().openStream().use { input -> file.outputStream().use { input.copyTo(it) } }
+            check(sha256(file) == hash) { "$name does not match its pinned SHA-256" }
+        }
+    }
 }
 
 val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generateRuntimeConfigs") {
@@ -1329,6 +1360,7 @@ kotlin {
                 implementation("com.squareup.okhttp3:okhttp:4.12.0")
                 implementation(libs.quickjs.kt)
                 implementation(libs.ksoup)
+                implementation(files(sherpaOnnxJars.keys.map { sherpaOnnxDir.get().file(it) }).builtBy(fetchSherpaOnnx))
             }
         }
         commonMain.dependencies {

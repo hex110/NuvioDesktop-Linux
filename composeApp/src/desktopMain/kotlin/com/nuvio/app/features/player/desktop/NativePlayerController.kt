@@ -4,6 +4,7 @@ import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
 import com.nuvio.app.isWindows
 import com.nuvio.app.features.autosync.AutoSyncCandidateScope
+import com.nuvio.app.features.autosync.AutoSyncMethod
 import com.nuvio.app.features.autosync.AutoSyncPlayerController
 import com.nuvio.app.features.autosync.AutoSyncSubtitleCandidate
 import com.nuvio.app.features.autosync.DesktopAutoSyncCoordinator
@@ -175,6 +176,11 @@ internal class NativePlayerController(
     private var onScrubFinished: (Long) -> Boolean = { false }
     private val autoSync = DesktopAutoSyncCoordinator(
         currentSource = { pendingSource?.let { it.sourceUrl to it.headerLines.toHeaderMap() } },
+        currentPositionMs = {
+            synchronized(handleLock) { handle }.takeIf { it != 0L }?.let { current ->
+                runCatching { NativePlayerBridge.positionMs(current) }.getOrNull()
+            }
+        },
         attachSubtitle = ::attachSubtitleNow,
         replaceSubtitles = { path ->
             handle.takeIf { it != 0L }?.let { current ->
@@ -186,6 +192,14 @@ internal class NativePlayerController(
         setPlayerSubtitleDelayMs = ::setSubtitleDelayMs,
         // Upstream shows Android toasts; the HUD's message pill is the desktop equivalent.
         showMessage = { message -> showTransientMessage("Auto Sync", message) },
+        showRunStatus = { text, running ->
+            handle.takeIf { it != 0L }?.let { current ->
+                NativePlayerBridge.runJavaScript(
+                    current,
+                    "window.nuvioSetAutoSyncRunStatus && window.nuvioSetAutoSyncRunStatus(${text.toJsonString()}, $running)",
+                )
+            }
+        },
     )
 
     // Learns the connection's real throughput from main-player playback, for stream ranking
@@ -990,6 +1004,12 @@ internal class NativePlayerController(
             // rendered frame like the failover pill — shown now it would expire unseen.
             audioPassthroughLog.i { "rejected by output device; bridge fell back to PCM (trackReloaded=${value >= 1.0})" }
             transientMessageForNextAttach = "Audio passthrough" to "Not supported by output device — decoding to PCM"
+            return
+        }
+        if (type == "subtitleAutoSyncRun") {
+            // The subtitle panel's on-demand sync: 1 = embedded subtitles, 2 = listening.
+            val method = if (value.toInt() == 2) AutoSyncMethod.SPEECH else AutoSyncMethod.EMBEDDED_SUBTITLES
+            autoSync.runOnDemand(method)
             return
         }
         if (type == "keyboardCycleHdrMode") {
@@ -2238,6 +2258,14 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonField("reloadSmallLabel", reloadSmallLabel)
         append(',')
         appendJsonField("captureLineLabel", captureLineLabel)
+        append(',')
+        appendJsonField("autoSyncAutomaticLabel", autoSyncAutomaticLabel)
+        append(',')
+        appendJsonField("autoSyncManualLabel", autoSyncManualLabel)
+        append(',')
+        appendJsonField("autoSyncEmbeddedLabel", autoSyncEmbeddedLabel)
+        append(',')
+        appendJsonField("autoSyncListenLabel", autoSyncListenLabel)
         append(',')
         appendJsonField("selectAddonSubtitleFirstLabel", selectAddonSubtitleFirstLabel)
         append(',')
