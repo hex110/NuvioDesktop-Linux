@@ -1,0 +1,52 @@
+# Repackages the .deb that hex110/NuvioDesktop-Linux CI attaches to each release.
+# Payload lives in /opt/nuvio-htpc and data in ~/.config/nuviohtpc, so this
+# coexists with the stock Nuvio (/opt/Nuvio, nuvio-linux-rated).
+pkgname=nuvio-htpc-bin
+_tag=v1.15.0-linux2
+pkgver=1.15.0.linux2
+pkgrel=2
+pkgdesc="Nuvio HTPC fork, Linux port (native mpv player bridge)"
+arch=('x86_64')
+url="https://github.com/hex110/NuvioDesktop-Linux"
+license=('GPL-3.0-only')
+depends=('mpv' 'webkit2gtk-4.1' 'gtk3' 'glib2' 'libx11' 'libxcomposite' 'cairo'
+         'xdg-utils')
+provides=('nuvio-htpc')
+conflicts=('nuvio-htpc')
+options=('!strip' '!debug')
+source=("$url/releases/download/$_tag/Nuvio-HTPC-Linux-x86_64-$_tag.deb")
+sha256sums=('ada3aac3b26fbbc9644e23a1c79dfd8d228dab5acc45dcc9235eed786f5cbc1a')
+noextract=("Nuvio-HTPC-Linux-x86_64-$_tag.deb")
+
+prepare() {
+  mkdir -p deb
+  bsdtar -xf "Nuvio-HTPC-Linux-x86_64-$_tag.deb" -C deb
+  bsdtar -xf deb/data.tar.* -C deb
+}
+
+package() {
+  cp -a deb/opt "$pkgdir/"
+
+  install -d "$pkgdir/usr/bin"
+  ln -s /opt/nuvio-htpc/bin/Nuvio "$pkgdir/usr/bin/nuvio-htpc"
+
+  install -Dm644 deb/opt/nuvio-htpc/lib/Nuvio.png \
+    "$pkgdir/usr/share/pixmaps/nuvio-htpc.png"
+
+  # jpackage's own entry is named "Nuvio" with an invalid category; give it a
+  # distinct name so the launcher can tell it apart from the stock Nuvio.
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/nuvio-htpc.desktop" <<EOF
+[Desktop Entry]
+Name=Nuvio HTPC
+Comment=Nuvio HTPC media client
+Exec=/opt/nuvio-htpc/bin/Nuvio %U
+Icon=nuvio-htpc
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Player;
+StartupWMClass=nuvio-htpc
+EOF
+
+  install -Dm644 deb/opt/nuvio-htpc/share/doc/copyright \
+    "$pkgdir/usr/share/licenses/$pkgname/copyright"
+}
