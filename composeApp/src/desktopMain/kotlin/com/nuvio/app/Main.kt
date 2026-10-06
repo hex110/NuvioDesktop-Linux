@@ -1020,7 +1020,10 @@ private fun configureDesktopRenderer() {
         // while Settings displayed "OpenGL" (the value PlayerSettingsRepository defaults to) until
         // the user saved the setting once. Direct3D is the default (see DesktopRendererApi for why
         // OpenGL is opt-in); it must match the PlayerSettingsRepository default Settings displays.
-        val renderer = stored ?: DesktopRendererApi.D3D11
+        // NUVIO-LINUX: Direct3D does not exist here, and a saved or default D3D11 choice would
+        // throw when the first window opens. OpenGL is the only backend.
+        val onLinux = System.getProperty("os.name").orEmpty().contains("linux", ignoreCase = true)
+        val renderer = if (onLinux) DesktopRendererApi.OpenGL else stored ?: DesktopRendererApi.D3D11
         renderer?.let { System.setProperty("skiko.renderApi", it.skikoRenderApi) }
     }
 }
