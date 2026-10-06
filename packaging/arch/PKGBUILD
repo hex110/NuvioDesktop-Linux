@@ -2,9 +2,9 @@
 # Payload lives in /opt/nuvio-htpc and data in ~/.config/nuviohtpc, so this
 # coexists with the stock Nuvio (/opt/Nuvio, nuvio-linux-rated).
 pkgname=nuvio-htpc-bin
-_tag=v1.15.0-linux2
-pkgver=1.15.0.linux2
-pkgrel=2
+_tag=v1.15.0-linux3
+pkgver=1.15.0.linux3
+pkgrel=1
 pkgdesc="Nuvio HTPC fork, Linux port (native mpv player bridge)"
 arch=('x86_64')
 url="https://github.com/hex110/NuvioDesktop-Linux"
@@ -15,7 +15,7 @@ provides=('nuvio-htpc')
 conflicts=('nuvio-htpc')
 options=('!strip' '!debug')
 source=("$url/releases/download/$_tag/Nuvio-HTPC-Linux-x86_64-$_tag.deb")
-sha256sums=('ada3aac3b26fbbc9644e23a1c79dfd8d228dab5acc45dcc9235eed786f5cbc1a')
+sha256sums=('164f0fb04b9d58b89a26c237e33f51c35fd938ba359b27bc8a21cadd8dd59d2d')
 noextract=("Nuvio-HTPC-Linux-x86_64-$_tag.deb")
 
 prepare() {

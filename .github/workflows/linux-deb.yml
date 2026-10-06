@@ -69,6 +69,9 @@ jobs:
         run: python3 ./scripts/linux/check-jni-contract.py
 
       - name: Build Linux DEB
+        env:
+          # What the in-app update check compares against the latest release.
+          NUVIO_LINUX_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: |
           set -euo pipefail
           ./gradlew :composeApp:packageReleaseDeb \
@@ -122,8 +125,67 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --notes "Linux build of the Nuvio HTPC fork.
 
-          Install on Arch with packaging/arch/PKGBUILD from this repository, which
-          repackages this .deb; the payload installs to /opt/nuvio-htpc and keeps
-          its data in ~/.config/nuviohtpc, so it coexists with the stock Nuvio.
+          Arch: sudo pacman -U nuvio-htpc-bin-*.pkg.tar.zst
+          Debian/Ubuntu: sudo apt install ./Nuvio-HTPC-Linux-x86_64-*.deb
+
+          The payload installs to /opt/nuvio-htpc and keeps its data in
+          ~/.config/nuviohtpc, so it coexists with the stock Nuvio.
           Auto Sync by Listening needs ffmpeg installed."
 
+
+  # Builds the Arch package from the .deb above, so Arch users can `pacman -U`
+  # it straight from the release instead of running makepkg themselves. Also
+  # attaches the PKGBUILD with this release's tag and checksum filled in --
+  # the committed one only changes when someone bumps it.
+  arch_package:
+    name: Linux x64 - Arch package
+    needs: linux_deb
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container: archlinux:latest
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: nuvio-htpc-linux-deb-${{ github.ref_name }}
+          path: build
+
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm base-devel pacman-contrib github-cli libarchive
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          deb="Nuvio-HTPC-Linux-x86_64-${RELEASE_VERSION}.deb"
+          cp packaging/arch/PKGBUILD build/PKGBUILD
+          cd build
+
+          # v1.15.0-linux3 -> pkgver 1.15.0.linux3 (pkgver may not contain '-').
+          sed -i \
+            -e "s|^_tag=.*|_tag=${RELEASE_VERSION}|" \
+            -e "s|^pkgver=.*|pkgver=${RELEASE_VERSION#v}|" \
+            -e "s|^pkgver=\(.*\)-|pkgver=\1.|" \
+            -e "s|^pkgrel=.*|pkgrel=1|" \
+            -e "s|^sha256sums=.*|sha256sums=('$(sha256sum "$deb" | cut -d' ' -f1)')|" \
+            PKGBUILD
+
+          # makepkg refuses to run as root. The .deb sits next to the PKGBUILD,
+          # so makepkg uses it instead of downloading from the release.
+          useradd -m builder
+          chown -R builder .
+          su builder -c 'makepkg --nodeps --noconfirm'
+          ls -lh *.pkg.tar.zst
+
+      - name: Attach to release
+        run: |
+          set -euo pipefail
+          cd build
+          gh release upload "${RELEASE_VERSION}" *.pkg.tar.zst PKGBUILD \
+            --repo "${GITHUB_REPOSITORY}" --clobber

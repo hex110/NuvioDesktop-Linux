@@ -16,6 +16,30 @@
 
 This fork is unaffiliated with the Nuvio team. Don't worry about the commit disparity, Nuvio's team makes many small commits while I bundle everything into a single release commit for simplicity as this is mostly a solo focused project.
 
+# Installation (Linux)
+
+This repository is the Linux port. Packages are attached to each
+[release](https://github.com/hex110/NuvioDesktop-Linux/releases/latest).
+
+**Arch / CachyOS / Manjaro**
+
+```bash
+sudo pacman -U nuvio-htpc-bin-*.pkg.tar.zst
+```
+
+**Debian / Ubuntu**
+
+```bash
+sudo apt install ./Nuvio-HTPC-Linux-x86_64-*.deb
+```
+
+Then launch **Nuvio HTPC** from your app menu, or run `nuvio-htpc` (Arch package).
+
+- Requires `mpv`, GTK3 and WebKitGTK 4.1; the package managers pull these in. Install `ffmpeg` for AutoSync by listening.
+- Installs to `/opt/nuvio-htpc` and keeps its data in `~/.config/nuviohtpc`, so it coexists with the stock Nuvio.
+- Building the Arch package yourself: see [`packaging/arch`](packaging/arch/README.md).
+- Windows and macOS builds are not published from this fork; see the upstream section below.
+
 # Home Theatre features
 
 * Mouse, keyboard or controller friendly TV Mode with full-screen navigation, adaptive hero, row-jump navigation, cast and award information. This applies across all panels, not just home.
