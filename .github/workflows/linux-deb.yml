@@ -122,7 +122,8 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --notes "Linux build of the Nuvio HTPC fork.
 
-          Install on Arch with the PKGBUILD in ~/pkgbuilds/nuvio-htpc-bin, which
+          Install on Arch with packaging/arch/PKGBUILD from this repository, which
           repackages this .deb; the payload installs to /opt/nuvio-htpc and keeps
-          its data in ~/.config/nuviohtpc, so it coexists with the stock Nuvio."
+          its data in ~/.config/nuviohtpc, so it coexists with the stock Nuvio.
+          Auto Sync by Listening needs ffmpeg installed."
 
