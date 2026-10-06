@@ -55,7 +55,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -67,6 +66,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import com.nuvio.app.core.ui.navigationKey
+import com.nuvio.app.core.ui.rememberHoldToSelectState
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -86,6 +86,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.isDesktop
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioBackButton
+import com.nuvio.app.core.ui.KeepListAtTopWhileItemsArrive
 import com.nuvio.app.core.ui.NuvioPosterCard
 import com.nuvio.app.core.ui.HeroAmbientBackdrop
 import com.nuvio.app.core.ui.LocalCollectionsPosterSurface
@@ -438,27 +439,6 @@ private fun FolderDetailScreenContent(
 }
 
 
-/**
- * Collection rows load in parallel and a row only exists once its catalog has returned items, so
- * rows arrive in completion order, not display order. A keyed lazy list anchors on its first
- * visible item's key: the row that answered first lands at the top, and every row meant to sit
- * above it is then inserted out of view — the folder opens scrolled to whichever catalog was
- * fastest. While the list is still exactly at its top, ask it to stay at index 0 instead of
- * following that key. Once the user has scrolled, the default key anchoring is what they want.
- */
-@Composable
-private fun KeepListAtTopWhileRowsArrive(state: LazyListState, rowKeys: List<String>) {
-    remember(state, rowKeys) {
-        // Unobserved: this runs in the caller's composition, and reading the scroll position
-        // normally would recompose the whole screen on every scroll frame.
-        Snapshot.withoutReadObservation {
-            if (state.firstVisibleItemIndex == 0 && state.firstVisibleItemScrollOffset == 0) {
-                state.requestScrollToItem(0)
-            }
-        }
-    }
-}
-
 private fun HomeTvKey.movesTvFocus(): Boolean = when (this) {
     HomeTvKey.Down, HomeTvKey.Up, HomeTvKey.Left, HomeTvKey.Right,
     HomeTvKey.PageDown, HomeTvKey.PageUp, HomeTvKey.Home, HomeTvKey.End -> true
@@ -581,6 +561,7 @@ private fun ImmersiveCollectionContent(
     // must still resolve to a real item instead of going null and freezing the hero on
     // whatever the pager last showed.
     val focusedItem = activeRowEntries.getOrNull(activeItemIndex)
+    val selectHold = rememberHoldToSelectState()
 
     // Mirrors HomeScreen's handleHomeTvKey: a shared handler so the same navigation works
     // whether Compose still owns keyboard focus or the native hero-trailer surface has
@@ -686,6 +667,17 @@ private fun ImmersiveCollectionContent(
                 }
             }
             .onPreviewKeyEvent { event ->
+                val selectKey = event.navigationKey()
+                if (selectKey == Key.Enter || selectKey == Key.NumPadEnter) {
+                    val item = focusedItem
+                    return@onPreviewKeyEvent selectHold.handle(
+                        event = event,
+                        onSelect = { handleTvKey(HomeTvKey.Select) },
+                        onHold = item?.let { focused ->
+                            onPosterLongClick?.let { longPress -> { longPress(focused) } }
+                        },
+                    )
+                }
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.navigationKey()) {
                     Key.Backspace -> {
@@ -702,7 +694,6 @@ private fun ImmersiveCollectionContent(
                     Key.PageUp -> handleTvKey(HomeTvKey.PageUp)
                     Key.MoveHome -> handleTvKey(HomeTvKey.Home)
                     Key.MoveEnd -> handleTvKey(HomeTvKey.End)
-                    Key.Enter, Key.NumPadEnter -> handleTvKey(HomeTvKey.Select)
                     Key.T -> handleTvKey(HomeTvKey.ToggleTrailer)
                     Key.Escape -> handleTvKey(HomeTvKey.Dismiss)
                     else -> false
@@ -956,6 +947,7 @@ private fun AdaptiveCollectionContent(
     // must still resolve to a real item instead of going null and freezing the hero on
     // whatever the pager last showed.
     val focusedItem = activeRowEntries.getOrNull(activeItemIndex)
+    val selectHold = rememberHoldToSelectState()
 
     // Mirrors HomeScreen's handleHomeTvKey: a shared handler so the same navigation works
     // whether Compose still owns keyboard focus or the native hero-trailer surface has
@@ -1050,6 +1042,17 @@ private fun AdaptiveCollectionContent(
                 mouseActivity.onMouseMoved(event.changes.first().position)
             }
             .onPreviewKeyEvent { event ->
+                val selectKey = event.navigationKey()
+                if (selectKey == Key.Enter || selectKey == Key.NumPadEnter) {
+                    val item = focusedItem
+                    return@onPreviewKeyEvent selectHold.handle(
+                        event = event,
+                        onSelect = { handleTvKey(HomeTvKey.Select) },
+                        onHold = item?.let { focused ->
+                            onPosterLongClick?.let { longPress -> { longPress(focused) } }
+                        },
+                    )
+                }
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.navigationKey()) {
                     Key.Backspace -> {
@@ -1064,7 +1067,6 @@ private fun AdaptiveCollectionContent(
                     Key.PageUp -> handleTvKey(HomeTvKey.PageUp)
                     Key.MoveHome -> handleTvKey(HomeTvKey.Home)
                     Key.MoveEnd -> handleTvKey(HomeTvKey.End)
-                    Key.Enter, Key.NumPadEnter -> handleTvKey(HomeTvKey.Select)
                     Key.T -> handleTvKey(HomeTvKey.ToggleTrailer)
                     Key.Escape -> handleTvKey(HomeTvKey.Dismiss)
                     else -> false
@@ -1114,7 +1116,7 @@ private fun AdaptiveCollectionContent(
                 )
             }
 
-            KeepListAtTopWhileRowsArrive(lazyListState, sections.map { it.key })
+            KeepListAtTopWhileItemsArrive(lazyListState, sections.map { it.key })
             LazyColumn(state = lazyListState, modifier = Modifier.weight(1f)) {
                 sections.forEachIndexed { rowIndex, section ->
                     val previewEntries = section.items.take(FolderCatalogPreviewLimit)
@@ -1355,7 +1357,7 @@ private fun RowsContent(
         },
     )
 
-    KeepListAtTopWhileRowsArrive(listState, sections.map { it.key })
+    KeepListAtTopWhileItemsArrive(listState, sections.map { it.key })
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize().then(pageScrollKeys),

@@ -7,6 +7,9 @@ import com.nuvio.app.features.lights.LightsPlaybackSource
 import java.awt.Desktop
 import java.io.File
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import javax.swing.JFileChooser
@@ -36,6 +39,10 @@ private class DesktopPlayerDefinition(
     val candidatePaths: List<String>,
     val executableNames: List<String>,
     val buildArgs: (ExternalPlayerPlaybackRequest) -> List<String>,
+    /** Rejects an install that exists but cannot play network streams, so discovery moves on. */
+    val isUsableInstall: (File) -> Boolean = { true },
+    /** How the source goes on the command line; most players take it as a bare last argument. */
+    val sourceArgs: (String) -> List<String> = { listOf(it) },
 )
 
 internal actual object ExternalPlayerPlatform {
@@ -74,6 +81,15 @@ internal actual object ExternalPlayerPlatform {
                 "%ProgramFiles(x86)%\\VideoLAN\\VLC\\vlc.exe",
             ),
             executableNames = listOf("vlc.exe"),
+            // A VLC install with a stripped plugins/access folder (no http/https access modules)
+            // fails every stream with "no access modules matched". Seen with a side-by-side
+            // 64-bit install next to a working 32-bit one.
+            isUsableInstall = { exe ->
+                val access = File(exe.parentFile, "plugins\\access")
+                !access.isDirectory ||
+                    File(access, "libhttps_plugin.dll").isFile ||
+                    File(access, "libhttp_plugin.dll").isFile
+            },
             buildArgs = { request ->
                 buildList {
                     request.buildPlayerTitle(includeEpisodeTitle = true)
@@ -85,7 +101,16 @@ internal actual object ExternalPlayerPlatform {
                     // VLC only exposes a fixed set of HTTP headers, not arbitrary ones.
                     request.sourceHeaders.headerValue("user-agent")?.let { add("--http-user-agent=$it") }
                     request.sourceHeaders.headerValue("referer", "referrer")?.let { add("--http-referrer=$it") }
-                    request.subtitles?.firstOrNull()?.let { add("--sub-file=${it.url}") }
+                    // --sub-file takes one track and selects it; the rest ride along as
+                    // `#`-separated --input-slave entries. VLC types a slave by its file
+                    // extension (anything unrecognised is loaded as an audio track), and `#`
+                    // is the separator, so only extension-typed, `#`-free references qualify.
+                    val subtitleUrls = request.subtitles.orEmpty().map { it.url }
+                    subtitleUrls.firstOrNull()?.let { add("--sub-file=$it") }
+                    subtitleUrls.drop(1)
+                        .filter { url -> '#' !in url && url.hasVlcSubtitleExtension() }
+                        .takeIf { it.isNotEmpty() }
+                        ?.let { add("--input-slave=${it.joinToString("#")}") }
                 }
             },
         ),
@@ -165,6 +190,29 @@ internal actual object ExternalPlayerPlatform {
                 }
             },
         ),
+        // Microsoft Store (MSIX) app: there is no install folder to find, only the execution
+        // alias it registers under WindowsApps (also on PATH). Switches are from the author's
+        // Kodi/Stremio integration guides: the source must go through --path=, subtitles through
+        // --subs-path=, and there is no start-time, title or header switch.
+        DesktopPlayerDefinition(
+            id = "energy",
+            displayName = "Energy Media Player",
+            candidatePaths = listOf(
+                "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\EnergyPlayer.exe",
+                "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\EnergyPlayerWin.exe",
+                "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\EnergyPlayerForWindows.exe",
+            ),
+            executableNames = listOf("EnergyPlayer.exe", "EnergyPlayerWin.exe", "EnergyPlayerForWindows.exe"),
+            buildArgs = { request ->
+                // Only one subtitle switch is documented, so forward the best-ranked track. The
+                // app is sandboxed and cannot read Nuvio's subtitle cache (a cached path left it
+                // stuck loading), so it gets the original addon URL, as Stremio's integration does.
+                request.subtitles.orEmpty().firstOrNull()
+                    ?.let { listOf("--subs-path=${it.sourceUrl ?: it.url}") }
+                    .orEmpty()
+            },
+            sourceArgs = { source -> listOf("--path=$source") },
+        ),
     )
 
     /** Resolved only when a specific player is needed; startup no longer scans every player. */
@@ -178,10 +226,11 @@ internal actual object ExternalPlayerPlatform {
         val customPath = customPlayerStore
             .getString(customPlayerPathKey(def.id))
             ?.let(::File)
-            ?.takeIf(File::isFile)
+            ?.takeIf(File::isLaunchableFile)
             ?.absolutePath
         val associatedPath = defaultMediaAssociation
             ?.takeIf { association -> def.matchesExecutable(association.executablePath) }
+            ?.takeIf { association -> def.isUsableInstall(File(association.executablePath)) }
             ?.executablePath
         val discoveredPath = if (customPath == null && associatedPath == null) resolveExecutable(def) else null
         val resolved = customPath ?: associatedPath ?: discoveredPath
@@ -267,6 +316,13 @@ internal actual object ExternalPlayerPlatform {
                 "source=$sourceSummary headers=${request.sourceHeaders.size} " +
                 "subtitles=${request.subtitles.orEmpty().size} resumeMs=${request.resumePositionMs}"
         }
+        val verdict = PlaybackSourcePolicy.check(request.sourceUrl)
+        if (verdict is PlaybackSourcePolicy.Verdict.Rejected) {
+            externalPlayerLog.w {
+                "External playback refused: source rejected (${verdict.reason}) source=$sourceSummary"
+            }
+            return ExternalPlayerOpenResult.Failed
+        }
 
         if (effectiveId == null || effectiveId == systemPlayerId) {
             defaultMediaAssociation?.let { association ->
@@ -274,7 +330,9 @@ internal actual object ExternalPlayerPlatform {
                 val command = buildList {
                     add(association.executablePath)
                     if (knownDefinition != null) addAll(knownDefinition.buildArgs(request))
-                    add(request.sourceUrl)
+                    addEndOfOptions(association.executablePath)
+                    if (knownDefinition != null) addAll(knownDefinition.sourceArgs(request.sourceUrl))
+                    else add(request.sourceUrl)
                 }
                 if (
                     launchDetached(
@@ -299,7 +357,8 @@ internal actual object ExternalPlayerPlatform {
         val command = buildList {
             add(exePath)
             addAll(def.buildArgs(request))
-            add(request.sourceUrl)
+            addEndOfOptions(exePath)
+            addAll(def.sourceArgs(request.sourceUrl))
         }
         return if (
             launchDetached(
@@ -327,6 +386,13 @@ internal actual object ExternalPlayerPlatform {
         }
         return runCatching {
             ProcessBuilder(command)
+                // Run from the player's own folder. Inheriting ours pins Nuvio's install
+                // directory for as long as the player stays open, which blocks updates.
+                .apply {
+                    File(executable).takeIf(File::isAbsolute)?.parentFile
+                        ?.takeIf(File::isDirectory)
+                        ?.let(::directory)
+                }
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.DISCARD)
                 .start()
@@ -363,15 +429,27 @@ internal actual object ExternalPlayerPlatform {
     // --- executable resolution ------------------------------------------------------------
 
     private fun resolveExecutable(def: DesktopPlayerDefinition): String? {
-        // Keep discovery in-process: check known install locations first, then PATH.
-        def.candidatePaths.forEach { candidate ->
-            val expanded = expandEnvPlaceholders(candidate)
-            if (expanded != null && File(expanded).isFile) return expanded
+        // The installer's App Paths registration comes first: it names the install the user
+        // actually launches, which the hard-coded candidates can get wrong when two installs sit
+        // side by side (64-bit and 32-bit VLC). Then known install locations, then PATH.
+        val candidates = sequence {
+            if (isWindows) {
+                def.executableNames.forEach { exe ->
+                    listOf("HKCU", "HKLM").forEach { hive ->
+                        queryRegistryValue(
+                            key = "$hive\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$exe",
+                            valueName = null,
+                        )?.trim('"')?.let(::expandEnvPlaceholders)?.let { yield(it) }
+                    }
+                }
+            }
+            def.candidatePaths.forEach { candidate -> expandEnvPlaceholders(candidate)?.let { yield(it) } }
+            def.executableNames.forEach { exe -> findOnPath(exe)?.let { yield(it) } }
         }
-        def.executableNames.forEach { exe ->
-            findOnPath(exe)?.let { return it }
-        }
-        return null
+        return candidates
+            .map(::File)
+            .firstOrNull { it.isLaunchableFile() && def.isUsableInstall(it) }
+            ?.absolutePath
     }
 
     /** Expands `%VAR%` occurrences; returns null if any referenced variable is unset. */
@@ -390,7 +468,7 @@ internal actual object ExternalPlayerPlatform {
         return pathEnv.split(File.pathSeparatorChar)
             .asSequence()
             .map { File(it.trim(), exe) }
-            .firstOrNull { it.isFile }
+            .firstOrNull { it.isLaunchableFile() }
             ?.absolutePath
     }
 
@@ -412,7 +490,7 @@ internal actual object ExternalPlayerPlatform {
                 }
             }
             if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
-                val selected = chooser.selectedFile?.takeIf(File::isFile)
+                val selected = chooser.selectedFile?.takeIf(File::isLaunchableFile)
                 val valid = selected != null && (
                     !isWindows || def.executableNames.any { it.equals(selected.name, ignoreCase = true) }
                 )
@@ -507,9 +585,30 @@ internal actual object ExternalPlayerPlatform {
         return if (exeEnd >= 0) trimmed.substring(0, exeEnd + 4).trim() else null
     }
 
+    /**
+     * mpv documents `--` as the end of options, so even a source that slipped past
+     * [PlaybackSourcePolicy] cannot become a switch. Only for mpv.exe: mpv.net, VLC, MPC and
+     * PotPlayer parse their own command lines and the policy's leading `-`/`/` check covers them.
+     */
+    private fun MutableList<String>.addEndOfOptions(executablePath: String) {
+        if (File(executablePath).name.equals("mpv.exe", ignoreCase = true)) add("--")
+    }
+
     // --- system-handler fallback (previous behaviour) -------------------------------------
 
     private fun openUri(rawUri: String, sourceSummary: String): Boolean {
+        // ShellExecute *runs* .exe/.lnk/.bat targets and hands other schemes (ms-*:, search-ms:)
+        // to whatever claims them; rundll32's FileProtocolHandler is a classic launcher. Only a
+        // web stream is safe to give to "whatever is registered".
+        if (!PlaybackSourcePolicy.allowsSystemHandler(rawUri)) {
+            externalPlayerLog.w { "System handler refused: not a web stream or local media file source=$sourceSummary" }
+            return false
+        }
+        if (PlaybackSourcePolicy.isLocalDrivePath(rawUri)) {
+            return runCatching { Desktop.getDesktop().open(File(rawUri)) }
+                .onFailure { error -> externalPlayerLog.w(error) { "Desktop API failed to open local file source=$sourceSummary" } }
+                .isSuccess
+        }
         val uri = runCatching { URI(rawUri) }.getOrNull() ?: return false
         val desktop = runCatching { Desktop.getDesktop() }.getOrNull()
 
@@ -548,6 +647,16 @@ private data class WindowsMediaAssociation(
 )
 
 private val REGISTRY_STRING_VALUE = Regex("""(?i)\sREG_(?:EXPAND_)?SZ\s+(.+)$""")
+
+/**
+ * A regular file, or a Store app's execution alias (the 0-byte reparse points in WindowsApps).
+ * java.io.File reports an alias as missing, so it is accepted when NIO, without following the
+ * reparse point, sees a non-directory there. CreateProcess launches an alias like any other exe.
+ */
+private fun File.isLaunchableFile(): Boolean =
+    isFile || runCatching {
+        Files.readAttributes(toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS).isOther
+    }.getOrDefault(false)
 
 /** Returns only the source origin so diagnostic logs never contain path/query credentials. */
 internal fun externalPlayerSourceSummary(rawUri: String): String {
@@ -598,3 +707,12 @@ private fun formatHms(positionMs: Long): String {
     val seconds = totalSeconds % 60
     return "%02d:%02d:%02d".format(hours, minutes, seconds)
 }
+
+private val VLC_SUBTITLE_EXTENSIONS = setOf("srt", "vtt", "ass", "ssa", "sub", "ttml", "smi", "txt")
+
+internal fun String.hasVlcSubtitleExtension(): Boolean =
+    substringBefore('?')
+        .substringAfterLast('/')
+        .substringAfterLast('\\')
+        .substringAfterLast('.', missingDelimiterValue = "")
+        .lowercase(Locale.ROOT) in VLC_SUBTITLE_EXTENSIONS

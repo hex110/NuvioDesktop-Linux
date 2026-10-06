@@ -99,6 +99,8 @@ data class PlayerControlsState(
     // and the hero-trailer surfaces leave it blank, which clears the thumbnail.
     val mediaSessionArtwork: String = "",
     val streamTitle: String = "",
+    // The addon's real media file name; mpv's diagnostics show it ahead of the source label.
+    val streamFilename: String = "",
     val providerName: String = "",
     val pauseOverlayWatchingLabel: String = "You're watching",
     val pauseOverlayLogo: String? = null,
@@ -144,6 +146,9 @@ data class PlayerControlsState(
     val seekThumbnailsEnabled: Boolean = true,
     /** The source is on this machine or LAN, so the HUD may ask for previews with a short settle delay. */
     val seekThumbnailsLocalSource: Boolean = false,
+    /** Signed Seekr WebVTT for this playback, or blank; when set the HUD draws sprites instead. */
+    val seekrVttUrl: String = "",
+    val seekrScale: Double = 1.0,
     /** Drives the HUD's seek button/command-palette labels so they name the real jump distance. */
     val seekStepSeconds: Int = 10,
     val tapToUnlockLabel: String = "Tap to unlock",
@@ -284,6 +289,9 @@ data class PlayerControlsState(
     val nextEpisodeStatus: String = "",
     val nextEpisodeActionLabel: String = "Play",
     val nextEpisodePlayable: Boolean = false,
+    // Playlist mode: hovering the title shows a short window of the playlist around this entry.
+    val playlistPeekTitle: String = "",
+    val playlistPeekItems: List<PlayerControlPlaylistItem> = emptyList(),
     val showSubmitIntro: Boolean = false,
     val showVideoSettings: Boolean = false,
     val showSources: Boolean = false,
@@ -296,6 +304,11 @@ data class PlayerControlsState(
     val sourceBadgePlacement: String = "bottom",
     val sourceFilters: List<PlayerControlFilterItem> = emptyList(),
     val sourceItems: List<PlayerControlSourceItem> = emptyList(),
+    // The streams screen's Sort chip, shared: one setting orders both lists. [sourceSortOptions]
+    // ids are StreamListSortOrder ordinals; the panel sends one back as "setSourceSort".
+    val sourceSortOptions: List<PlayerControlFilterItem> = emptyList(),
+    val sourceSortLabel: String = "",
+    val sourceCachedFirst: Boolean = false,
     val episodeItems: List<PlayerControlEpisodeItem> = emptyList(),
     // Stand-in artwork for episode cards whose own still is missing (unaired episodes) or whose
     // still fails to load. The details screen already falls back to the show's backdrop this way;
@@ -389,12 +402,17 @@ data class PlayerControlsState(
  * A resolved debrid URL is an implementation detail and can contain both opaque hashes and access
  * tokens. The source-list label is already the user-facing description of that URL, so it wins;
  * title/episode metadata is only a fallback for direct and local playback.
+ *
+ * The diagnostics overlay is meant to describe the media itself, so when the addon states the real
+ * file name ([streamFilename]) that comes first, ahead of the label.
  */
 internal fun preferredMpvMediaTitle(
     streamTitle: String?,
     title: String?,
     episodeText: String?,
-): String = streamTitle.cleanMpvMediaTitlePart()
+    streamFilename: String? = null,
+): String = streamFilename.cleanMpvMediaTitlePart()
+    ?: streamTitle.cleanMpvMediaTitlePart()
     ?: listOfNotNull(
         title.cleanMpvMediaTitlePart(),
         episodeText.cleanMpvMediaTitlePart(),
@@ -407,6 +425,14 @@ private fun String?.cleanMpvMediaTitlePart(): String? =
         ?.replace(Regex("\\s+"), " ")
         ?.trim()
         ?.takeIf(String::isNotBlank)
+
+/** One row of the HUD's playlist peek. [state] is "played", "current", "next" or "upcoming". */
+data class PlayerControlPlaylistItem(
+    val position: Int,
+    val title: String,
+    val subtitle: String,
+    val state: String,
+)
 
 data class PlayerControlFilterItem(
     val id: String = "",

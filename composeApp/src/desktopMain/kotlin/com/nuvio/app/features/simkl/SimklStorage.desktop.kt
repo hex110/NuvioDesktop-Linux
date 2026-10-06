@@ -42,3 +42,35 @@ internal actual object SimklRewatchStorage {
         store.remove(ProfileScopedKey.of(payloadKey))
     }
 }
+
+internal actual object SimklWatchedSyncStorage {
+    private val store = DesktopStorage.store("nuvio_simkl_watched_sync")
+    private const val payloadKey = "simkl_watched_sync_payload"
+
+    actual fun loadPayload(profileId: Int): String? = store.getString(ProfileScopedKey.of(payloadKey, profileId))
+
+    actual fun savePayload(profileId: Int, payload: String?) {
+        store.putString(ProfileScopedKey.of(payloadKey, profileId), payload)
+    }
+}
+
+internal actual object SimklEpisodeCatalogStorage {
+    private val store = DesktopStorage.store("nuvio_simkl_episode_catalog")
+    private const val payloadKey = "simkl_episode_catalog_payload"
+
+    actual fun loadPayload(): String? = store.getString(payloadKey)
+
+    actual fun savePayload(payload: String?) {
+        store.putString(payloadKey, payload)
+    }
+}
+
+internal actual object SimklListCacheStorage {
+    private val store = DesktopStorage.store("nuvio_simkl_list_cache")
+
+    actual fun loadPayload(profileId: Int, key: String): String? = store.getString(ProfileScopedKey.of(key, profileId))
+
+    actual fun savePayload(profileId: Int, key: String, payload: String?) {
+        store.putString(ProfileScopedKey.of(key, profileId), payload)
+    }
+}

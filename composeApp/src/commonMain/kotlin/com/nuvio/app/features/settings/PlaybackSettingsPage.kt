@@ -1469,7 +1469,8 @@ private fun PlaybackSettingsSection(
         ) {
             // Subtitle/Audio settings enable/disable logic:
             // Internal: everything enabled
-            // External + forwarding enabled: subtitle language pickers enabled, other subtitle options disabled
+            // External + forwarding enabled: subtitle language pickers, track kind and reject
+            //   keywords enabled (they filter what is forwarded), other subtitle options disabled
             // External + forwarding disabled: entire subtitle section disabled
             // External: audio language pickers always disabled (external player manages audio tracks)
             val isExternalPlayer = autoPlayPlayerSettings.externalPlayerEnabled
@@ -1651,7 +1652,9 @@ private fun PlaybackSettingsSection(
                     },
                     selectedValues = autoPlayPlayerSettings.rejectedSubtitleKeywords,
                     emptyLabel = stringResource(Res.string.settings_playback_reject_keywords_none),
-                    enabled = otherSubtitleOptionsEnabled,
+                    // Forwarded subtitles are filtered by these too, so it stays editable
+                    // whenever the language pickers are.
+                    enabled = subtitleLanguageEnabled,
                     isTablet = isTablet,
                     modifier = Modifier.settingsScrollAnchor(
                         SettingsScrollAnchor.searchKey("reject-subtitle-keywords"),

@@ -128,6 +128,9 @@ object PlayerStreamsRepository {
         _sourceState.update { it.copy(selectedFilter = addonId) }
     }
 
+    /** Identifies the load [episodeStreamsState] currently belongs to (null once cleared). */
+    fun episodeStreamsRequestKey(): String? = episodeStreamsRequestKey
+
     fun selectEpisodeStreamsFilter(addonId: String?) {
         _episodeStreamsState.update { it.copy(selectedFilter = addonId) }
     }
@@ -466,7 +469,7 @@ object PlayerStreamsRepository {
                     if (prefetched != null) {
                         log.i {
                             "Provider served from prefetch addon=${addon.addonName} " +
-                                "id=${addon.addonId} streams=${prefetched.size}"
+                                "id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} streams=${prefetched.size}"
                         }
                         publishCompletion(
                             StreamLoadCompletion.Addon(
@@ -478,7 +481,7 @@ object PlayerStreamsRepository {
 
                     val providerStarted = TimeSource.Monotonic.markNow()
                     log.i {
-                        "Provider started addon=${addon.addonName} id=${addon.addonId} " +
+                        "Provider started addon=${addon.addonName} id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                             "type=$type contentId=$effectiveVideoId"
                     }
                     val url = buildAddonResourceUrl(
@@ -511,14 +514,14 @@ object PlayerStreamsRepository {
                     }.fold(
                         onSuccess = { streams ->
                             log.i {
-                                "Provider completed addon=${addon.addonName} id=${addon.addonId} " +
+                                "Provider completed addon=${addon.addonName} id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                                     "streams=${streams.size} elapsedMs=${providerStarted.elapsedNow().inWholeMilliseconds}"
                             }
                             AddonStreamGroup(displayName, addon.addonId, streams, isLoading = false)
                         },
                         onFailure = { err ->
                             log.w(err) {
-                                "Provider failed addon=$displayName id=${addon.addonId} " +
+                                "Provider failed addon=$displayName id=${com.nuvio.app.core.network.redactAddonId(addon.addonId)} " +
                                     "elapsedMs=${providerStarted.elapsedNow().inWholeMilliseconds}"
                             }
                             AddonStreamGroup(displayName, addon.addonId, emptyList(), isLoading = false, error = err.message)

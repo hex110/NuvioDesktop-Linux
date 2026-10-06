@@ -11,8 +11,8 @@ import com.nuvio.app.features.tracking.TrackingMediaReference
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
 import com.nuvio.app.features.tracking.TrackingScrobbleCoordinator
 import com.nuvio.app.features.tracking.TrackingScrobbleDispatch
-import com.nuvio.app.features.tracking.TrackingProviderRegistry
 import com.nuvio.app.features.tracking.TrackingScrobbleEvent
+import com.nuvio.app.features.tracking.TrackingScrobbleWatchedProgressThresholdPercent
 import com.nuvio.app.features.tracking.buildTrackingMediaReference
 import com.nuvio.app.features.watchprogress.WatchProgressClock
 import com.nuvio.app.features.watchprogress.WatchProgressCompletionPercentThreshold
@@ -23,9 +23,6 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import nuvio.composeapp.generated.resources.Res
-import nuvio.composeapp.generated.resources.player_watched_provider_success
-import org.jetbrains.compose.resources.getString
 
 internal val PlayerScreenRuntime.activePlaybackIdentity: String
     get() = "$playbackAttemptId:" + (activeTorrentInfoHash
@@ -50,6 +47,7 @@ internal fun PlayerScreenRuntime.beginPlaybackAttempt() {
     playerStartedAttemptId = null
     playbackSnapshot = PlayerPlaybackSnapshot()
     lastTrustedPlaybackPositionMs = 0L
+    initialResumeReached = false
     lastMeaningfulPlaybackSnapshot = null
     initialLoadCompleted = false
     defaultPlaybackSpeedApplied = false
@@ -137,6 +135,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         // The fallback flush snapshot belongs to the previous video; carrying it across an episode
         // or source switch would flush the old position onto the new item.
         lastMeaningfulPlaybackSnapshot = null
+        initialResumeReached = false
         hasRequestedScrobbleStartForCurrentItem = false
         scrobbleStartRequestGeneration = 0L
         pendingScrobbleStartAfterSeek = false
@@ -359,7 +358,7 @@ private fun PlayerScreenRuntime.prepareTrackingScrobbleStop(
     val positionSeconds = playbackSnapshot.positionSecondsOrNull()
     val durationSeconds = playbackSnapshot.durationSecondsOrNull()
     val request: suspend () -> Unit = {
-        val dispatch = dispatchTrackingScrobble(
+        dispatchTrackingScrobble(
             profileId = profileId,
             action = TrackingScrobbleAction.STOP,
             media = media,
@@ -369,11 +368,6 @@ private fun PlayerScreenRuntime.prepareTrackingScrobbleStop(
             durationSeconds = durationSeconds,
             paused = paused,
         )
-        showWatchedProviderToast(
-            dispatch = dispatch,
-            profileId = profileId,
-            media = media,
-        )
     }
     currentTrackingScrobbleMedia = null
     hasRequestedScrobbleStartForCurrentItem = false
@@ -381,41 +375,6 @@ private fun PlayerScreenRuntime.prepareTrackingScrobbleStop(
     return request
 }
 
-
-private suspend fun PlayerScreenRuntime.showWatchedProviderToast(
-    dispatch: TrackingScrobbleDispatch,
-    profileId: Int,
-    media: TrackingMediaReference,
-) {
-    if (dispatch.watchedProviderIds.isEmpty()) return
-    val controller = playerController ?: return
-    val mediaKey = buildString {
-        append(profileId)
-        append(':')
-        append(media.stableKey)
-        append(':')
-        append(media.catalog?.videoId.orEmpty())
-        append(':')
-        append(media.episode?.season ?: -1)
-        append(':')
-        append(media.episode?.number ?: -1)
-    }
-    val providerIds = dispatch.watchedProviderIds.distinct().filter { providerId ->
-        synchronized(shownWatchedProviderToastKeys) {
-            shownWatchedProviderToastKeys.add("$mediaKey:${providerId.storageId}")
-        }
-    }
-    if (providerIds.isEmpty()) return
-
-    val providerNames = providerIds.joinToString { providerId ->
-        TrackingProviderRegistry.authProvider(providerId)?.descriptor?.displayName
-            ?: providerId.storageId
-    }
-    controller.showTransientMessage(
-        title = getString(Res.string.player_watched_provider_success),
-        value = providerNames,
-    )
-}
 
 private suspend fun dispatchTrackingScrobble(
     profileId: Int,
@@ -445,24 +404,69 @@ internal fun PlayerScreenRuntime.emitStopScrobbleForCurrentProgress(
     snapshot: PlayerPlaybackSnapshot = playbackSnapshot,
     paused: Boolean = false,
 ) {
-    // Speed-adjusted percent: used only to decide whether the 80% completion threshold is met.
+    // Speed-adjusted percent: used only to decide whether the completion threshold is met.
     // Raw percent: what gets sent to scrobble services so resume starts at the right position.
     val effectivePercent = currentScrobbleProgressPercent(snapshot)
     val rawPercent = currentPlaybackProgressPercent(snapshot)
 
-    if (effectivePercent >= 0.1f && effectivePercent < 80f && hasRequestedScrobbleStartForCurrentItem) {
-        emitTrackingScrobbleStop(rawPercent, paused = paused)
-        return
-    }
-
-    if (effectivePercent >= 80f) {
-        val isAtEnd = effectivePercent >= 99f
-        if (!hasSentCompletionScrobbleForCurrentItem || isAtEnd) {
+    when (
+        flushScrobbleStopKind(
+            effectivePercent = effectivePercent,
+            paused = paused,
+            sessionRunning = hasRequestedScrobbleStartForCurrentItem,
+            completionSent = hasSentCompletionScrobbleForCurrentItem,
+        )
+    ) {
+        FlushScrobbleStopKind.NONE -> Unit
+        FlushScrobbleStopKind.PROGRESS -> emitTrackingScrobbleStop(rawPercent, paused = paused)
+        FlushScrobbleStopKind.COMPLETION -> {
             hasSentCompletionScrobbleForCurrentItem = true
-            // A completion is a completion even if the player happens to be paused at the time.
             emitTrackingScrobbleStop(rawPercent)
         }
     }
+}
+
+internal enum class FlushScrobbleStopKind {
+    /** Nothing to report. */
+    NONE,
+
+    /** Resumable progress: a pause when the flush is one, otherwise a stop below completion. */
+    PROGRESS,
+
+    /** The title is finished; sent as a real stop, never as a pause. */
+    COMPLETION,
+}
+
+/**
+ * What a progress flush should tell the trackers.
+ *
+ * **A pause is never a completion below the app's own completion threshold.** This used to send
+ * any flush at or past the providers' 80% as a real stop, pause included ("a completion is a
+ * completion even if paused"). Trakt and SIMKL both record a stop at 80% or more as a watch, so
+ * pausing anywhere in the last fifth of an episode marked it watched on the provider, showed the
+ * dropped it from a provider-sourced Continue Watching, while locally it was still in progress.
+ * Playback is never cut short with a forced completion mid-file: providers decide from the stop that
+ * a pause past [WatchProgressCompletionPercentThreshold], an exit or the end of playback sends.
+ *
+ * An exit, source change or end of playback (not paused) keeps the providers' 80% rule: leaving
+ * the player at 85% is the user being done with it.
+ */
+internal fun flushScrobbleStopKind(
+    effectivePercent: Float,
+    paused: Boolean,
+    sessionRunning: Boolean,
+    completionSent: Boolean,
+): FlushScrobbleStopKind {
+    val completionPercent = if (paused) {
+        WatchProgressCompletionPercentThreshold
+    } else {
+        TrackingScrobbleWatchedProgressThresholdPercent.toFloat()
+    }
+    if (effectivePercent >= completionPercent) {
+        val isAtEnd = effectivePercent >= 99f
+        return if (!completionSent || isAtEnd) FlushScrobbleStopKind.COMPLETION else FlushScrobbleStopKind.NONE
+    }
+    return if (effectivePercent >= 0.1f && sessionRunning) FlushScrobbleStopKind.PROGRESS else FlushScrobbleStopKind.NONE
 }
 
 internal fun PlayerScreenRuntime.tryShowParentalGuide() {
@@ -491,9 +495,11 @@ internal fun PlayerScreenRuntime.flushWatchProgress(paused: Boolean = false) {
     val snapshot = playbackSnapshot.progressSnapshotForFlush(
         initialPositionMs = activeInitialPositionMs,
         initialProgressFraction = activeInitialProgressFraction,
+        resumeReached = initialResumeReached,
     ) ?: lastMeaningfulPlaybackSnapshot?.progressSnapshotForFlush(
         initialPositionMs = activeInitialPositionMs,
         initialProgressFraction = activeInitialProgressFraction,
+        resumeReached = initialResumeReached,
     ) ?: run {
         // A controller can be disposed before its first meaningful sample. Do not let the
         // zero-valued placeholder replace an existing resume point or start a 0% scrobble.
@@ -509,16 +515,31 @@ internal fun PlayerScreenRuntime.flushWatchProgress(paused: Boolean = false) {
     )
 }
 
+/**
+ * The snapshot a flush should record, or null when there is nothing trustworthy to record.
+ *
+ * Until the resume seek has landed the engine can still read 0 (or an early position), so the
+ * requested resume point is used as a floor — closing the player in that window must not replace
+ * a real resume point with the start of the file. Once [resumeReached], the live position is the
+ * truth: the floor used to stay on for the whole session, so rewinding from a late resume point
+ * (or from where a source switch picked up) and then pausing reported the *old* position. With a
+ * resume point past 80% that pause was sent as a completion — the "marked watched" toast with the
+ * playhead visibly near the start — and Continue Watching was rewritten to the stale position.
+ */
 internal fun PlayerPlaybackSnapshot.progressSnapshotForFlush(
     initialPositionMs: Long,
     initialProgressFraction: Float?,
+    resumeReached: Boolean = false,
 ): PlayerPlaybackSnapshot? {
     val duration = durationMs.coerceAtLeast(0L)
-    val requestedPosition = when {
-        initialPositionMs > 0L -> initialPositionMs
-        duration > 0L && initialProgressFraction != null && initialProgressFraction > 0f ->
-            (duration.toDouble() * initialProgressFraction.coerceIn(0f, 1f).toDouble()).toLong()
-        else -> 0L
+    val requestedPosition = if (resumeReached) {
+        0L
+    } else {
+        requestedResumePositionMs(
+            durationMs = duration,
+            initialPositionMs = initialPositionMs,
+            initialProgressFraction = initialProgressFraction,
+        )
     }
     // Some engines briefly expose a placeholder duration before media metadata settles. Treat a
     // resume point beyond that duration as unknown rather than clamping it to 100% completion.
@@ -526,6 +547,36 @@ internal fun PlayerPlaybackSnapshot.progressSnapshotForFlush(
     val trustworthyPosition = maxOf(positionMs.coerceAtLeast(0L), requestedPosition)
     if (duration <= 0L || trustworthyPosition < 1_000L) return null
     return copy(positionMs = trustworthyPosition.coerceAtMost(duration))
+}
+
+/** Where the current attempt asked playback to resume, in ms; 0 when it starts from the top. */
+internal fun requestedResumePositionMs(
+    durationMs: Long,
+    initialPositionMs: Long,
+    initialProgressFraction: Float?,
+): Long = when {
+    initialPositionMs > 0L -> initialPositionMs
+    durationMs > 0L && initialProgressFraction != null && initialProgressFraction > 0f ->
+        (durationMs.toDouble() * initialProgressFraction.coerceIn(0f, 1f).toDouble()).toLong()
+    else -> 0L
+}
+
+/** How far short of the requested resume point a landed seek may be (keyframe snapping). */
+private const val ResumeReachedToleranceMs = 10_000L
+
+/**
+ * Whether a trusted playing sample shows the resume seek has landed, after which the live
+ * position — including a deliberate rewind — is what a flush records.
+ */
+internal fun isResumeReached(
+    trustedPositionMs: Long,
+    durationMs: Long,
+    initialPositionMs: Long,
+    initialProgressFraction: Float?,
+): Boolean {
+    if (trustedPositionMs <= 0L) return false
+    val requested = requestedResumePositionMs(durationMs, initialPositionMs, initialProgressFraction)
+    return trustedPositionMs >= requested - ResumeReachedToleranceMs
 }
 
 /**
@@ -592,9 +643,6 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
 
 internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     if (progressTrackingDisabled) return
-    // Ahead of the throttle below, deliberately. The persist interval is a minute, and the whole
-    // point of this check is that the tracker learns the title is finished *when it is finished*.
-    emitCompletionScrobbleAtThreshold()
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now
@@ -604,42 +652,6 @@ internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
         syncRemote = false,
     )
     emitTrackingProgressRefresh()
-}
-
-/**
- * Sends the completion scrobble the moment playback passes the completion threshold, instead of
- * waiting for something to flush.
- *
- * **The mark used to arrive at the end of the file, and only by accident of when a flush happened.**
- * A stop scrobble is the only thing that records a watched item on a provider, and the only callers
- * of one are pause, exit, source change and end of playback — nothing runs on a timer. So playing a
- * film straight through meant the app marked it watched locally at
- * [WatchProgressCompletionPercentThreshold] (Continue Watching updated, the poster got its tick)
- * while Trakt/Simkl heard nothing until the credits. Worse, a crash or a force-quit inside that last
- * stretch lost the tracker write entirely, on a title the app already considered watched.
- *
- * **The cost, accepted knowingly:** a stop closes the provider's session, so "watching now" goes
- * quiet for the remainder. That is a few minutes of presence traded for a mark that is on time and
- * survives the app dying. The end-of-playback stop still fires (see
- * [emitStopScrobbleForCurrentProgress]'s `isAtEnd` branch) and providers treat the repeat as a
- * duplicate; the toast does not repeat either, because it is deduped per media and provider.
- *
- * The local threshold is used rather than the scrobble path's own 80%, so this fires when the app
- * itself decides the title is finished — one moment, not two.
- */
-private fun PlayerScreenRuntime.emitCompletionScrobbleAtThreshold() {
-    if (hasSentCompletionScrobbleForCurrentItem) return
-    // Only from a live session on the current attempt: a leftover snapshot from the previous
-    // source would bank a completion for the wrong item, which is the same hazard the start and
-    // the refresh both guard against.
-    if (!hasRequestedScrobbleStartForCurrentItem) return
-    if (!playbackSnapshot.isPlaying) return
-    if (!snapshotBelongsToCurrentAttempt) return
-    // Speed-adjusted to decide completion, raw to report position — the same split the flush path
-    // uses, and for the same reason.
-    if (currentScrobbleProgressPercent() < WatchProgressCompletionPercentThreshold) return
-    hasSentCompletionScrobbleForCurrentItem = true
-    emitTrackingScrobbleStop(currentPlaybackProgressPercent())
 }
 
 /**

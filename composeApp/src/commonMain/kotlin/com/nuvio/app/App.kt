@@ -114,6 +114,7 @@ import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavController
 import androidx.navigation.NavDestination.Companion.hasRoute
 import androidx.navigation.NavHostController
+import androidx.navigation.NavOptionsBuilder
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -150,6 +151,7 @@ import com.nuvio.app.core.ui.DesktopNavigationGestureBridge
 import com.nuvio.app.core.ui.DesktopBackRequestSource
 import androidx.compose.runtime.rememberUpdatedState
 import com.nuvio.app.core.ui.PosterZoomOverlayCoordinator
+import com.nuvio.app.core.ui.ContextMenuInvocation
 import com.nuvio.app.core.ui.unclaimedSecondaryClick
 import com.nuvio.app.core.ui.PlatformBackHandler
 import com.nuvio.app.core.ui.platformExitApp
@@ -246,12 +248,29 @@ import com.nuvio.app.features.library.LibraryScreen
 import com.nuvio.app.features.library.toLibraryItem
 import com.nuvio.app.features.library.toMetaPreview
 import com.nuvio.app.features.locallibrary.FilenameParser
+import com.nuvio.app.features.locallibrary.LocalLibraryPlaybackPreference
 import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import com.nuvio.app.features.notifications.EpisodeReleaseNotificationsRepository
 import com.nuvio.app.features.p2p.P2pConsentDialog
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.player.PlaybackStartTrace
 import com.nuvio.app.features.player.PlayerAutoPlayMode
+import com.nuvio.app.features.player.PlayerHandoff
+import com.nuvio.app.features.playlist.PlaylistAddDialogHost
+import com.nuvio.app.features.playlist.PlaylistAddController
+import com.nuvio.app.features.playlist.PlaylistAddTarget
+import com.nuvio.app.features.playlist.PlaylistEntries
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
+import com.nuvio.app.features.playlist.PlaylistRepository
+import com.nuvio.app.features.playlist.PlaylistEntry
+import com.nuvio.app.features.playlist.PlaylistRandomEpisodes
+import com.nuvio.app.features.playlist.PlaylistDialog
+import com.nuvio.app.features.playlist.PlaylistHandoff
+import com.nuvio.app.features.playlist.isPlaylistPreview
+import com.nuvio.app.features.playlist.PlaylistContinueWatchingSnapshot
+import com.nuvio.app.features.playlist.displayTitle
+import com.nuvio.app.features.playlist.playlistAddTargetForContinueWatching
+import com.nuvio.app.features.playlist.toPlaylistEntryOrNull
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.LocalFileDrop
 import com.nuvio.app.features.player.AppShortcutAction
@@ -309,6 +328,7 @@ import com.nuvio.app.features.home.HomeCatalogSettingsSyncService
 import com.nuvio.app.features.collection.FolderDetailScreen
 import com.nuvio.app.features.collection.FolderDetailRepository
 import com.nuvio.app.features.collection.clearFolderScrollSession
+import com.nuvio.app.features.streams.mediaFilename
 import com.nuvio.app.features.streams.BingeGroupCacheRepository
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
@@ -392,6 +412,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import nuvio.composeapp.generated.resources.*
@@ -806,7 +828,9 @@ private suspend fun warmProfileDeferredRepositories() {
                 SimklSettingsRepository.isRewatchTrackingEnabled() &&
                 SimklAuthRepository.uiState.value.canUseRewatches
             ) {
-                SimklRewatchRepository.refreshNow()
+                // Gated on activities: a delta when something moved, a full read only when
+                // `removed_from_list` moved or the last full read is a day old. See refreshNow.
+                SimklRewatchRepository.refreshAsync()
             }
         }
         startupWarmStep("tvdb settings load", rethrow = false) { com.nuvio.app.features.tvdb.TvdbSettingsRepository.ensureLoaded() }
@@ -1241,6 +1265,21 @@ private fun NavController.navigateIfResumed(route: Any) {
     }
 }
 
+/**
+ * Opens the player unless the player is already the current screen. Everything that starts playback
+ * goes through here: a held Enter (or a controller's A, which repeats) fires a source pick many
+ * times inside one transition, and each one used to push its own player — so Exit popped one copy
+ * and revealed the next, reloading the same file every time.
+ */
+private fun NavController.navigateToPlayer(
+    launch: PlayerLaunch,
+    builder: NavOptionsBuilder.() -> Unit = {},
+): Boolean {
+    if (currentDestination?.hasRoute<PlayerRoute>() == true) return false
+    navigate(PlayerRoute(launchId = PlayerLaunchStore.put(launch)), builder)
+    return true
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
 private fun MainAppContent(
@@ -1362,10 +1401,15 @@ private fun MainAppContent(
         val liquidGlassNativeTabBarSupported = remember { isLiquidGlassNativeTabBarSupported() }
         var showExitConfirmation by rememberSaveable { mutableStateOf(false) }
         var selectedPosterActionTarget by remember { mutableStateOf<PosterActionTarget?>(null) }
+        // The playlist popup open over the current screen, if any.
+        var openPlaylistId by remember { mutableStateOf<String?>(null) }
         var selectedPosterAnchor by remember { mutableStateOf<PosterZoomAnchor?>(null) }
         val posterOverlayHazeState = rememberHazeState()
         var selectedContinueWatchingForActions by remember { mutableStateOf<ContinueWatchingItem?>(null) }
         var selectedContinueWatchingAnchor by remember { mutableStateOf<PosterZoomAnchor?>(null) }
+        // Set when a right-click opened the menu: it then appears as a context menu at the cursor.
+        var selectedPosterMenuPosition by remember { mutableStateOf<IntOffset?>(null) }
+        var selectedContinueWatchingMenuPosition by remember { mutableStateOf<IntOffset?>(null) }
         var requestedSettingsPageName by rememberSaveable { mutableStateOf<String?>(null) }
         val gameModeActive by GameModeController.active.collectAsStateWithLifecycle()
         var showLibraryListPicker by remember { mutableStateOf(false) }
@@ -1735,6 +1779,21 @@ private fun MainAppContent(
         continueWatchingPreferencesUiState.showResumePromptOnLaunch,
     ) {
         if (!initialHomeReady || profileSwitchLoading) return@LaunchedEffect
+        // Before the prompt consumes the unclean-exit flags: re-send the scrobble stop a force-close
+        // swallowed, so a remote Continue Watching source keeps the item.
+        if (ResumePromptRepository.recoverUncleanPlayerExit()) {
+            launch {
+                runCatching {
+                    WatchProgressRepository.forceContinueWatchingSync(
+                        ProfileRepository.activeProfileId,
+                        rereadHistoryInFull = false,
+                    )
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
+                    appStartupLog.e(error) { "Continue Watching resync after unclean exit failed" }
+                }
+            }
+        }
         if (resumePromptItem != null) return@LaunchedEffect
         if (continueWatchingPreferencesUiState.showResumePromptOnLaunch) {
             resumePromptItem = ResumePromptRepository.consumeResumePrompt()
@@ -1851,8 +1910,12 @@ private fun MainAppContent(
                 settings = playerSettingsUiState,
                 originalLanguage = OriginalLanguageCache.languageFor(launch.parentMetaId),
             )
-            val shouldForwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles &&
-                externalSubtitleLanguages.isNotEmpty()
+            // The forwarding switch is only shown in External mode. Reaching here in Internal mode
+            // means a one-off "Open in external player" from a stream's menu, where the hidden
+            // (default-off) switch would otherwise silently drop every subtitle.
+            val forwardSubtitles = !playerSettingsUiState.externalPlayerEnabled ||
+                playerSettingsUiState.externalPlayerForwardSubtitles
+            val shouldForwardSubtitles = forwardSubtitles && externalSubtitleLanguages.isNotEmpty()
             if (shouldForwardSubtitles) {
                 StreamsRepository.setOverlayVisible(true, getString(Res.string.streams_loading_subtitles))
             }
@@ -1860,7 +1923,7 @@ private fun MainAppContent(
                 request = baseRequest,
                 type = launch.contentType ?: launch.parentMetaType,
                 videoId = launch.videoId ?: launch.parentMetaId,
-                forwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles,
+                forwardSubtitles = forwardSubtitles,
                 settings = playerSettingsUiState,
                 originalLanguage = OriginalLanguageCache.languageFor(launch.parentMetaId),
                 onOverlayMessage = { _ -> },
@@ -1926,8 +1989,7 @@ private fun MainAppContent(
                         openExternalPlayback(playerLaunch)
                         true
                     } else {
-                        val launchId = PlayerLaunchStore.put(playerLaunch)
-                        navController.navigate(PlayerRoute(launchId = launchId))
+                        navController.navigateToPlayer(playerLaunch)
                         true
                     }
                 }
@@ -1958,6 +2020,9 @@ private fun MainAppContent(
             streamVideoId: String? = null,
             disableProgressTracking: Boolean = false,
             autoPlayMode: PlayerAutoPlayMode = PlayerAutoPlayMode.NextEpisode,
+            // A playlist's own "Prefer local files": true plays a local copy when there is one,
+            // false ignores local copies and searches streams. Null follows the app-wide setting.
+            preferLocalOverride: Boolean? = null,
         ) {
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
             val targetResumeProgressFraction = if (startFromBeginning) null else resumeProgressFraction
@@ -1977,8 +2042,12 @@ private fun MainAppContent(
             // Read the repository at the moment of the click. A details destination can outlive the
             // composition that created its callbacks; using its captured UI snapshot meant changing
             // this setting to Source picker could still leave that destination opening local files.
-            val configuredBehavior = LocalLibraryRepository.currentPlaybackPreference()
-            val downloadedItem = if (AppFeaturePolicy.downloadsEnabled) {
+            val configuredBehavior = if (preferLocalOverride == true) {
+                LocalLibraryPlaybackPreference.LOCAL_LIBRARY
+            } else {
+                LocalLibraryRepository.currentPlaybackPreference()
+            }
+            val downloadedItem = if (AppFeaturePolicy.downloadsEnabled && preferLocalOverride != false) {
                 DownloadsRepository.findPlayableDownload(
                     parentMetaId = parentMetaId,
                     seasonNumber = seasonNumber,
@@ -1989,7 +2058,7 @@ private fun MainAppContent(
                 null
             }
             val localSourceUrl = downloadedItem?.let(DownloadsRepository::playableLocalFileUri)
-            val hasLocalLibraryStream = AppFeaturePolicy.downloadsEnabled &&
+            val hasLocalLibraryStream = AppFeaturePolicy.downloadsEnabled && preferLocalOverride != false &&
                 LocalLibraryRepository.localStreamsFor(parentMetaId, videoId).isNotEmpty()
             val localRouting = configuredBehavior.resolvePlaybackRouting(
                 useAlternate = useAlternateBehavior,
@@ -2043,8 +2112,7 @@ private fun MainAppContent(
                         coroutineScope.launch { openExternalPlayback(playerLaunch) }
                         return
                     }
-                    val launchId = PlayerLaunchStore.put(playerLaunch)
-                    navController.navigate(PlayerRoute(launchId = launchId))
+                    navController.navigateToPlayer(playerLaunch)
                     return
                 }
             }
@@ -2157,6 +2225,180 @@ private fun MainAppContent(
                     autoPlayMode = PlayerAutoPlayMode.RandomEpisode,
                 )
             }
+
+        // Plays one playlist entry through the same path as pressing Play on its details page, in
+        // playlist mode: the player then hands the end of the file back to onPlaybackCompleted,
+        // which moves on to the next entry. Resume position is the entry's own watch progress; an
+        // entry already watched through starts over rather than opening on its credits.
+        //
+        // A random-episode slot is first turned into a concrete episode ([resolved] when the player
+        // already picked one for its up-next card), then plays like the details page's Random
+        // episode: from the start, untracked and unscrobbled.
+        fun launchPlaylistEntry(playlistId: String, entryId: String, resolved: PlaylistEntry? = null) {
+            val stored = PlaylistRepository.get(playlistId)
+                ?.entries
+                ?.firstOrNull { it.entryId == entryId }
+                ?: return
+            val entry = resolved?.takeUnless { it.isUnresolvedRandom } ?: stored
+            if (entry.isUnresolvedRandom) {
+                coroutineScope.launch {
+                    val picked = PlaylistRandomEpisodes.resolve(entry)
+                    if (picked == null) {
+                        PlaylistPlaybackSession.clear()
+                        NuvioToastController.show("Couldn't load episodes for ${entry.title}")
+                    } else {
+                        launchPlaylistEntry(playlistId, entryId, picked)
+                    }
+                }
+                return
+            }
+            PlaylistPlaybackSession.start(playlistId, entryId)
+            val progress = WatchProgressRepository.progressForVideo(entry.videoId)
+                ?.takeUnless { entry.randomEpisode }
+            val resumePositionMs = progress
+                ?.takeUnless { it.isCompleted }
+                ?.lastPositionMs
+                ?.takeIf { it > 0L }
+            launchPlaybackWithDownloadPreference(
+                type = entry.type,
+                videoId = entry.videoId,
+                parentMetaId = entry.parentMetaId,
+                parentMetaType = entry.parentMetaType,
+                title = entry.title,
+                logo = entry.logo,
+                poster = entry.poster,
+                background = entry.background,
+                seasonNumber = entry.seasonNumber,
+                episodeNumber = entry.episodeNumber,
+                episodeTitle = entry.episodeTitle,
+                episodeThumbnail = entry.episodeThumbnail,
+                pauseDescription = entry.description,
+                resumePositionMs = resumePositionMs,
+                resumeProgressFraction = null,
+                useAlternateBehavior = false,
+                startFromBeginning = entry.randomEpisode || progress?.isCompleted == true,
+                disableProgressTracking = entry.randomEpisode,
+                autoPlayMode = PlayerAutoPlayMode.Playlist,
+                preferLocalOverride = PlaylistRepository.get(playlistId)?.preferLocalLibrary ?: true,
+            )
+        }
+
+        // The viewer picked another entry from the player's playlist peek. The entry being left is
+        // judged finished or not as on exit; then the player closes fully (two players must never
+        // coexist — see PlayerHandoff) and the picked entry starts like pressing it in the playlist.
+        fun jumpPlaylistEntry(fromLaunchId: Long, entryId: String) {
+            val active = PlaylistPlaybackSession.current() ?: return
+            lastPlayerExitBackMark = TimeSource.Monotonic.markNow()
+            ResumePromptRepository.markPlayerExitedNormally()
+            PlayerLaunchStore.remove(fromLaunchId)
+            PlaylistPlaybackSession.leaveCurrent()
+            navController.popBackStack()
+            coroutineScope.launch {
+                withTimeoutOrNull(PLAYLIST_HANDOFF_DISPOSE_TIMEOUT_MS) {
+                    PlayerHandoff.activeRoutes.first { it == 0 }
+                }
+                launchPlaylistEntry(active.playlistId, entryId)
+            }
+        }
+
+        // The player found (in the background, binge-style) the source for the playlist's next
+        // entry: swap the player route for one playing it, with no streams screen in between.
+        // Only an entry nothing could be auto-selected for goes through the normal source list.
+        fun handOffPlaylistEntry(fromLaunchId: Long, handoff: PlaylistHandoff) {
+            val active = PlaylistPlaybackSession.current() ?: return
+            val entry = handoff.entry
+            lastPlayerExitBackMark = TimeSource.Monotonic.markNow()
+            ResumePromptRepository.markPlayerExitedNormally()
+            PlayerLaunchStore.remove(fromLaunchId)
+            PlaylistPlaybackSession.finishCurrent()
+            if (handoff is PlaylistHandoff.SourceList) {
+                navController.popBackStack()
+                launchPlaylistEntry(active.playlistId, entry.entryId, entry)
+                return
+            }
+            PlaylistPlaybackSession.start(active.playlistId, entry.entryId)
+            val progress = WatchProgressRepository.progressForVideo(entry.videoId)?.takeUnless { entry.randomEpisode }
+            val resumePositionMs = progress?.takeUnless { it.isCompleted }?.lastPositionMs?.takeIf { it > 0L } ?: 0L
+            val releaseYear = ReleaseYearResolver.peek(entry.parentMetaType, entry.parentMetaId)
+            val playerLaunch = when (handoff) {
+                is PlaylistHandoff.Stream -> {
+                    val stream = handoff.stream
+                    PlayerLaunch(
+                        title = entry.title,
+                        sourceUrl = stream.playableDirectUrl ?: return,
+                        sourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
+                        sourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
+                        streamType = stream.streamType,
+                        sourceAffinity = PlayerSourceAffinity.fromInitialStreamType(stream.streamType),
+                        logo = entry.logo,
+                        poster = entry.poster,
+                        background = entry.background,
+                        seasonNumber = entry.seasonNumber,
+                        episodeNumber = entry.episodeNumber,
+                        episodeTitle = entry.episodeTitle,
+                        episodeThumbnail = entry.episodeThumbnail,
+                        releaseYear = releaseYear,
+                        streamTitle = stream.streamLabel,
+                        streamFilename = stream.mediaFilename,
+                        streamSubtitle = stream.streamSubtitle,
+                        sourceIdentityKey = stream.playerSourceIdentityKey(),
+                        bingeGroup = stream.behaviorHints.bingeGroup,
+                        pauseDescription = entry.description,
+                        providerName = stream.addonName,
+                        providerAddonId = stream.addonId,
+                        contentType = entry.type,
+                        videoId = entry.videoId,
+                        parentMetaId = entry.parentMetaId,
+                        parentMetaType = entry.parentMetaType,
+                        initialPositionMs = resumePositionMs,
+                        disableProgressTracking = entry.randomEpisode,
+                        autoPlayMode = PlayerAutoPlayMode.Playlist,
+                    )
+                }
+                is PlaylistHandoff.Downloaded -> {
+                    val localUri = DownloadsRepository.playableLocalFileUri(handoff.item) ?: return
+                    val labels = handoff.item.playbackLabels(
+                        localPath = localUri,
+                        fallbackTitle = entry.title,
+                        downloadedLabel = downloadedProviderLabel,
+                    )
+                    PlayerLaunch(
+                        title = entry.title,
+                        sourceUrl = localUri,
+                        logo = entry.logo,
+                        poster = entry.poster,
+                        background = entry.background,
+                        seasonNumber = entry.seasonNumber,
+                        episodeNumber = entry.episodeNumber,
+                        episodeTitle = entry.episodeTitle,
+                        episodeThumbnail = entry.episodeThumbnail,
+                        releaseYear = releaseYear,
+                        streamTitle = labels.streamTitle,
+                        streamSubtitle = labels.streamSubtitle,
+                        pauseDescription = entry.description,
+                        providerName = labels.providerName,
+                        providerAddonId = handoff.item.providerAddonId,
+                        contentType = entry.type,
+                        videoId = entry.videoId,
+                        parentMetaId = entry.parentMetaId,
+                        parentMetaType = entry.parentMetaType,
+                        initialPositionMs = resumePositionMs,
+                        disableProgressTracking = entry.randomEpisode,
+                        autoPlayMode = PlayerAutoPlayMode.Playlist,
+                    )
+                }
+                is PlaylistHandoff.SourceList -> return
+            }
+            // Close the outgoing player completely before opening the next — see PlayerHandoff.
+            PlayerHandoff.holdShield()
+            navController.popBackStack()
+            coroutineScope.launch {
+                withTimeoutOrNull(PLAYLIST_HANDOFF_DISPOSE_TIMEOUT_MS) {
+                    PlayerHandoff.activeRoutes.first { it == 0 }
+                }
+                navController.navigateToPlayer(playerLaunch)
+            }
+        }
 
         val onCatalogClick: (HomeCatalogSection) -> Unit = onCatalogClick@ { section ->
             val target = section.target ?: return@onCatalogClick
@@ -2335,6 +2577,7 @@ private fun MainAppContent(
         val onContinueWatchingLongPress: (ContinueWatchingItem) -> Unit = { item ->
             hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
             selectedContinueWatchingAnchor = PosterZoomAnchorHolder.consume()
+            selectedContinueWatchingMenuPosition = ContextMenuInvocation.consume()
             selectedContinueWatchingForActions = item
         }
 
@@ -2377,8 +2620,7 @@ private fun MainAppContent(
                 coroutineScope.launch { openExternalPlayback(playerLaunch) }
                 return@openDownload
             }
-            val launchId = PlayerLaunchStore.put(playerLaunch)
-            navController.navigate(PlayerRoute(launchId = launchId))
+            navController.navigateToPlayer(playerLaunch)
         }
 
         // In adaptive-hero / TV mode the resume prompt is owned by the home hero. When the user
@@ -2600,6 +2842,10 @@ private fun MainAppContent(
                                         onCastClick = onHeroCastClick,
                                         onBadgeClick = { fact, item -> onHeroBadgeClick(fact, item.type) },
                                         onPosterClick = posterClick@{ meta ->
+                                            if (meta.isPlaylistPreview()) {
+                                                openPlaylistId = meta.id
+                                                return@posterClick
+                                            }
                                             val randomCategory = meta.randomPlayCategoryOrNull()
                                             if (randomCategory != null) {
                                                 val randomSettings = HomeCatalogSettingsRepository.uiState.value
@@ -2656,8 +2902,15 @@ private fun MainAppContent(
                                         },
                                         onPosterLongClick = posterLongClick@{ meta ->
                                             if (meta.randomPlayCategoryOrNull() != null) return@posterLongClick
+                                            // Library, tracker and watched actions mean nothing
+                                            // for a playlist card; its screen holds its actions.
+                                            if (meta.isPlaylistPreview()) {
+                                                openPlaylistId = meta.id
+                                                return@posterLongClick
+                                            }
                                             hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
                                             selectedPosterAnchor = PosterZoomAnchorHolder.consume()
+                                            selectedPosterMenuPosition = ContextMenuInvocation.consume()
                                             selectedPosterActionTarget = PosterActionTarget(preview = meta)
                                         },
                                         onLibraryPosterClick = { item ->
@@ -2673,6 +2926,7 @@ private fun MainAppContent(
                                         onLibraryPosterLongClick = { item, section ->
                                             hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
                                             selectedPosterAnchor = PosterZoomAnchorHolder.consume()
+                                            selectedPosterMenuPosition = ContextMenuInvocation.consume()
                                             selectedPosterActionTarget = PosterActionTarget(
                                                 preview = item.toMetaPreview(),
                                                 libraryItem = item,
@@ -2852,8 +3106,7 @@ private fun MainAppContent(
                             if (playerSettingsUiState.externalPlayerEnabled) {
                                 coroutineScope.launch { openExternalPlayback(trailerLaunch) }
                             } else {
-                                val launchId = PlayerLaunchStore.put(trailerLaunch)
-                                navController.navigate(PlayerRoute(launchId = launchId))
+                                navController.navigateToPlayer(trailerLaunch)
                             }
                         },
                         onOpenMeta = { preview ->
@@ -3199,6 +3452,7 @@ private fun MainAppContent(
                             episodeTitle = launch.episodeTitle,
                             episodeThumbnail = launch.episodeThumbnail,
                             streamTitle = stream.streamLabel,
+                            streamFilename = stream.mediaFilename,
                             streamSubtitle = stream.streamSubtitle,
                             sourceIdentityKey = stream.playerSourceIdentityKey(),
                             bingeGroup = stream.behaviorHints.bingeGroup,
@@ -3220,9 +3474,8 @@ private fun MainAppContent(
                             autoPlayMode = launch.autoPlayMode,
                         )
 
-                        val launchId = PlayerLaunchStore.put(playerLaunch)
                         StreamsRepository.cancelLoading()
-                        navController.navigate(PlayerRoute(launchId = launchId)) {
+                        navController.navigateToPlayer(playerLaunch) {
                             if (replaceStreamRoute) {
                                 popUpTo<StreamRoute> { inclusive = true }
                             }
@@ -3351,8 +3604,7 @@ private fun MainAppContent(
                             }
                             StreamsRepository.clear()
                             reuseNavigated = true
-                            val launchId = PlayerLaunchStore.put(playerLaunch)
-                            navController.navigate(PlayerRoute(launchId = launchId)) {
+                            navController.navigateToPlayer(playerLaunch) {
                                 popUpTo<StreamRoute> { inclusive = true }
                             }
                         }
@@ -3475,6 +3727,7 @@ private fun MainAppContent(
                                 episodeTitle = launch.episodeTitle,
                                 episodeThumbnail = launch.episodeThumbnail,
                                 streamTitle = stream.streamLabel,
+                                streamFilename = stream.mediaFilename,
                                 streamSubtitle = stream.streamSubtitle,
                                 sourceIdentityKey = selectedSourceIdentityKey,
                                 bingeGroup = stream.behaviorHints.bingeGroup,
@@ -3499,8 +3752,7 @@ private fun MainAppContent(
                         }
                         StreamsRepository.consumeAutoPlay()
                         StreamsRepository.cancelLoading()
-                        val launchId = PlayerLaunchStore.put(playerLaunch)
-                        navController.navigate(PlayerRoute(launchId = launchId)) {
+                        navController.navigateToPlayer(playerLaunch) {
                             popUpTo<StreamRoute> { inclusive = true }
                         }
                     }
@@ -3615,6 +3867,7 @@ private fun MainAppContent(
                             episodeTitle = launch.episodeTitle,
                             episodeThumbnail = launch.episodeThumbnail,
                             streamTitle = stream.streamLabel,
+                            streamFilename = stream.mediaFilename,
                             streamSubtitle = stream.streamSubtitle,
                             sourceIdentityKey = sourceIdentityKey,
                             bingeGroup = stream.behaviorHints.bingeGroup,
@@ -3638,11 +3891,8 @@ private fun MainAppContent(
                             return
                         }
 
-                        val launchId = PlayerLaunchStore.put(playerLaunch)
                         StreamsRepository.cancelLoading()
-                        navController.navigate(
-                            PlayerRoute(launchId = launchId)
-                        )
+                        navController.navigateToPlayer(playerLaunch)
                     }
 
                     // Hide overlay when reuse navigated to external player (prevents reload from showing it again)
@@ -3768,9 +4018,11 @@ private fun MainAppContent(
                         return@composable
                     }
                     DisposableEffect(route.launchId) {
+                        PlayerHandoff.routeEntered()
                         com.nuvio.app.features.librarypvr.LibraryPvrScheduler.setPlaybackActive(true)
                         onDispose {
                             com.nuvio.app.features.librarypvr.LibraryPvrScheduler.setPlaybackActive(false)
+                            PlayerHandoff.routeLeft()
                         }
                     }
                     LaunchedEffect(launch.videoId) {
@@ -3783,6 +4035,9 @@ private fun MainAppContent(
                             lastPlayerExitBackMark = TimeSource.Monotonic.markNow()
                             ResumePromptRepository.markPlayerExitedNormally()
                             PlayerLaunchStore.remove(route.launchId)
+                            if (launch.autoPlayMode == PlayerAutoPlayMode.Playlist) {
+                                PlaylistPlaybackSession.onPlayerExited()
+                            }
                         },
                     )
                     PlayerScreen(
@@ -3802,6 +4057,7 @@ private fun MainAppContent(
                         episodeThumbnail = launch.episodeThumbnail,
                         releaseYear = launch.releaseYear,
                         streamTitle = launch.streamTitle,
+                        streamFilename = launch.streamFilename,
                         streamSubtitle = launch.streamSubtitle,
                         sourceIdentityKey = launch.sourceIdentityKey,
                         initialBingeGroup = launch.bingeGroup,
@@ -3821,11 +4077,37 @@ private fun MainAppContent(
                         initialProgressFraction = launch.initialProgressFraction,
                         disableProgressTracking = launch.disableProgressTracking,
                         autoPlayMode = launch.autoPlayMode,
+                        onPlaylistHandoff = if (launch.autoPlayMode == PlayerAutoPlayMode.Playlist) {
+                            { handoff -> handOffPlaylistEntry(route.launchId, handoff) }
+                        } else {
+                            null
+                        },
+                        onPlaylistJump = if (launch.autoPlayMode == PlayerAutoPlayMode.Playlist) {
+                            { entryId -> jumpPlaylistEntry(route.launchId, entryId) }
+                        } else {
+                            null
+                        },
                         onBack = onBackFromPlayer,
-                        onPlaybackCompleted = {
+                        onPlaybackCompleted = completed@{
                             lastPlayerExitBackMark = TimeSource.Monotonic.markNow()
                             ResumePromptRepository.markPlayerExitedNormally()
                             PlayerLaunchStore.remove(route.launchId)
+                            val playlistPlayback = PlaylistPlaybackSession.current()
+                                ?.takeIf { launch.autoPlayMode == PlayerAutoPlayMode.Playlist }
+                            if (playlistPlayback != null) {
+                                // Back to wherever the playlist was started from (normally its
+                                // screen), then on to the next entry's source search from there,
+                                // so Back from the next player lands in the same place.
+                                val next = PlaylistPlaybackSession.finishCurrent()
+                                navController.popBackStack()
+                                if (next != null) {
+                                    launchPlaylistEntry(playlistPlayback.playlistId, next.entryId)
+                                } else {
+                                    PlaylistPlaybackSession.clear()
+                                    NuvioToastController.show("Playlist finished")
+                                }
+                                return@completed
+                            }
                             val returnedToDetails = navController.popBackStack<DetailRoute>(inclusive = false)
                             if (!returnedToDetails) navController.popBackStack()
                         },
@@ -3896,6 +4178,7 @@ private fun MainAppContent(
                         onPosterLongClick = { meta ->
                             hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
                             selectedPosterAnchor = PosterZoomAnchorHolder.consume()
+                            selectedPosterMenuPosition = ContextMenuInvocation.consume()
                             selectedPosterActionTarget = if (target is CatalogTarget.Library) {
                                 PosterActionTarget(
                                     preview = meta,
@@ -4033,6 +4316,7 @@ private fun MainAppContent(
                         onPosterLongClick = { meta ->
                             hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
                             selectedPosterAnchor = PosterZoomAnchorHolder.consume()
+                            selectedPosterMenuPosition = ContextMenuInvocation.consume()
                             selectedPosterActionTarget = PosterActionTarget(preview = meta)
                         },
                     )
@@ -4041,6 +4325,25 @@ private fun MainAppContent(
                 }
             }
 
+            }
+
+            PlaylistAddDialogHost()
+
+            openPlaylistId?.let { playlistId ->
+                PlaylistDialog(
+                    playlistId = playlistId,
+                    onDismiss = { openPlaylistId = null },
+                    onPlayEntry = { entryId ->
+                        openPlaylistId = null
+                        launchPlaylistEntry(playlistId, entryId)
+                    },
+                    onOpenDetails = { entry ->
+                        openPlaylistId = null
+                        navController.navigateIfResumed(
+                            DetailRoute(type = entry.parentMetaType, id = entry.parentMetaId),
+                        )
+                    },
+                )
             }
 
             NuvioPosterActionSheet(
@@ -4057,9 +4360,23 @@ private fun MainAppContent(
                 onDismiss = {
                     selectedPosterActionTarget = null
                     selectedPosterAnchor = null
+                    selectedPosterMenuPosition = null
                 },
                 // Only offered for titles that actually have a local copy — the page it opens is
                 // the local library list, which would be meaningless for a streaming-only title.
+                // Addon content only: cloud and synthetic rows have no episodes or streams to queue.
+                onAddToPlaylist = selectedPosterActionTarget?.preview?.let { preview ->
+                    val target = when (preview.type.lowercase()) {
+                        "movie" -> PlaylistAddTarget.Entries(
+                            label = preview.name,
+                            entries = listOf(PlaylistEntries.movie(preview)),
+                        )
+                        "series", "tv", "anime" ->
+                            PlaylistAddTarget.Series(type = preview.type, id = preview.id, name = preview.name)
+                        else -> null
+                    }
+                    target?.let { { PlaylistAddController.request(it) } }
+                },
                 onOpenInLocalLibrary = selectedPosterActionTarget?.preview
                     ?.let { preview -> LocalLibraryRepository.itemForContentId(preview.id) }
                     ?.let {
@@ -4157,12 +4474,13 @@ private fun MainAppContent(
                 onToggleWatched = {
                     selectedPosterActionTarget?.preview?.let { preview ->
                         coroutineScope.launch {
-                            WatchingActions.togglePosterWatched(preview)
+                            WatchingActions.togglePosterWatched(preview, origin = "poster menu")
                         }
                     }
                 },
                 zoomAnchor = selectedPosterAnchor,
                 zoomHazeState = posterOverlayHazeState,
+                contextMenuPosition = selectedPosterMenuPosition,
             )
 
             val selectedContinueWatching = selectedContinueWatchingForActions
@@ -4210,8 +4528,35 @@ private fun MainAppContent(
                 )
             } == true
 
+            val continueWatchingPlaylistRow = selectedContinueWatchingForActions
+                ?.let(PlaylistContinueWatchingSnapshot::rowOf)
+                .orEmpty()
+            val continueWatchingRowIsNextUp = continueWatchingPlaylistRow.isNotEmpty() &&
+                continueWatchingPlaylistRow.all { it.isNextUp }
             NuvioContinueWatchingActionSheet(
                 item = selectedContinueWatchingForActions,
+                onAddToPlaylist = selectedContinueWatchingForActions
+                    ?.toPlaylistEntryOrNull()
+                    ?.let { entry ->
+                        {
+                            PlaylistAddController.request(
+                                PlaylistAddTarget.Entries(label = entry.displayTitle(), entries = listOf(entry)),
+                            )
+                        }
+                    },
+                // "Bung all my new episodes into a playlist and press play": the whole row the card
+                // is in, as drawn, in its order.
+                addRowToPlaylistLabel = if (continueWatchingRowIsNextUp) {
+                    "Add all of Up Next to playlist"
+                } else {
+                    "Add all of Continue Watching to playlist"
+                },
+                onAddRowToPlaylist = playlistAddTargetForContinueWatching(
+                    items = continueWatchingPlaylistRow,
+                    label = if (continueWatchingRowIsNextUp) "Up Next" else "Continue Watching",
+                )
+                    ?.takeIf { (it as PlaylistAddTarget.Entries).entries.size > 1 }
+                    ?.let { target -> { PlaylistAddController.request(target) } },
                 primaryPlayLabel = stringResource(Res.string.cw_action_play)
                     .takeIf { continueWatchingUsesDetailsByDefault },
                 alternatePlayLabel = continueWatchingAlternatePlayLabel,
@@ -4219,6 +4564,7 @@ private fun MainAppContent(
                 onDismiss = {
                     selectedContinueWatchingForActions = null
                     selectedContinueWatchingAnchor = null
+                    selectedContinueWatchingMenuPosition = null
                 },
                 onOpenDetails = {
                     selectedContinueWatchingForActions?.let { item ->
@@ -4257,22 +4603,11 @@ private fun MainAppContent(
                     }
                 },
                 onRemove = {
-                    selectedContinueWatchingForActions?.let { item ->
-                        if (item.isNextUp) {
-                            ContinueWatchingPreferencesRepository.addDismissedNextUpKey(
-                                nextUpDismissKey(
-                                    item.parentMetaId,
-                                    item.nextUpSeedSeasonNumber,
-                                    item.nextUpSeedEpisodeNumber,
-                                ),
-                            )
-                        } else {
-                            WatchProgressRepository.removeContinueWatchingItem(item)
-                        }
-                    }
+                    selectedContinueWatchingForActions?.let(WatchProgressRepository::dismissContinueWatchingCard)
                 },
                 zoomAnchor = selectedContinueWatchingAnchor,
                 zoomHazeState = posterOverlayHazeState,
+                contextMenuPosition = selectedContinueWatchingMenuPosition,
             )
 
             TraktListPickerDialog(
@@ -5817,3 +6152,6 @@ private fun AppLaunchOverlay(
         }
     }
 }
+
+/** Upper bound on waiting for the outgoing player to dispose before opening the next entry. */
+private const val PLAYLIST_HANDOFF_DISPOSE_TIMEOUT_MS = 3_000L

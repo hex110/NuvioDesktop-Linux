@@ -1,5 +1,6 @@
 package com.nuvio.app.features.simkl
 
+import co.touchlab.kermit.Logger
 import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.library.LibrarySection
 import com.nuvio.app.features.profiles.ProfileRepository
@@ -20,7 +21,10 @@ import com.nuvio.app.features.tracking.TrackingScrobbleResult
 import com.nuvio.app.features.tracking.TrackingScrobbler
 import com.nuvio.app.features.tracking.TrackingSeekScrobblePolicy
 import com.nuvio.app.features.tracking.TrackingWatchedProvider
+import com.nuvio.app.features.tracking.isPauseThatStopWouldRecordAsWatched
 import com.nuvio.app.features.watched.WatchedItem
+import com.nuvio.app.features.watched.WatchedRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 
@@ -71,13 +75,19 @@ internal object SimklWatchedAdapter : TrackingWatchedProvider {
 
     override fun invalidateChangeDetection() = SimklWatchedRepository.invalidate()
 
+    override fun consumeHistoryResets() = SimklWatchedRepository.consumeHistoryResets()
+
     // Manual mutations use SimklHistoryWriter. These are deliberately no-ops here so a local
     // playback completion cannot be written twice through both the scrobbler and watched sync.
     override suspend fun push(profileId: Int, items: Collection<WatchedItem>) = Unit
     override suspend fun delete(profileId: Int, items: Collection<WatchedItem>) = Unit
 }
 
+/** SIMKL's own cut-off: a scrobble `stop` at or above this marks the item watched. */
+private const val SIMKL_SCROBBLE_WATCHED_PERCENT = 80f
+
 internal object SimklScrobbleAdapter : TrackingScrobbler {
+    private val log = Logger.withTag("SimklScrobble")
     override val providerId: TrackingProviderId = TrackingProviderId.SIMKL
 
     /** Matches the pre-existing seek behaviour: a seek stops the scrobble and starts a new one. */
@@ -116,12 +126,53 @@ internal object SimklScrobbleAdapter : TrackingScrobbler {
             isAnime = media.kind == TrackingMediaKind.ANIME,
         ) ?: return TrackingScrobbleResult.Declined
         val progressPercent = event.progressPercent.toFloat()
+        val inActiveRewatch = item is SimklScrobbleItem.Episode &&
+            SimklRewatchRepository.hasActiveRewatchFor(item)
 
         return when (action) {
-            TrackingScrobbleAction.START ->
+            // No /scrobble call can address a rewatch session. During a rewatch the finishing stop is
+            // diverted below, so a plain start here opened a SIMKL playback session nothing ever
+            // stopped; per SIMKL's rewatch guide the next /scrobble/start "tidies up" such a stale
+            // session first, which matured it into a watch on the completed original — at every new
+            // episode, showing as "Seen All" over the rewatch. Report starts (including progress
+            // refreshes) and resumable stops handled without sending anything.
+            TrackingScrobbleAction.START -> if (inActiveRewatch) {
+                TrackingScrobbleResult.Handled
+            } else {
                 SimklScrobbleRepository.scrobbleStart(item = item, progressPercent = progressPercent).copy(handled = true)
-            TrackingScrobbleAction.STOP ->
-                SimklScrobbleRepository.scrobbleStop(item = item, progressPercent = progressPercent).copy(handled = true)
+            }
+            // A pause is reported as a stop here, and this stop records 80%+ as a watch.
+            TrackingScrobbleAction.STOP -> {
+                if (isPauseThatStopWouldRecordAsWatched(event)) {
+                    TrackingScrobbleResult.Declined
+                } else if (inActiveRewatch && progressPercent < SIMKL_SCROBBLE_WATCHED_PERCENT) {
+                    TrackingScrobbleResult.Handled
+                } else if (inActiveRewatch && item is SimklScrobbleItem.Episode) {
+                    // A plain completing stop marks the episode watched on the title's original
+                    // watch, so during an active rewatch it reset the original to the rewatched
+                    // episodes. Scrobble's own allow_rewatch cannot pin a session id and forks a new
+                    // session per write, so record the episode on the pinned rewatch session instead
+                    // and leave the original untouched.
+                    val recorded = try {
+                        SimklRewatchRepository.recordEpisode(item)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        // Not retried as a plain stop: that is exactly the write that resets the
+                        // original watch. The playback-completion edge retries the pinned write.
+                        log.w(error) { "SIMKL rewatch append failed for ${item.itemKey}" }
+                        false
+                    }
+                    log.i {
+                        "SIMKL scrobble stop for ${item.itemKey} @ ${"%.1f".format(progressPercent)}% " +
+                            "diverted to the active rewatch (recorded=$recorded); original watch left untouched"
+                    }
+                    TrackingScrobbleResult(handled = true, confirmsWatched = recorded)
+                } else {
+                    SimklScrobbleRepository.scrobbleStop(item = item, progressPercent = progressPercent)
+                        .copy(handled = true)
+                }
+            }
             // SIMKL's scrobble API has no pause action.
             TrackingScrobbleAction.PAUSE -> TrackingScrobbleResult.Declined
         }
@@ -136,7 +187,7 @@ internal object SimklLibraryAdapter : TrackingLibraryProvider {
     override val connectionRefreshIntent: TrackingRefreshIntent = TrackingRefreshIntent.AUTOMATIC
 
     override fun ensureLoaded() = SimklLibraryRepository.ensureLoaded()
-    override fun onProfileChanged() = SimklLibraryRepository.clearLocalState()
+    override fun onProfileChanged() = SimklLibraryRepository.onProfileChanged()
     override fun clearLocalState() = SimklLibraryRepository.clearLocalState()
     override suspend fun refresh(intent: TrackingRefreshIntent) = SimklLibraryRepository.refreshNow()
 
@@ -182,6 +233,21 @@ internal object SimklLibraryAdapter : TrackingLibraryProvider {
     ): TrackingMembershipResolution? {
         if (profileId != ProfileRepository.activeProfileId) return null
         val desired = desiredMembership[PLAN_TO_WATCH_KEY] == true
+        // SIMKL has no "remove from Plan to Watch" that spares history: the removal is
+        // /sync/history/remove for the whole title, which also erases every watched episode and
+        // any rewatch. That is not what a bookmark toggle means, so it is refused for anything
+        // with watch history unless the caller has had the user confirm exactly that.
+        if (
+            !desired &&
+            !destructiveRemovalConfirmed &&
+            contains(item.id, item.type) &&
+            WatchedRepository.hasAnyWatched(item.id, item.type)
+        ) {
+            error(
+                "${item.name.ifBlank { "This title" }} has watch history on SIMKL. Removing it from Plan to " +
+                    "Watch here would erase that history, so Nuvio won't do it — remove it on simkl.com instead.",
+            )
+        }
         if (desired != contains(item.id, item.type)) {
             SimklLibraryRepository.setPlanToWatch(item, desired)
         }

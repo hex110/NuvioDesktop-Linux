@@ -14,6 +14,8 @@ import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
+import com.nuvio.app.features.streams.mediaFilename
 import com.nuvio.app.features.streams.StreamDebridCacheState
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamScorer
@@ -210,6 +212,7 @@ internal fun PlayerScreenRuntime.switchToP2pSourceStream(
     activeTorrentTrackers = stream.p2pTrackers
     activeSourceIdentityKey = stream.playerSourceIdentityKey()
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId
@@ -320,6 +323,7 @@ internal fun PlayerScreenRuntime.switchToSource(
     activeStreamType = stream.streamType
     activeSourceIdentityKey = sourceIdentityKey
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId
@@ -436,6 +440,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
         downloadedLabel = downloadedLabel,
     )
     activeStreamTitle = labels.streamTitle
+    activeStreamFilename = null
     activeStreamSubtitle = labels.streamSubtitle
     activeProviderName = labels.providerName
     activeProviderAddonId = downloadItem.providerAddonId
@@ -904,6 +909,12 @@ internal fun PlayerScreenRuntime.openSourcesPanelForEpisode(episode: MetaVideo) 
     playerControlsOpenSourcesToken += 1
 }
 
+/** The up-next card, next button or skip key in playlist mode. See PlayerPlaylistAdvance.kt. */
+internal fun PlayerScreenRuntime.advancePlaylist() {
+    PlaylistPlaybackSession.log.i { "advance requested from the player" }
+    requestPlaylistAdvance(trigger = "card")
+}
+
 internal fun PlayerScreenRuntime.playNextEpisode() {
     // Mirror launchPlayerNextEpisodeAutoPlay's own early-exit checks: when there's clearly no
     // episode to advance to, bail out before engaging the latch at all. Engaging it here and
@@ -1100,6 +1111,7 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     resetFailoverBudget()
     activeSourceIdentityKey = sourceIdentityKey
     activeStreamTitle = stream.streamLabel
+    activeStreamFilename = stream.mediaFilename
     activeStreamSubtitle = stream.streamSubtitle
     activeProviderName = stream.addonName
     activeProviderAddonId = stream.addonId

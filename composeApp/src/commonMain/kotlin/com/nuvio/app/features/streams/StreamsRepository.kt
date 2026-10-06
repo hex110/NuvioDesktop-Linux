@@ -663,7 +663,7 @@ object StreamsRepository {
                         type = type,
                         id = effectiveVideoId,
                     )
-                    log.d { "Fetching streams from: $url" }
+                    log.d { "Fetching streams from: ${com.nuvio.app.core.network.redactAddonUrl(url)}" }
 
                     val group = runCatchingUnlessCancelled {
                         val payload = httpGetTextWithHeaders(url, STREAM_METADATA_REQUEST_HEADERS)
@@ -827,7 +827,7 @@ object StreamsRepository {
                                 emptyStateReason = updated.toEmptyStateReason(anyLoading),
                             )
                         }
-                        PlaybackStartTrace.mark("plugin:${completion.addonId} streams=${completion.streams.size}")
+                        PlaybackStartTrace.mark("plugin:${com.nuvio.app.core.network.redactAddonId(completion.addonId)} streams=${completion.streams.size}")
                         autoSelectOnResponse()
                     }
 

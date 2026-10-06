@@ -46,8 +46,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -122,6 +124,11 @@ class PosterZoomOverlayAction(
     val onSelected: () -> Unit,
     /** Right-click (desktop) alternative to [onSelected]; the overlay closes the same way. */
     val onSecondarySelected: (() -> Unit)? = null,
+    /**
+     * [NuvioContextMenu] draws a separator wherever this changes from one row to the next; the other
+     * presentations ignore it.
+     */
+    val group: Int = 0,
 )
 
 private enum class PosterZoomPhase {
@@ -244,6 +251,18 @@ fun NuvioPosterZoomActionOverlay(
         close()
     }
 
+    val labelMeasurer = rememberTextMeasurer()
+    val labelStyle = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
+    val density = LocalDensity.current
+    val widestLabelMenuWidth = remember(frozenActions, labelStyle, density) {
+        val widestPx = frozenActions.maxOfOrNull { action ->
+            labelMeasurer.measure(action.label, style = labelStyle, maxLines = 1).size.width
+        } ?: 0
+        // Row padding either side + gap + icon, as laid out by PosterZoomMenuRow.
+        with(density) { widestPx.toDp() } +
+            NuvioTokens.Space.s18 * 2 + NuvioTokens.Space.s12 + NuvioTokens.Icon.md + 2.dp
+    }
+
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -261,7 +280,9 @@ fun NuvioPosterZoomActionOverlay(
         val maxPosterWidth = if (aspect >= 1f) maxWidth * 0.8f else maxWidth * 0.6f
         val posterHeight = min(maxPosterWidth / aspect, maxHeight * 0.44f)
         val posterWidth = posterHeight * aspect
-        val menuWidth = min(280.dp, maxWidth - NuvioTokens.Space.s48)
+        // 280dp, widened to fit the longest label (e.g. "Add all of Continue Watching to
+        // playlist") rather than ellipsising it — up to the screen's own margin.
+        val menuWidth = min(max(280.dp, widestLabelMenuWidth), maxWidth - NuvioTokens.Space.s48)
         val columnWidth = max(posterWidth, menuWidth)
 
         Box(

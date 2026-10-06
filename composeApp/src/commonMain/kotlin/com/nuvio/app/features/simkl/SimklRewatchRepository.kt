@@ -1,7 +1,6 @@
 package com.nuvio.app.features.simkl
 
 import co.touchlab.kermit.Logger
-import com.nuvio.app.features.addons.httpRequestRaw
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.metadata.MediaIdResolver
 import com.nuvio.app.features.metadata.toSimklIds
@@ -68,7 +67,16 @@ internal object SimklRewatchRepository {
 
     private var sessions = mutableListOf<SimklRewatchSession>()
     private var lastActivitiesAt: String? = null
+    private var lastRemovedStamp: String? = null
     private var loaded = false
+
+    /**
+     * `rewatchId:episodeKey` pairs SIMKL answered with `added=0` this run. SIMKL collapses a second
+     * write of an episode watched in the last 48 hours (the original watch counts), and repeating
+     * it only spends quota: one finished episode used to cost three identical POSTs, from the
+     * scrobbler and the completion edge.
+     */
+    private val ignoredBySimkl = mutableSetOf<String>()
 
     fun ensureLoaded() {
         if (loaded) return
@@ -81,66 +89,89 @@ internal object SimklRewatchRepository {
             }
         sessions = stored?.sessions?.toMutableList() ?: mutableListOf()
         lastActivitiesAt = stored?.lastActivitiesAt
+        lastRemovedStamp = stored?.lastRemovedStamp
         publish()
     }
 
     fun onProfileChanged() {
         loaded = false
+        ignoredBySimkl.clear()
         sessions = mutableListOf()
         lastActivitiesAt = null
+        lastRemovedStamp = null
         ensureLoaded()
     }
 
     fun clearLocalState() {
         loaded = true
+        ignoredBySimkl.clear()
         sessions = mutableListOf()
         lastActivitiesAt = null
+        lastRemovedStamp = null
         SimklRewatchStorage.clearPayload()
         publish()
     }
 
-    fun refreshAsync() {
-        scope.launch { refreshNow() }
+    fun refreshAsync(full: Boolean = false) {
+        scope.launch { refreshNow(full) }
     }
 
-    suspend fun refreshNow(): Boolean {
+    /**
+     * SIMKL's two-phase sync. Phase 1 — the first read, or [full] — is the one `extended=full` read
+     * without `date_from`; SIMKL's all-items reference allows that payload only as a one-time
+     * baseline. After it, a delta (`date_from`) when activities moved, nothing when they did not.
+     *
+     * A delta never reports a session SIMKL deleted, so deletions are reconciled separately, as the
+     * sync guide prescribes: an `extended=simkl_ids_only` read diffed against the stored sessions,
+     * run only when `removed_from_list` moves ("your cue to run the check") and only while sessions
+     * are stored. This used to re-read the whole `extended=full` payload then, and at least daily.
+     */
+    suspend fun refreshNow(full: Boolean = false): Boolean {
         ensureLoaded()
         if (!rewatchRequestsAllowed()) return false
         _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
         return runCatching {
-            val headers = SimklAuthRepository.authorizedHeaders() ?: error("SIMKL is not connected.")
-            val deltaFrom = lastActivitiesAt?.takeIf(String::isNotBlank)
-            val activities = if (deltaFrom != null) {
-                SimklAuthRepository.fetchActivities()
-                    ?: error("SIMKL activity state could not be read.")
-            } else {
-                null
+            if (!SimklAuthRepository.hasUsableToken()) error("SIMKL is not connected.")
+            // Read before the all-items request, so a change landing while it is in flight is
+            // newer than the stored watermark and the next delta still sees it.
+            val activities = SimklAuthRepository.fetchActivities()
+                ?: error("SIMKL activity state could not be read.")
+            val removedStamp = simklRemovedFromListStamp(activities)
+            var needsFull = full || lastActivitiesAt.isNullOrBlank()
+            val needsDeletionCheck = !needsFull && sessions.isNotEmpty() &&
+                removedStamp != null && removedStamp != lastRemovedStamp
+            if (needsDeletionCheck && removedStamp != null && !reconcileDeletions(removedStamp)) {
+                // The ids-only answer could not say which sessions survive; fall back to one baseline.
+                needsFull = true
             }
-            if (deltaFrom != null && activities?.all == deltaFrom) {
+            val deltaFrom = lastActivitiesAt?.takeIf(String::isNotBlank)?.takeUnless { needsFull }
+            if (deltaFrom != null && activities.all == deltaFrom) {
                 publish()
                 return@runCatching true
             }
-            val dateFromQuery = deltaFrom?.let { "&date_from=$it" }.orEmpty()
-            val response = httpRequestRaw(
+            val dateFromQuery = deltaFrom?.let { "&date_from=${simklUrlEncode(it)}" }.orEmpty()
+            val response = simklRequest(
                 method = "GET",
                 url = SimklAuthRepository.appendParams(
                     "$SIMKL_BASE_URL/sync/all-items/all" +
                         "?allow_rewatch=yes&extended=full&episode_watched_at=yes$dateFromQuery",
                 ),
-                headers = headers,
-                body = "",
             )
             if (response.status !in 200..299) error("SIMKL rewatch sync failed (${response.status}).")
-            val remote = json.decodeFromString<SimklAllItemsResponse>(response.body).toRewatchSessions()
-            val nextActivitiesAt = activities?.all
-                ?: SimklAuthRepository.fetchActivities()?.all
+            val body = response.body.trim()
+            val remote: List<SimklRewatchSession> = if (body.isEmpty() || body == "null" || body == "[]") {
+                emptyList()
+            } else {
+                json.decodeFromString<SimklAllItemsResponse>(body).toRewatchSessions()
+            }
             mutex.withLock {
                 sessions = if (deltaFrom == null) {
                     remote.toMutableList()
                 } else {
                     sessions.mergeRewatchDelta(remote)
                 }
-                lastActivitiesAt = nextActivitiesAt ?: lastActivitiesAt
+                lastActivitiesAt = activities.all?.takeIf(String::isNotBlank) ?: lastActivitiesAt
+                if (deltaFrom == null) lastRemovedStamp = removedStamp ?: lastRemovedStamp
                 persist()
                 publish()
             }
@@ -153,6 +184,29 @@ internal object SimklRewatchRepository {
                 errorMessage = error.message ?: "SIMKL rewatches could not be refreshed.",
             )
         }.getOrDefault(false)
+    }
+
+    /**
+     * Drops stored sessions SIMKL no longer has, from the shared ids-only library read (see
+     * [SimklDeletionCheck]). Returns false when the answer cannot decide that (see
+     * [reconcileRewatchDeletions]), leaving sessions as is.
+     */
+    private suspend fun reconcileDeletions(removedStamp: String): Boolean {
+        val present = SimklDeletionCheck.currentLibrary(removedStamp)
+        return mutex.withLock {
+            val kept = sessions.reconcileRewatchDeletions(present) ?: run {
+                log.w { "SIMKL rewatch deletion check: ids-only rows carried no session ids; doing a full read" }
+                return@withLock false
+            }
+            if (kept.size != sessions.size) {
+                log.i { "SIMKL rewatch deletion check: dropped ${sessions.size - kept.size} session(s) SIMKL no longer has" }
+            }
+            sessions = kept.toMutableList()
+            lastRemovedStamp = removedStamp
+            persist()
+            publish()
+            true
+        }
     }
 
     suspend fun startRewatch(item: MetaPreview): SimklRewatchStartResult {
@@ -231,37 +285,67 @@ internal object SimklRewatchRepository {
         if (!rewatchRequestsAllowed()) return
         if (sessions.none { it.status.equals("active", true) && it.mayAddress(entry.parentMetaId) }) return
         scope.launch {
-            runCatching { recordPlaybackCompletion(entry) }
-                .onFailure { error ->
-                    if (error is CancellationException) throw error
-                    log.w(error) { "Failed to append playback completion to SIMKL rewatch" }
+            runCatching {
+                val item = SimklScrobbleRepository.buildItem(
+                    contentType = entry.contentType,
+                    parentMetaId = entry.parentMetaId,
+                    videoId = entry.videoId,
+                    title = entry.title,
+                    seasonNumber = entry.seasonNumber,
+                    episodeNumber = entry.episodeNumber,
+                    isAnime = false,
+                ) as? SimklScrobbleItem.Episode
+                if (item == null) {
+                    log.i { "SIMKL rewatch: ${entry.videoId} did not resolve to a SIMKL episode; not recorded" }
+                } else {
+                    recordEpisode(item)
                 }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                log.w(error) { "Failed to append playback completion to SIMKL rewatch" }
+            }
         }
     }
 
-    private suspend fun recordPlaybackCompletion(entry: WatchProgressEntry) = mutex.withLock {
-        val item = SimklScrobbleRepository.buildItem(
-            contentType = entry.contentType,
-            parentMetaId = entry.parentMetaId,
-            videoId = entry.videoId,
-            title = entry.title,
-            seasonNumber = entry.seasonNumber,
-            episodeNumber = entry.episodeNumber,
-            isAnime = false,
-        ) as? SimklScrobbleItem.Episode ?: return@withLock
-        val kind = if (item.isAnime) SimklRewatchKind.ANIME else SimklRewatchKind.SHOW
-        val index = sessions.indexOfFirst { session ->
-            session.kind == kind && session.status.equals("active", true) && session.ids.matches(item.ids)
+    /**
+     * Whether a finished playback of [item] belongs to an active rewatch session rather than the
+     * title's original watch.
+     *
+     * The scrobbler asks this before its completing `stop`: a plain `/scrobble/stop` always lands on
+     * the canonical (original) watch, so during a rewatch every finished episode used to be written
+     * to the original as well — or instead, when the pinned write below did not land — and SIMKL
+     * then reports the original as restarted at the rewatched episodes.
+     */
+    fun hasActiveRewatchFor(item: SimklScrobbleItem.Episode): Boolean {
+        ensureLoaded()
+        if (!rewatchRequestsAllowed()) return false
+        return sessions.findActiveFor(item) >= 0
+    }
+
+    /**
+     * Appends one finished episode to its active rewatch session, pinned to the session's id.
+     * Idempotent per episode, so the scrobbler and the playback-completion edge may both call it.
+     * Returns whether the episode is now recorded in the session.
+     */
+    suspend fun recordEpisode(item: SimklScrobbleItem.Episode): Boolean = mutex.withLock {
+        val index = sessions.findActiveFor(item)
+        if (index < 0) {
+            log.i { "SIMKL rewatch: no active session matches ${item.itemKey} (ids=${item.ids}); not recorded" }
+            return@withLock false
         }
-        if (index < 0) return@withLock
         val session = sessions[index]
+        val kind = session.kind
         val episodeKey = if (kind == SimklRewatchKind.ANIME) {
             item.number.toString()
         } else {
             "${item.season}:${item.number}"
         }
-        if (episodeKey in session.watchedEpisodeKeys) return@withLock
+        if (episodeKey in session.watchedEpisodeKeys) return@withLock true
+        val ignoredKey = "${session.rewatchId}:$episodeKey"
+        if (ignoredKey in ignoredBySimkl) return@withLock false
 
+        // SIMKL's rewatch guide pins every appended episode to a watched_at; without it the write came back 201 with added=0.
+        val watchedAt = kotlin.time.Instant.fromEpochMilliseconds(System.currentTimeMillis()).toString()
         val media = RewatchHistoryMedia(
             title = item.showTitle,
             ids = item.ids,
@@ -269,14 +353,28 @@ internal object SimklRewatchRepository {
             rewatchId = session.rewatchId,
             rewatchStatus = "active",
             seasons = if (kind == SimklRewatchKind.SHOW) {
-                listOf(RewatchHistorySeason(item.season, listOf(RewatchHistoryEpisode(item.number))))
+                listOf(RewatchHistorySeason(item.season, listOf(RewatchHistoryEpisode(item.number, watchedAt))))
             } else emptyList(),
             episodes = if (kind == SimklRewatchKind.ANIME) {
-                listOf(RewatchHistoryEpisode(item.number))
+                listOf(RewatchHistoryEpisode(item.number, watchedAt))
             } else emptyList(),
         )
         val response = postMutation(buildRewatchRequest(kind, media), retryPinnedWrite = true).getOrThrow()
         val mutation = response.rewatchMutation()
+        if (response.added.episodes == 0) {
+            // SIMKL answered 2xx but stored nothing, so it is not recorded; but asking again will not
+            // change the answer, so not again this run.
+            ignoredBySimkl += ignoredKey
+            log.w {
+                "SIMKL rewatch #${session.rewatchId} (${session.title}): $episodeKey was not added (added=0); " +
+                    "SIMKL ignores an episode already in the session or watched within the last 48h"
+            }
+            return@withLock false
+        }
+        log.i {
+            "SIMKL rewatch #${session.rewatchId} (${session.title}): recorded $episodeKey, " +
+                "added=${response.added.episodes} status=${mutation?.rewatchStatus ?: session.status}"
+        }
         sessions[index] = session.copy(
             status = mutation?.rewatchStatus ?: session.status,
             watchedEpisodeKeys = session.watchedEpisodeKeys + episodeKey,
@@ -285,6 +383,14 @@ internal object SimklRewatchRepository {
         persist()
         publish()
         invalidateHistoryCaches()
+        true
+    }
+
+    private fun List<SimklRewatchSession>.findActiveFor(item: SimklScrobbleItem.Episode): Int {
+        val kind = if (item.isAnime) SimklRewatchKind.ANIME else SimklRewatchKind.SHOW
+        return indexOfFirst { session ->
+            session.kind == kind && session.status.equals("active", true) && session.ids.matches(item.ids)
+        }
     }
 
     private suspend fun postMutation(
@@ -295,13 +401,13 @@ internal object SimklRewatchRepository {
         var lastFailure: Throwable? = null
         repeat(attempts) { attempt ->
             val result = runCatching {
-                val headers = SimklAuthRepository.authorizedHeaders() ?: error("SIMKL is not connected.")
-                val response = httpRequestRaw(
+                if (!SimklAuthRepository.hasUsableToken()) error("SIMKL is not connected.")
+                val response = simklRequest(
                     method = "POST",
                     url = SimklAuthRepository.appendParams("$SIMKL_BASE_URL/sync/history?allow_rewatch=yes"),
-                    headers = headers,
                     body = json.encodeToString(body),
                 )
+                log.i { "SIMKL rewatch POST /sync/history ${response.status} req=${json.encodeToString(body)} resp=${response.body.take(600)}" }
                 if (response.status !in 200..299) {
                     error("SIMKL rewatch update failed (${response.status}): ${response.body.take(160)}")
                 }
@@ -314,6 +420,9 @@ internal object SimklRewatchRepository {
         return Result.failure(lastFailure ?: IllegalStateException("SIMKL rewatch update failed."))
     }
 
+    /** Whether `allow_rewatch=yes` may be sent at all: tracking on, connected, PRO or VIP. */
+    internal fun requestsAllowed(): Boolean = rewatchRequestsAllowed()
+
     private fun rewatchRequestsAllowed(): Boolean =
         SimklSettingsRepository.isRewatchTrackingEnabled() &&
             SimklAuthRepository.isAuthenticated.value &&
@@ -325,6 +434,7 @@ internal object SimklRewatchRepository {
                 StoredRewatchPayload(
                     sessions = sessions,
                     lastActivitiesAt = lastActivitiesAt,
+                    lastRemovedStamp = lastRemovedStamp,
                 ),
             ),
         )
@@ -350,6 +460,23 @@ internal fun MutableList<SimklRewatchSession>.mergeRewatchDelta(
         }
         add(changed)
     }
+}
+
+/**
+ * The stored sessions an `extended=simkl_ids_only` + `allow_rewatch=yes` read still lists, matched
+ * by session id. Null when the read cannot decide: it lists no rewatch row at all (every session
+ * deleted, or the ids-only shape leaves `is_rewatch` out — indistinguishable), or a rewatch row
+ * without its `rewatch_id`. The caller then falls back to a full read rather than guess, because
+ * wrongly dropping an active session sends that rewatch's episodes back to the original watch.
+ */
+internal fun List<SimklRewatchSession>.reconcileRewatchDeletions(
+    present: SimklAllItemsResponse,
+): List<SimklRewatchSession>? {
+    if (isEmpty()) return this
+    val rows = (present.shows + present.movies + present.anime).filter { it.isRewatch || it.rewatchId != null }
+    if (rows.isEmpty() || rows.any { it.rewatchId == null }) return null
+    val presentIds = rows.mapNotNullTo(mutableSetOf(), SimklAllItemsEntry::rewatchId)
+    return filter { it.rewatchId in presentIds }
 }
 
 private fun MetaPreview.rewatchKind(): SimklRewatchKind {
@@ -459,7 +586,23 @@ private fun SimklMediaIds.toRewatchIds() = SimklScrobbleRepository.SimklIds(
 private data class StoredRewatchPayload(
     val sessions: List<SimklRewatchSession> = emptyList(),
     val lastActivitiesAt: String? = null,
+    val lastRemovedStamp: String? = null,
 )
+
+/**
+ * The `removed_from_list` stamps across every category, or null when SIMKL reports none. A move here
+ * is the one activities signal that something was deleted, which a `date_from` delta cannot show.
+ */
+internal fun simklRemovedFromListStamp(activities: SimklActivities?): String? {
+    if (activities == null) return null
+    val parts = listOf(
+        "shows" to activities.tvShows?.removedFromList,
+        "movies" to activities.movies?.removedFromList,
+        "anime" to activities.anime?.removedFromList,
+    )
+    if (parts.all { (_, value) -> value.isNullOrBlank() }) return null
+    return parts.joinToString("|") { (name, value) -> "$name=${value.orEmpty()}" }
+}
 
 @Serializable
 internal data class RewatchHistoryRequest(
@@ -486,7 +629,10 @@ internal data class RewatchHistorySeason(
 )
 
 @Serializable
-internal data class RewatchHistoryEpisode(val number: Int)
+internal data class RewatchHistoryEpisode(
+    val number: Int,
+    @SerialName("watched_at") val watchedAt: String? = null,
+)
 
 internal fun buildRewatchRequest(
     kind: SimklRewatchKind,

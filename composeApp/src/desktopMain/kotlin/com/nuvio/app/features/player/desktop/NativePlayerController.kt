@@ -44,6 +44,7 @@ import com.nuvio.app.features.player.PlayerControlsAction
 import com.nuvio.app.features.player.PlayerControlsState
 import com.nuvio.app.features.player.PlayerEngineController
 import com.nuvio.app.features.player.PlayerChapter
+import com.nuvio.app.features.player.PlayerControlPlaylistItem
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.PlayerShortcutAction
@@ -255,6 +256,16 @@ internal class NativePlayerController(
         restoreVolume: Boolean = false,
     ) {
         if (disposed) return
+        // A network-share source (\\host\share, file://host/…) from an addon or scraper would make
+        // Windows authenticate to that host and hand it the user's NTLM hash.
+        listOfNotNull(sourceUrl, sourceAudioUrl?.takeIf { it.isNotBlank() }).forEach { source ->
+            val verdict = com.nuvio.app.features.player.PlaybackSourcePolicy.checkInProcess(source)
+            if (verdict is com.nuvio.app.features.player.PlaybackSourcePolicy.Verdict.Rejected) {
+                Logger.withTag("PlaybackSourcePolicy").w { "Refusing playback source: ${verdict.reason}" }
+                onError("This stream points at a network share and was blocked.")
+                return
+            }
+        }
         if (pendingSource?.sourceUrl != sourceUrl) {
             autoSync.onSourceChanged()
             finishThroughputSample()
@@ -287,6 +298,7 @@ internal class NativePlayerController(
         }
         val pending = PendingSource(
             sourceUrl = sourceUrl,
+            mediaTitle = mediaTitle,
             sourceAudioUrl = sourceAudioUrl?.takeIf { it.isNotBlank() },
             headerLines = sourceHeaders.withDefaultPlaybackUserAgent(sourceUrl).toHeaderLines(),
             playWhenReady = playWhenReady,
@@ -304,7 +316,13 @@ internal class NativePlayerController(
                 if (tracePlaybackStart && DesktopHostOs.current == DesktopHostOs.WINDOWS) {
                     add("@nuvio-trace-id=${PlaybackStartTrace.currentId}")
                 }
-                if (isProviderPlaybackEndpoint(sourceUrl) || isExplicitProviderDiagnosticVideoUrl(sourceUrl)) {
+                // youtube-dl has nothing to add for a provider endpoint or a debrid CDN link, and
+                // when mpv cannot open one it hands the URL to ytdl_hook, whose "youtube-dl failed:
+                // not found" errors then bury the real failure in the playback log.
+                if (isProviderPlaybackEndpoint(sourceUrl) ||
+                    isExplicitProviderDiagnosticVideoUrl(sourceUrl) ||
+                    PlaybackRedirectResolver.isDirectMediaHost(sourceUrl)
+                ) {
                     add("ytdl=no")
                 }
                 if (enableUserMpvOptions) {
@@ -321,6 +339,11 @@ internal class NativePlayerController(
                 }
                 // Imported subtitle fonts (Settings > Playback): libass loads every font in here.
                 subtitleFontsDirectory()?.let { add("sub-fonts-dir=${it.absolutePath}") }
+                // A Nuvio option like the rest: Replace lets a custom network-timeout override it,
+                // Add keeps this one, and Full (the user's own configuration only) never gets it.
+                if (PlayerSettingsRepository.uiState.value.desktopMpvConfigMode != DesktopMpvConfigMode.Full) {
+                    directMediaNetworkTimeoutOption(sourceUrl)?.let(::add)
+                }
                 if (enableUserMpvOptions) addAll(buildDesktopUserMpvOptions(initialPlaybackSpeed))
                 // An init option rather than a runtime property: mpv filters text subtitles as it
                 // parses them, so it has to be set before the first track loads. Only ever turned
@@ -397,7 +420,7 @@ internal class NativePlayerController(
                     val result = runCatching {
                         newHandle = NativePlayerBridge.create(
                             hostViewPtr = hostViewPtr,
-                            sourceUrl = pending.sourceUrl,
+                            sourceUrl = withMpvFilenameHint(pending.sourceUrl, pending.mediaTitle),
                             sourceAudioUrl = pending.sourceAudioUrl,
                             headerLines = pending.headerLines.toTypedArray(),
                             playWhenReady = pending.playWhenReady,
@@ -488,6 +511,7 @@ internal class NativePlayerController(
         val current = currentHandle.takeIf { it != 0L } ?: return
         val mpvMediaTitle = preferredMpvMediaTitle(
             streamTitle = state.streamTitle,
+            streamFilename = state.streamFilename,
             title = state.title,
             episodeText = state.episodeText,
         )
@@ -1416,6 +1440,7 @@ internal class NativePlayerController(
         val pending = pendingSource ?: return
         attach(
             sourceUrl = pending.sourceUrl,
+            mediaTitle = pending.mediaTitle,
             sourceAudioUrl = pending.sourceAudioUrl,
             sourceHeaders = pending.headerLines.toHeaderMap(),
             playWhenReady = pending.playWhenReady,
@@ -1877,6 +1902,7 @@ private fun String.jsEscape(): String =
 
 private data class PendingSource(
     val sourceUrl: String,
+    val mediaTitle: String = "",
     val sourceAudioUrl: String?,
     val headerLines: List<String>,
     val playWhenReady: Boolean,
@@ -1982,6 +2008,45 @@ private fun buildDesktopUserMpvOptions(initialPlaybackSpeed: Float): List<String
         }
     }
 }
+
+/**
+ * How long mpv waits on a silent connection to a debrid CDN before giving up, in place of mpv's
+ * 60 s default. These hosts answer a range request in well under a second (TorBox store nodes
+ * measured 0.1-0.6 s), so a minute of silence is a stalled node, not a slow one: on 2026-10-03
+ * `store-046.wnam.tb-cdn.io` held five opens for the full 60 s each. Failing in 15 s lets the
+ * TorBox node hop or failover start while the user is still waiting. Mid-playback it also brings
+ * FFmpeg's own `reconnect=1` retry forward, since a timed-out read of a partly read file
+ * reconnects at the same offset. Resolver and addon endpoints keep the default: a resolve can
+ * legitimately take 10 s or more (Debridio once took 14 s waiting on a throttled TorBox call).
+ */
+internal const val DIRECT_MEDIA_NETWORK_TIMEOUT_SECONDS = 15
+
+/**
+ * mpv's diagnostics overlay prints the `filename` property, which is the last path segment of the
+ * URL it opened and ignores `force-media-title`. A debrid CDN link ends in an opaque hash plus the
+ * account token (`/dld/<hash>?token=...`), so that is what the overlay showed.
+ *
+ * Appending `#/<title>` gives mpv a readable basename. FFmpeg's http protocol drops the fragment
+ * from the request line, so the server sees the original URL. Limited to direct-media hosts and to
+ * non-manifest paths: an HLS/DASH manifest resolves its relative segment URLs against the base URL,
+ * and a `/` inside the fragment would corrupt that base.
+ */
+internal fun withMpvFilenameHint(url: String, title: String): String {
+    val name = title.trim().replace(Regex("[\\\\/\\s]+"), " ").trim()
+    if (name.isEmpty() || '#' in url) return url
+    if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) return url
+    if (!PlaybackRedirectResolver.isDirectMediaHost(url)) return url
+    val path = url.substringBefore('?').lowercase()
+    if (path.endsWith(".m3u8") || path.endsWith(".mpd")) return url
+    return "$url#/${java.net.URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")}"
+}
+
+internal fun directMediaNetworkTimeoutOption(sourceUrl: String): String? =
+    if (PlaybackRedirectResolver.isDirectMediaHost(sourceUrl)) {
+        "network-timeout=$DIRECT_MEDIA_NETWORK_TIMEOUT_SECONDS"
+    } else {
+        null
+    }
 
 /**
  * Web (non-debrid) addon streams are served by streaming-site CDNs that reject libmpv's default
@@ -2174,6 +2239,10 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonField("seekThumbnailsEnabled", seekThumbnailsEnabled)
         append(',')
         appendJsonField("seekThumbnailsLocalSource", seekThumbnailsLocalSource)
+        append(',')
+        appendJsonField("seekrVttUrl", seekrVttUrl)
+        append(',')
+        appendJsonField("seekrScale", seekrScale)
         append(',')
         appendJsonField("seekStepSeconds", seekStepSeconds)
         append(',')
@@ -2461,6 +2530,10 @@ private fun PlayerControlsState.toControlsJson(
         append(',')
         appendJsonField("nextEpisodePlayable", nextEpisodePlayable)
         append(',')
+        appendJsonField("playlistPeekTitle", playlistPeekTitle)
+        append(',')
+        appendJsonArrayField("playlistPeekItems", playlistPeekItems) { appendPlaylistPeekItemJson(it) }
+        append(',')
         appendJsonField("showSubmitIntro", showSubmitIntro)
         append(',')
         appendJsonField("showVideoSettings", showVideoSettings)
@@ -2484,6 +2557,12 @@ private fun PlayerControlsState.toControlsJson(
         appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }
         append(',')
         appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it) }
+        append(',')
+        appendJsonArrayField("sourceSortOptions", sourceSortOptions) { appendFilterItemJson(it) }
+        append(',')
+        appendJsonField("sourceSortLabel", sourceSortLabel)
+        append(',')
+        appendJsonField("sourceCachedFirst", sourceCachedFirst)
         append(',')
         appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it) }
         append(',')
@@ -2608,6 +2687,18 @@ private fun StringBuilder.appendJsonField(name: String, value: Double) {
 
 private fun StringBuilder.appendJsonField(name: String, value: Long) {
     append('"').append(name).append("\":").append(value)
+}
+
+private fun StringBuilder.appendPlaylistPeekItemJson(item: PlayerControlPlaylistItem) {
+    append('{')
+    appendJsonField("position", item.position)
+    append(',')
+    appendJsonField("title", item.title)
+    append(',')
+    appendJsonField("subtitle", item.subtitle)
+    append(',')
+    appendJsonField("state", item.state)
+    append('}')
 }
 
 private fun StringBuilder.appendChapterJson(chapter: PlayerChapter) {

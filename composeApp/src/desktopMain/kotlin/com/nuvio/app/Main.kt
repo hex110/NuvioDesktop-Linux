@@ -40,6 +40,7 @@ import java.awt.dnd.DropTargetDropEvent
 import com.nuvio.app.core.sync.AppForegroundMonitor
 import com.nuvio.app.core.build.AppVersionPolicy
 import com.nuvio.app.core.ui.DesktopNavigationGestureBridge
+import com.nuvio.app.core.ui.HoldToSelect
 import com.nuvio.app.core.ui.DesktopBackRequestSource
 import com.nuvio.app.core.ui.DesktopTrayMenu
 import com.nuvio.app.core.ui.DesktopTrayMenuEntry
@@ -681,6 +682,7 @@ fun main() {
                 }
                 val uninstallFullscreenShortcuts = installDesktopAppFullscreenShortcuts(window)
                 val backNavigationDispatcher = KeyEventDispatcher { event ->
+                    if (swallowHeldSelectKey(event)) return@KeyEventDispatcher true
                     if (event.keyCode == VK_BROWSER_FORWARD) {
                         when (event.id) {
                             KeyEvent.KEY_PRESSED ->
@@ -965,6 +967,9 @@ fun main() {
             runCatching { MdbListMetadataService.flushPendingWrites() }
         }
     }
+    // Every store coalesces its writes (DesktopStorage.flushAll), including the two caches just
+    // flushed above. A shutdown hook does the same for exit paths that skip this function.
+    runCatching { com.nuvio.app.core.storage.DesktopStorage.flushAll() }
 
     // Allow a brief grace period for background coroutines (e.g., scrobble network requests
     // triggered by UI teardown) to complete before hard-terminating the JVM.
@@ -1004,9 +1009,8 @@ private fun configureDesktopChrome() {
 // Selects the Compose/Skiko UI graphics backend from the persisted renderer setting. Skiko
 // reads the skiko.renderApi system property once, when it initializes for the first window, so
 // this must run before any Compose window is shown and a change only takes effect on the next
-// launch. An explicit user choice always wins; if none is saved we default to OpenGL unless
-// skiko.renderApi was already set out-of-band (e.g. a JVM flag for debugging), which is left
-// untouched. Best-effort — on any failure Skiko falls back to its own platform default.
+// launch. An explicit user choice always wins; if none is saved we default to Direct3D.
+// Best-effort — on any failure Skiko falls back to its own platform default.
 private fun configureDesktopRenderer() {
     runCatching {
         val stored = PlayerSettingsStorage.loadDesktopRendererApi()
@@ -1014,8 +1018,34 @@ private fun configureDesktopRenderer() {
         // Unconditional fallback. It used to defer to whatever `skiko.renderApi` the launcher had
         // already set, which on Windows was the DIRECT3D jvmArg — so a fresh install ran Direct3D
         // while Settings displayed "OpenGL" (the value PlayerSettingsRepository defaults to) until
-        // the user saved the setting once. OpenGL is the intended default; say so in one place.
-        val renderer = stored ?: DesktopRendererApi.OpenGL
+        // the user saved the setting once. Direct3D is the default (see DesktopRendererApi for why
+        // OpenGL is opt-in); it must match the PlayerSettingsRepository default Settings displays.
+        val renderer = stored ?: DesktopRendererApi.D3D11
         renderer?.let { System.setProperty("skiko.renderApi", it.skikoRenderApi) }
+    }
+}
+
+/**
+ * Once a held select key has opened an item's actions (see [HoldToSelect]), the rest of that
+ * press — key-repeats and the release — is eaten here, before Compose sees it. Otherwise the
+ * release lands on whatever the hold just opened, and a focused menu row clicks on Enter's release.
+ */
+private fun swallowHeldSelectKey(event: KeyEvent): Boolean {
+    if (!HoldToSelect.swallowSelectUntilRelease) return false
+    if (event.keyCode != AppShortcutsRepository.keyCode(AppShortcutAction.SelectFocused)) return false
+    return when (event.id) {
+        KeyEvent.KEY_RELEASED -> {
+            HoldToSelect.stopSwallowingRelease()
+            true
+        }
+        KeyEvent.KEY_PRESSED -> if (HoldToSelect.isLikelyRepeat()) {
+            HoldToSelect.onRepeatSwallowed()
+            true
+        } else {
+            // The release went somewhere this window never saw; this is a new press.
+            HoldToSelect.stopSwallowingRelease()
+            false
+        }
+        else -> false
     }
 }

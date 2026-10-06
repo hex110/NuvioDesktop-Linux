@@ -14,6 +14,7 @@ fun PlayerScreen(
     sourceAffinity: PlayerSourceAffinity = PlayerSourceAffinity.fromInitialStreamType(streamType),
     providerName: String,
     streamTitle: String,
+    streamFilename: String? = null,
     streamSubtitle: String?,
     sourceIdentityKey: String? = null,
     initialBingeGroup: String? = null,
@@ -44,6 +45,8 @@ fun PlayerScreen(
     initialProgressFraction: Float? = null,
     disableProgressTracking: Boolean = false,
     autoPlayMode: PlayerAutoPlayMode = PlayerAutoPlayMode.NextEpisode,
+    onPlaylistHandoff: ((com.nuvio.app.features.playlist.PlaylistHandoff) -> Unit)? = null,
+    onPlaylistJump: ((entryId: String) -> Unit)? = null,
 ) {
     PlayerScreenContent(
         PlayerScreenArgs(
@@ -56,6 +59,7 @@ fun PlayerScreen(
             sourceAffinity = sourceAffinity,
             providerName = providerName,
             streamTitle = streamTitle,
+            streamFilename = streamFilename,
             streamSubtitle = streamSubtitle,
             sourceIdentityKey = sourceIdentityKey,
             initialBingeGroup = initialBingeGroup,
@@ -86,6 +90,8 @@ fun PlayerScreen(
             initialProgressFraction = initialProgressFraction,
             disableProgressTracking = disableProgressTracking,
             autoPlayMode = autoPlayMode,
+            onPlaylistHandoff = onPlaylistHandoff,
+            onPlaylistJump = onPlaylistJump,
         )
     )
 }

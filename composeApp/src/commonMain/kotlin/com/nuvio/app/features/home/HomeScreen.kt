@@ -48,6 +48,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import com.nuvio.app.core.ui.WasdNavigation
 import com.nuvio.app.core.ui.navigationKey
+import com.nuvio.app.core.ui.rememberHoldToSelectState
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -108,6 +109,10 @@ import com.nuvio.app.features.discover.DiscoverRowHeader
 import com.nuvio.app.features.discover.discoverRowProvenance
 import com.nuvio.app.features.discover.rememberDiscoverPostersAlpha
 import com.nuvio.app.features.cloud.CloudLibraryContentType
+import com.nuvio.app.features.playlist.PlaylistLibraryRowKey
+import com.nuvio.app.features.playlist.PlaylistContinueWatchingSnapshot
+import com.nuvio.app.features.playlist.PlaylistRepository
+import com.nuvio.app.features.playlist.playlistLibrarySection
 import com.nuvio.app.features.cloud.CloudLibraryRepository
 import com.nuvio.app.features.cloud.CloudLibraryUiState
 import com.nuvio.app.features.cloud.findPlaybackTargetForProgress
@@ -245,6 +250,8 @@ private object HomeScrollMemory {
     var continueWatchingStartupResetApplied: Boolean = false
     val nextUpRowState = LazyListState()
     var nextUpStartupResetApplied: Boolean = false
+    val upcomingRowState = LazyListState()
+    var upcomingStartupResetApplied: Boolean = false
     val immersiveRowStates = mutableMapOf<String, LazyListState>()
 }
 
@@ -413,6 +420,10 @@ fun HomeScreen(
         }
     }
     val libraryUiState by LibraryRepository.uiState.collectAsStateWithLifecycle()
+    val libraryPlaylists by remember {
+        PlaylistRepository.ensureLoaded()
+        PlaylistRepository.playlists
+    }.collectAsStateWithLifecycle()
     val libraryDisplaySettings by remember {
         LibraryDisplaySettingsRepository.ensureLoaded()
         LibraryDisplaySettingsRepository.uiState
@@ -530,6 +541,7 @@ fun HomeScreen(
         randomPlayPool,
         watchedUiState.watchedKeys,
         homeUiState.sections, searchUiState.sections, libraryUiState.sections, libraryDisplaySettings.sortOption,
+        libraryPlaylists,
     ) {
         when (displayMode) {
             is HomeContentMode.Normal -> buildList {
@@ -562,7 +574,7 @@ fun HomeScreen(
                     })
                 }
             }
-            is HomeContentMode.Library -> sortLibrarySections(
+            is HomeContentMode.Library -> listOfNotNull(playlistLibrarySection(libraryPlaylists)) + sortLibrarySections(
                 libraryUiState.sections,
                 libraryDisplaySettings.sortOption,
                 libraryUiState.sourceMode,
@@ -706,7 +718,8 @@ fun HomeScreen(
         // Seed the hero from the visible rows (what you're currently browsing), used by Search,
         // Library, and — as a fallback — Normal mode's content-following desktop backdrop modes.
         fun currentlyViewingHeroSeed(keepText: Boolean = false) =
-            effectiveSections.take(2).flatMap { it.items.take(8) }.distinctBy { "${it.type}:${it.id}" }
+            effectiveSections.filterNot { it.key == PlaylistLibraryRowKey }
+                .take(2).flatMap { it.items.take(8) }.distinctBy { "${it.type}:${it.id}" }
                 .suppressingCatalogHero(keepText)
         when (displayMode) {
             is HomeContentMode.Normal -> homeUiState.heroItems.ifEmpty {
@@ -786,12 +799,12 @@ fun HomeScreen(
         // scrolling is not slowed.
         if (!heroBatchEnrichmentStartupGraceUsed) {
             heroBatchEnrichmentStartupGraceUsed = true
-            co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+            co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
                 "t=${heroProbeMs()} BATCH grace start (${HERO_BATCH_ENRICHMENT_STARTUP_GRACE_MS}ms, ${baseHeroItems.size} items)"
             }
             delay(HERO_BATCH_ENRICHMENT_STARTUP_GRACE_MS)
         }
-        co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+        co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
             "t=${heroProbeMs()} BATCH dispatch ${baseHeroItems.size} items"
         }
         if (!heroMetadataStartupGraceUsed) {
@@ -1468,14 +1481,23 @@ fun HomeScreen(
     val continueWatchingItems = com.nuvio.app.features.posterservice.rememberContinueWatchingCustomPosters(
         rawContinueWatchingItems,
     )
-    val (continueWatchingRowItems, nextUpRowItems) = remember(
+    val (continueWatchingRowItems, nextUpRowItems, upcomingRowItems) = remember(
         continueWatchingItems,
         continueWatchingPreferences.separateNextUpRow,
+        continueWatchingPreferences.separateUpcomingRow,
     ) {
         splitContinueWatchingRows(
             items = continueWatchingItems,
             separateNextUpRow = continueWatchingPreferences.separateNextUpRow,
+            separateUpcomingRow = continueWatchingPreferences.separateUpcomingRow,
         )
+    }
+
+    // What "Add all to playlist" on a card's menu queues: the rows as drawn.
+    LaunchedEffect(continueWatchingRowItems, nextUpRowItems, contentMode) {
+        if (contentMode is HomeContentMode.Normal) {
+            PlaylistContinueWatchingSnapshot.publish(continueWatchingRowItems, nextUpRowItems)
+        }
     }
 
     // Keyed on the raw rows: a poster-service re-derive changes art, not which titles need metadata.
@@ -1824,6 +1846,7 @@ fun HomeScreen(
         }
     val continueWatchingRowState = remember { HomeScrollMemory.continueWatchingRowState }
     val nextUpRowState = remember { HomeScrollMemory.nextUpRowState }
+    val upcomingRowState = remember { HomeScrollMemory.upcomingRowState }
     LaunchedEffect(isShowingHomeContent, continueWatchingRowItems.isNotEmpty()) {
         if (
             isShowingHomeContent &&
@@ -1842,6 +1865,16 @@ fun HomeScreen(
         ) {
             nextUpRowState.scrollToItem(0, scrollOffset = 0)
             HomeScrollMemory.nextUpStartupResetApplied = true
+        }
+    }
+    LaunchedEffect(isShowingHomeContent, upcomingRowItems.isNotEmpty()) {
+        if (
+            isShowingHomeContent &&
+            upcomingRowItems.isNotEmpty() &&
+            !HomeScrollMemory.upcomingStartupResetApplied
+        ) {
+            upcomingRowState.scrollToItem(0, scrollOffset = 0)
+            HomeScrollMemory.upcomingStartupResetApplied = true
         }
     }
     // Applies to every catalog-row surface, not just home: Search and Library rows honour it too
@@ -2018,11 +2051,22 @@ fun HomeScreen(
     val nextUpHeroPreviews = remember(nextUpRowItems) {
         nextUpRowItems.map { it.toHomeHeroPreview() }
     }
+    val upcomingHeroPreviews = remember(upcomingRowItems) {
+        upcomingRowItems.map { it.toHomeHeroPreview() }
+    }
     val nextUpRowTitle = stringResource(Res.string.continue_watching_up_next)
     val nextUpImmersiveSettingsItem = remember(nextUpRowTitle) {
         HomeCatalogSettingsItem(
             key = HOME_NEXT_UP_SECTION_KEY,
             defaultTitle = nextUpRowTitle,
+            addonName = "",
+        )
+    }
+    val upcomingRowTitle = stringResource(Res.string.continue_watching_upcoming)
+    val upcomingImmersiveSettingsItem = remember(upcomingRowTitle) {
+        HomeCatalogSettingsItem(
+            key = HOME_UPCOMING_SECTION_KEY,
+            defaultTitle = upcomingRowTitle,
             addonName = "",
         )
     }
@@ -2180,8 +2224,10 @@ fun HomeScreen(
         continueWatchingPreferences.isVisible,
         continueWatchingRowItems,
         nextUpRowItems,
+        upcomingRowItems,
         continueWatchingHeroPreviews,
         nextUpHeroPreviews,
+        upcomingHeroPreviews,
         continueWatchingHeroFollowActive,
         enabledHomeItems,
         collectionsMap,
@@ -2191,6 +2237,8 @@ fun HomeScreen(
         onContinueWatchingClick,
         onFolderClick,
         posterClickHandler,
+        onPosterLongClick,
+        onContinueWatchingLongPress,
         // A re-deal changes what sits at each index, and tvRows is indexed by the focused column.
         rowShuffleOrders,
         rowShuffleEnabled,
@@ -2206,6 +2254,9 @@ fun HomeScreen(
                         onEnter = { index ->
                             continueWatchingRowItems.getOrNull(index)?.let { onContinueWatchingClick?.invoke(it) }
                         },
+                        onHold = onContinueWatchingLongPress?.let { longPress ->
+                            { index -> continueWatchingRowItems.getOrNull(index)?.let(longPress) }
+                        },
                     ),
                 )
             }
@@ -2216,6 +2267,23 @@ fun HomeScreen(
                         metaItems = if (continueWatchingHeroFollowActive) nextUpHeroPreviews else null,
                         onEnter = { index ->
                             nextUpRowItems.getOrNull(index)?.let { onContinueWatchingClick?.invoke(it) }
+                        },
+                        onHold = onContinueWatchingLongPress?.let { longPress ->
+                            { index -> nextUpRowItems.getOrNull(index)?.let(longPress) }
+                        },
+                    ),
+                )
+            }
+            if (isShowingHomeContent && continueWatchingPreferences.isVisible && upcomingRowItems.isNotEmpty()) {
+                add(
+                    HomeTvRow(
+                        itemCount = upcomingRowItems.size,
+                        metaItems = if (continueWatchingHeroFollowActive) upcomingHeroPreviews else null,
+                        onEnter = { index ->
+                            upcomingRowItems.getOrNull(index)?.let { onContinueWatchingClick?.invoke(it) }
+                        },
+                        onHold = onContinueWatchingLongPress?.let { longPress ->
+                            { index -> upcomingRowItems.getOrNull(index)?.let(longPress) }
                         },
                     ),
                 )
@@ -2277,6 +2345,9 @@ fun HomeScreen(
                                 onEnter = { index ->
                                     entries.getOrNull(index)?.let { posterClickHandler?.invoke(it) }
                                 },
+                                onHold = onPosterLongClick?.let { longPress ->
+                                    { index -> entries.getOrNull(index)?.let(longPress) }
+                                },
                                 onLoadMore = if (usesInfiniteScroll) {
                                     { HomeRepository.loadMoreCatalogRow(section.key) }
                                 } else {
@@ -2318,6 +2389,9 @@ fun HomeScreen(
                             onEnter = { index ->
                                 entries.getOrNull(index)?.let { posterClickHandler?.invoke(it) }
                             },
+                            onHold = onPosterLongClick?.let { longPress ->
+                                { index -> entries.getOrNull(index)?.let(longPress) }
+                            },
                             onLoadMore = when {
                                 !usesInfiniteScroll || !section.hasMore -> null
                                 // The Discover browser row pages through SearchRepository, not
@@ -2342,6 +2416,7 @@ fun HomeScreen(
     }
 
     val tvSectionCount = (if (heroFocusable) 1 else 0) + tvRows.size
+    val homeSelectHold = rememberHoldToSelectState()
     LaunchedEffect(tvRows.size) {
         setImmersiveRowIndex(getImmersiveRowIndex().coerceIn(0, (tvRows.size - 1).coerceAtLeast(0)))
     }
@@ -2644,7 +2719,9 @@ fun HomeScreen(
         continueWatchingPreferences.isVisible,
         continueWatchingRowItems,
         nextUpRowItems,
+        upcomingRowItems,
         nextUpImmersiveSettingsItem,
+        upcomingImmersiveSettingsItem,
         enabledHomeItems,
         collectionsMap,
         sectionsMap,
@@ -2657,6 +2734,9 @@ fun HomeScreen(
                 }
                 if (continueWatchingPreferences.isVisible && nextUpRowItems.isNotEmpty()) {
                     add(nextUpImmersiveSettingsItem)
+                }
+                if (continueWatchingPreferences.isVisible && upcomingRowItems.isNotEmpty()) {
+                    add(upcomingImmersiveSettingsItem)
                 }
                 enabledHomeItems.forEach { settingsItem ->
                     val isRenderable = if (settingsItem.isCollection) {
@@ -2893,10 +2973,11 @@ fun HomeScreen(
     // priority and replaces the whole hero. A focused Continue Watching card gets the Resume action
     // only in TV mode; Adaptive and Adaptive Ambient keep the preview but use the normal hero click
     // to open details, avoiding a clipped action in their shorter hero.
-    val continueWatchingDisplayRows = remember(continueWatchingRowItems, nextUpRowItems) {
+    val continueWatchingDisplayRows = remember(continueWatchingRowItems, nextUpRowItems, upcomingRowItems) {
         buildList {
             if (continueWatchingRowItems.isNotEmpty()) add(continueWatchingRowItems)
             if (nextUpRowItems.isNotEmpty()) add(nextUpRowItems)
+            if (upcomingRowItems.isNotEmpty()) add(upcomingRowItems)
         }
     }
     val continueWatchingRowPresent = isShowingHomeContent &&
@@ -3100,14 +3181,14 @@ fun HomeScreen(
             val cached = heroEnrichmentMap[mapKey]
             if (cached != null && !cached.needsHeroTextEnrichment()) return@launch
             pendingHeroEnrichments[mapKey] = Unit
-            co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+            co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
                 "t=${heroProbeMs()} FOCUSED enrich start key=$mapKey"
             }
             try {
                 fetchEnrichment(raw)
             } finally {
                 pendingHeroEnrichments.remove(mapKey)
-                co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+                co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
                     "t=${heroProbeMs()} FOCUSED enrich done key=$mapKey"
                 }
             }
@@ -3275,6 +3356,33 @@ fun HomeScreen(
                             },
                         )
                         .onPreviewKeyEvent { event ->
+                            val selectKey = event.navigationKey()
+                            if (selectKey == Key.Enter || selectKey == Key.NumPadEnter) {
+                                // Resolved on the press: the release must act on the item that
+                                // was focused when the key went down.
+                                val sectionIndex = tvFocus.sectionIndex
+                                val itemIndex = tvFocus.itemIndex
+                                val heroSelected = heroFocusable && sectionIndex == 0
+                                val row = if (heroSelected) {
+                                    null
+                                } else {
+                                    tvRows.getOrNull(tvRowIndexForSection(sectionIndex))
+                                }
+                                return@onPreviewKeyEvent homeSelectHold.handle(
+                                    event = event,
+                                    onSelect = {
+                                        if (heroSelected) {
+                                            effectiveHeroItems.getOrNull(itemIndex)
+                                                ?.let { posterClickHandler?.invoke(it) }
+                                        } else {
+                                            row?.onEnter?.invoke(itemIndex)
+                                        }
+                                    },
+                                    // The hero has no card of its own to open actions beside,
+                                    // so select there stays a plain press.
+                                    onHold = row?.onHold?.let { hold -> { hold(itemIndex) } },
+                                )
+                            }
                             if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                             if (appShortcutMatches(AppShortcutAction.ToggleTrailer, event)) {
                                 return@onPreviewKeyEvent handleHomeTvKey(HomeTvKey.ToggleTrailer)
@@ -3321,16 +3429,6 @@ fun HomeScreen(
                                 Key.DirectionLeft -> {
                                     mouseActivity.onKeyboardNavigation()
                                     tvFocus.moveItem(-1, tvItemCountForSection(tvFocus.sectionIndex))
-                                    true
-                                }
-                                Key.Enter, Key.NumPadEnter -> {
-                                    if (heroFocusable && tvFocus.sectionIndex == 0) {
-                                        effectiveHeroItems.getOrNull(tvFocus.itemIndex)?.let { posterClickHandler?.invoke(it) }
-                                    } else {
-                                        tvRows.getOrNull(tvRowIndexForSection(tvFocus.sectionIndex))
-                                            ?.onEnter
-                                            ?.invoke(tvFocus.itemIndex)
-                                    }
                                     true
                                 }
                                 Key.LeftBracket -> {
@@ -3630,6 +3728,23 @@ fun HomeScreen(
                             )
                         }
                     }
+                    if (isShowingHomeContent && continueWatchingPreferences.isVisible && upcomingRowItems.isNotEmpty()) {
+                        item(key = HOME_UPCOMING_SECTION_KEY) {
+                            HomeContinueWatchingSection(
+                                items = upcomingRowItems,
+                                title = upcomingRowTitle,
+                                style = continueWatchingPreferences.style,
+                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
+                                blurNextUp = continueWatchingPreferences.blurNextUp,
+                                modifier = Modifier.padding(bottom = 12.dp),
+                                sectionPadding = homeSectionPadding,
+                                layout = continueWatchingLayout,
+                                rowState = upcomingRowState,
+                                onItemClick = onContinueWatchingClick,
+                                onItemLongPress = onContinueWatchingLongPress,
+                            )
+                        }
+                    }
                     item {
                         HomeEmptyStateCard(
                             modifier = Modifier.padding(horizontal = 16.dp),
@@ -3668,6 +3783,23 @@ fun HomeScreen(
                                 sectionPadding = homeSectionPadding,
                                 layout = continueWatchingLayout,
                                 rowState = nextUpRowState,
+                                onItemClick = onContinueWatchingClick,
+                                onItemLongPress = onContinueWatchingLongPress,
+                            )
+                        }
+                    }
+                    if (isShowingHomeContent && continueWatchingPreferences.isVisible && upcomingRowItems.isNotEmpty()) {
+                        item(key = HOME_UPCOMING_SECTION_KEY) {
+                            HomeContinueWatchingSection(
+                                items = upcomingRowItems,
+                                title = upcomingRowTitle,
+                                style = continueWatchingPreferences.style,
+                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
+                                blurNextUp = continueWatchingPreferences.blurNextUp,
+                                modifier = Modifier.padding(bottom = 12.dp),
+                                sectionPadding = homeSectionPadding,
+                                layout = continueWatchingLayout,
+                                rowState = upcomingRowState,
                                 onItemClick = onContinueWatchingClick,
                                 onItemLongPress = onContinueWatchingLongPress,
                             )
@@ -3797,6 +3929,38 @@ fun HomeScreen(
                                 sectionPadding = homeSectionPadding,
                                 layout = continueWatchingLayout,
                                 rowState = nextUpRowState,
+                                focusedItemIndex = if (tvFocusedRowIndex == rowIndex) tvFocus.itemIndex else null,
+                                isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                onHoverItem = if (isDesktop) {
+                                    { itemIndex ->
+                                        if (mouseActivity.isMouseActive) {
+                                            tvFocus.sectionIndex = sectionIndex
+                                            tvFocus.itemIndex = itemIndex
+                                        }
+                                    }
+                                } else {
+                                    null
+                                },
+                                onItemClick = onContinueWatchingClick,
+                                onItemLongPress = onContinueWatchingLongPress,
+                            )
+                        }
+                    }
+                    if (isShowingHomeContent &&
+                        continueWatchingPreferences.isVisible && upcomingRowItems.isNotEmpty()) {
+                        val rowIndex = tvRowCursor++
+                        val sectionIndex = if (heroFocusable) rowIndex + 1 else rowIndex
+                        item(key = HOME_UPCOMING_SECTION_KEY) {
+                            HomeContinueWatchingSection(
+                                items = upcomingRowItems,
+                                title = upcomingRowTitle,
+                                style = continueWatchingPreferences.style,
+                                useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
+                                blurNextUp = continueWatchingPreferences.blurNextUp,
+                                modifier = Modifier.padding(bottom = 12.dp),
+                                sectionPadding = homeSectionPadding,
+                                layout = continueWatchingLayout,
+                                rowState = upcomingRowState,
                                 focusedItemIndex = if (tvFocusedRowIndex == rowIndex) tvFocus.itemIndex else null,
                                 isKeyboardNavigation = !mouseActivity.isMouseActive,
                                 onHoverItem = if (isDesktop) {
@@ -4122,6 +4286,29 @@ fun HomeScreen(
                                         onItemLongPress = onContinueWatchingLongPress,
                                     )
 
+                                isShowingHomeContent && activeSettingsItem?.key == HOME_UPCOMING_SECTION_KEY ->
+                                    HomeContinueWatchingSection(
+                                        items = upcomingRowItems,
+                                        title = upcomingRowTitle,
+                                        style = continueWatchingPreferences.style,
+                                        useEpisodeThumbnails = continueWatchingPreferences.useEpisodeThumbnails,
+                                        blurNextUp = continueWatchingPreferences.blurNextUp,
+                                        sectionPadding = homeSectionPadding,
+                                        layout = continueWatchingLayout,
+                                        basePosterWidthDpOverride = immersivePosterBaseWidthDp.takeIf {
+                                            immersiveLandscapeMode
+                                        },
+                                        maxCardHeight = immersiveShelfCardHeightDp(immersiveShelfHeight.value).dp,
+                                        focusedItemIndex = tvFocus.itemIndex,
+                                        rowState = upcomingRowState,
+                                        onHoverItem = ::selectHoveredImmersiveItem,
+                                        isKeyboardNavigation = !mouseActivity.isMouseActive,
+                                        headerTrailingContent = tvRowDotsContent,
+                                        bodyModifier = rowBodyModifier,
+                                        onItemClick = onContinueWatchingClick,
+                                        onItemLongPress = onContinueWatchingLongPress,
+                                    )
+
                                 isShowingHomeContent && activeSettingsItem?.isCollection == true -> {
                                     collectionsMap[activeSettingsItem?.key ?: ""]?.let { collection ->
                                         HomeCollectionRowSection(
@@ -4340,6 +4527,7 @@ private const val HOME_CONTINUE_WATCHING_SECTION_KEY = "home:continue-watching"
  */
 internal const val DISCOVER_BROWSER_ROW_KEY = "discover:browser"
 private const val HOME_NEXT_UP_SECTION_KEY = "home:next-up"
+private const val HOME_UPCOMING_SECTION_KEY = "home:upcoming"
 
 /**
  * Entries a Search or Library row renders. Unlike home catalogs these sections never paginate —
@@ -4888,13 +5076,41 @@ private fun heroMobileBelowSectionHeightHint(
     return sectionHeight + bottomNavigationOverlayHeight
 }
 
+internal data class HomeContinueWatchingRows(
+    val continueWatching: List<ContinueWatchingItem>,
+    val nextUp: List<ContinueWatchingItem>,
+    val upcoming: List<ContinueWatchingItem>,
+)
+
+/**
+ * Splits the combined Continue Watching list into up to three rows. The two options are
+ * independent: [separateUpcomingRow] pulls Next Up episodes that have not aired yet into an
+ * Upcoming row (soonest first, as upstream's "Separate Upcoming Row"); [separateNextUpRow] then
+ * splits whatever is left, so with both on, Next Up holds only episodes that are watchable now.
+ */
 internal fun splitContinueWatchingRows(
     items: List<ContinueWatchingItem>,
     separateNextUpRow: Boolean,
-): Pair<List<ContinueWatchingItem>, List<ContinueWatchingItem>> {
-    if (!separateNextUpRow) return items to emptyList()
-    return items.filterNot(ContinueWatchingItem::isNextUp) to
-        items.filter(ContinueWatchingItem::isNextUp)
+    separateUpcomingRow: Boolean = false,
+    nowEpochMs: Long = WatchProgressClock.nowEpochMs(),
+): HomeContinueWatchingRows {
+    val (upcoming, watchable) = if (separateUpcomingRow) {
+        items.partition { item ->
+            item.isNextUp && com.nuvio.app.features.watchprogress.parseReleaseDateToEpochMs(item.released)
+                ?.let { releaseEpochMs -> releaseEpochMs > nowEpochMs } == true
+        }
+    } else {
+        emptyList<ContinueWatchingItem>() to items
+    }
+    val sortedUpcoming = upcoming.sortedBy { item ->
+        com.nuvio.app.features.watchprogress.parseReleaseDateToEpochMs(item.released)
+    }
+    if (!separateNextUpRow) return HomeContinueWatchingRows(watchable, emptyList(), sortedUpcoming)
+    return HomeContinueWatchingRows(
+        continueWatching = watchable.filterNot(ContinueWatchingItem::isNextUp),
+        nextUp = watchable.filter(ContinueWatchingItem::isNextUp),
+        upcoming = sortedUpcoming,
+    )
 }
 
 internal fun buildHomeContinueWatchingItems(
@@ -5598,7 +5814,7 @@ internal fun heroProbeMs(): Long = heroProbeClock.elapsedNow().inWholeMillisecon
 // TEMPORARY (hero race diagnosis) - remove with the other probes. Records every write to
 // displayedFocusedItem so a repro log shows which writer set the hero item and how complete it was.
 internal fun logHeroPick(site: String, item: MetaPreview?) {
-    co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+    co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
         if (item == null) {
             "t=${heroProbeMs()} site=$site item=null"
         } else {
@@ -5620,7 +5836,7 @@ internal fun publishHeroEnrichment(
 ) {
     val key = canonicalHeroKey(item.type, item.id)
     val previous = map[key]
-    co.touchlab.kermit.Logger.withTag("HeroLogoRace").i {
+    co.touchlab.kermit.Logger.withTag("HeroLogoRace").d {
         "t=${heroProbeMs()} PUBLISH site=$site key=$key logo=${item.logo?.takeLast(24) ?: "NONE"} " +
             "genres=${item.genres.size} hasDescr=${!item.description.isNullOrBlank()} " +
             "replaces=${previous?.let { "genres=" + it.genres.size + ",logo=" + (it.logo != null) } ?: "nothing"}"

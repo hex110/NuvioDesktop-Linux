@@ -23,6 +23,7 @@ import com.nuvio.app.features.discord.DiscordRichPresenceActivity
 import com.nuvio.app.features.discord.DiscordRichPresenceController
 import com.nuvio.app.features.discord.DiscordRichPresenceActivityType
 import com.nuvio.app.features.discord.DiscordRichPresenceImageFit
+import com.nuvio.app.features.discord.fitsDiscordAssetLimit
 import com.nuvio.app.features.discord.isExternallyFetchableArtworkUrl
 import com.nuvio.app.features.lights.LightsController
 import com.nuvio.app.features.lights.LightsPlaybackSource
@@ -55,7 +56,9 @@ import com.nuvio.app.features.player.skip.SKIP_SUBMIT_OFFER_FORWARD_TOLERANCE_SE
 import com.nuvio.app.features.player.skip.SKIP_SUBMIT_OFFER_TIMEOUT_MS
 import com.nuvio.app.features.player.skip.SKIP_SUBMIT_RESULT_TIMEOUT_MS
 import com.nuvio.app.features.player.skip.SkipSubmitToastPhase
+import com.nuvio.app.features.playlist.PlaylistPlaybackSession
 import com.nuvio.app.features.plugins.PluginRepository
+import com.nuvio.app.features.streams.mediaFilename
 import com.nuvio.app.features.streams.StreamPrefetchService
 import com.nuvio.app.features.streams.BingeGroupCacheRepository
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
@@ -69,6 +72,7 @@ import kotlinx.serialization.json.put
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.random.Random
 import nuvio.composeapp.generated.resources.*
@@ -980,7 +984,7 @@ private fun PlayerScreenRuntime.discordPresenceArtworkCandidates(
     }
     return ordered
         .mapNotNull { it?.trim() }
-        .filter { isExternallyFetchableArtworkUrl(it) }
+        .filter { isExternallyFetchableArtworkUrl(it) && fitsDiscordAssetLimit(it) }
         .distinct()
 }
 
@@ -1188,6 +1192,46 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         }
     }
 
+    val seekrEligible = seekrPreviewsEligible(
+        mode = playerSettingsUiState.desktopSeekThumbnailMode,
+        bufferPreset = playerSettingsUiState.desktopBufferPreset,
+        sourceUrl = activeSourceUrl,
+        isTorrent = activeTorrentInfoHash != null,
+        apiKey = playerSettingsUiState.seekrApiKey,
+    )
+    LaunchedEffect(
+        activeVideoId,
+        activeSeasonNumber,
+        activeEpisodeNumber,
+        parentMetaId,
+        activeSourceUrl,
+        seekrEligible,
+        playerSettingsUiState.seekrApiKey,
+    ) {
+        seekrTrack = null
+        seekrLookupPending = seekrEligible
+        if (!seekrEligible) return@LaunchedEffect
+        try {
+            val target = resolveSkipLookupTarget(
+                videoId = activeVideoId,
+                parentMetaId = parentMetaId,
+                contentType = contentType ?: parentMetaType,
+                season = activeSeasonNumber,
+                episode = activeEpisodeNumber,
+            ) ?: return@LaunchedEffect
+            // Seekr matches the cut by runtime, so the lookup has to wait for the player's.
+            val durationMs = withTimeoutOrNull(SKIP_LOOKUP_DURATION_TIMEOUT_MS) {
+                snapshotFlow { playbackSnapshot.durationMs }.first { it > 0L }
+            } ?: return@LaunchedEffect
+            val result = SeekrPreviews.lookup(playerSettingsUiState.seekrApiKey, target, durationMs)
+            SeekrLog.i { "lookup ${target::class.simpleName} duration=${durationMs}ms -> ${result::class.simpleName}" }
+            seekrTrack = (result as? SeekrLookupResult.Found)?.track
+        } finally {
+            // A cancelled run leaves the flag to its successor, which has already set its own.
+            if (isActive) seekrLookupPending = false
+        }
+    }
+
     LaunchedEffect(activeVideoId, activeSeasonNumber, activeEpisodeNumber, parentMetaId, parentMetaType) {
         skipIntervals = emptyList()
         playerChapters = emptyList()
@@ -1314,6 +1358,11 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         val current = skipSubmitOffer
         if (current?.interval == offer.interval && current.phase == offer.phase) skipSubmitOffer = null
     }
+    LaunchedEffect(playerNoticeToast?.key) {
+        val notice = playerNoticeToast ?: return@LaunchedEffect
+        delay(SKIP_SUBMIT_RESULT_TIMEOUT_MS)
+        if (playerNoticeToast?.key == notice.key) playerNoticeToast = null
+    }
     LaunchedEffect(skipCaptureSession?.startSec, skipCaptureSession?.phase) {
         val session = skipCaptureSession ?: return@LaunchedEffect
         val timeout = when (session.phase) {
@@ -1369,7 +1418,9 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
     }
 
     LaunchedEffect(playerMetaVideos, activeVideoId, activeSeasonNumber, activeEpisodeNumber) {
-        if (!isSeries || playerMetaVideos.isEmpty()) {
+        // A playlist decides what plays next, not the show: binge would otherwise carry on into
+        // the following episode instead of the playlist's next entry.
+        if (!isSeries || playerMetaVideos.isEmpty() || isPlaylistPlayback) {
             nextEpisodeInfo = null
             return@LaunchedEffect
         }
@@ -1399,6 +1450,114 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                 } else null,
             )
         } else null
+    }
+
+    if (isPlaylistPlayback) {
+        LaunchedEffect(Unit) {
+            val playlist = PlaylistPlaybackSession.currentPlaylist()
+            val entry = PlaylistPlaybackSession.currentEntry()
+            // A random-episode slot is picked now, so the up-next card names the episode and the
+            // prefetch searches for it.
+            playlistUpNext = PlaylistPlaybackSession.upNext()?.let { next ->
+                com.nuvio.app.features.playlist.PlaylistRandomEpisodes.resolve(next) ?: next
+            }
+            if (playlist != null && entry != null) {
+                val position = playlist.entries.indexOfFirst { it.entryId == entry.entryId } + 1
+                playlistUpNextHeader = "Up next · ${playlist.name} ($position/${playlist.entries.size})"
+            }
+            PlaylistPlaybackSession.log.i {
+                "player opened in playlist mode entry=${entry?.entryId} upNext=${playlistUpNext?.entryId ?: "<end>"}"
+            }
+        }
+
+        // Same threshold rules as the next-episode card, so the prompt lands where the viewer is used
+        // to it. Advancing still waits for the end of the file (or a click): a playlist has no
+        // "binge early" setting, and cutting a film's credits short unasked would be a surprise.
+        LaunchedEffect(
+            playbackSnapshot.positionMs,
+            playbackSnapshot.durationMs,
+            playbackSnapshot.isEnded,
+            playlistUpNext,
+            isProviderDiagnosticVideoPlayback,
+            playbackSourceFailureActive,
+            errorMessage,
+            skipIntervals,
+            playerSettingsUiState.nextEpisodeThresholdMode,
+            playerSettingsUiState.nextEpisodeThresholdPercent,
+            playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
+        ) {
+            val blocked = playlistUpNext == null ||
+                isProviderDiagnosticVideoPlayback ||
+                playbackSourceFailureActive ||
+                errorMessage != null ||
+                playbackSnapshot.durationMs <= 0L
+            val atThreshold = !blocked && !playbackSnapshot.isEnded &&
+                PlayerNextEpisodeRules.shouldShowNextEpisodeCard(
+                    positionMs = playbackSnapshot.positionMs,
+                    durationMs = playbackSnapshot.durationMs,
+                    skipIntervals = skipIntervals,
+                    thresholdMode = playerSettingsUiState.nextEpisodeThresholdMode,
+                    thresholdPercent = playerSettingsUiState.nextEpisodeThresholdPercent,
+                    thresholdMinutesBeforeEnd = playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
+                )
+            showPlaylistUpNextCard = !blocked && (playbackSnapshot.isEnded || atThreshold)
+            if (!atThreshold) {
+                playlistThresholdStableSamples = 0
+                // Search ahead of the card: the threshold can sit seconds from the end, and some
+                // addons take 15-20s to answer, so waiting for it made every transition a stall.
+                // Held, never played: the card, the end of the file or Binge Mode decide that.
+                val remainingMs = playbackSnapshot.durationMs - playbackSnapshot.positionMs
+                if (
+                    !blocked && !playbackSnapshot.isEnded && !playbackSnapshot.isLoading &&
+                    remainingMs in 1..PLAYLIST_PREFETCH_LEAD_MS &&
+                    isPlaybackPositionSupportedByRecentProgress(
+                        positionMs = playbackSnapshot.positionMs,
+                        lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+                    )
+                ) {
+                    preparePlaylistAdvance(trigger = "lead", handOffWhenReady = false)
+                }
+                return@LaunchedEffect
+            }
+            // Same spike filter as binge: a refresh seek can briefly report a near-end position.
+            if (
+                !playbackSnapshot.isLoading &&
+                isPlaybackPositionSupportedByRecentProgress(
+                    positionMs = playbackSnapshot.positionMs,
+                    lastTrustedPositionMs = lastTrustedPlaybackPositionMs,
+                )
+            ) {
+                playlistThresholdStableSamples++
+            }
+            if (playlistThresholdStableSamples >= NEXT_EPISODE_THRESHOLD_STABLE_SAMPLES) {
+                // Prefetch always; Binge Mode also plays it as soon as it is found, exactly as it
+                // advances a show early. "Apply To Next Episode" never advances by itself.
+                preparePlaylistAdvance(
+                    trigger = "threshold",
+                    handOffWhenReady = playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
+                        !shouldOpenManualNextEpisodeSelection(
+                            mode = playerSettingsUiState.streamAutoPlayMode,
+                            manualNextEpisodeEnabled = playerSettingsUiState.streamAutoPlayManualNextEpisode,
+                            sourceAffinity = sourceAffinity,
+                        ),
+                )
+            }
+        }
+
+        // The next entry opens in a fresh player; it starts at whatever speed this one ends at.
+        LaunchedEffect(sessionPlaybackSpeed) {
+            PlaylistPlaybackSession.playbackSpeed = sessionPlaybackSpeed
+        }
+
+        // Lets the session tell, once the player is left, whether the entry was watched far enough
+        // to move the playlist on. Sampled coarsely; only the last value matters.
+        LaunchedEffect(playbackSnapshot.positionMs / PLAYLIST_PROGRESS_SAMPLE_MS, isProviderDiagnosticVideoPlayback) {
+            if (isProviderDiagnosticVideoPlayback || playbackSnapshot.isLoading) return@LaunchedEffect
+            PlaylistPlaybackSession.reportProgress(
+                positionMs = playbackSnapshot.positionMs,
+                durationMs = playbackSnapshot.durationMs,
+            )
+        }
     }
 
     LaunchedEffect(
@@ -1599,6 +1758,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
             }
             if (willTrigger) {
                 playNextEpisode()
+            } else if (willExit && isPlaylistPlayback && playlistUpNext != null) {
+                requestPlaylistAdvance(trigger = "eof")
             } else if (willExit) {
                 playbackEndExitRequested = true
                 flushWatchProgress()
@@ -1655,6 +1816,9 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
 
 private const val NEXT_EPISODE_ADVANCE_LATCH_SAFETY_TIMEOUT_MS = 150_000L
 private const val NEXT_EPISODE_THRESHOLD_STABLE_SAMPLES = 3
+
+/** How far before the end a playlist starts searching for its next entry's source. */
+private const val PLAYLIST_PREFETCH_LEAD_MS = 4 * 60_000L
 private const val NEXT_EPISODE_EOF_STABILITY_MS = 1_000L
 private const val NEXT_EPISODE_EOF_POSITION_TOLERANCE_MS = 5_000L
 private const val NEXT_EPISODE_TRUSTED_POSITION_TOLERANCE_MS = 30_000L
@@ -1684,7 +1848,10 @@ internal fun isTrustworthyPlaybackEnd(
 // these snapshot-keyed effects) are hard to reproduce, so this traces every link in the chain —
 // threshold detection, the end-of-file fallback, the advance latch, and the actual advance call —
 // to pinpoint exactly where a stall happens the next time it's observed. Purely observational.
+private const val PLAYLIST_PROGRESS_SAMPLE_MS = 2_000L
+
 internal val BingeAdvanceLog = Logger.withTag("BingeAdvance")
+private val SeekrLog = Logger.withTag("Seekr")
 
 private fun resolveAutoPlayEpisode(
     videos: List<MetaVideo>,
@@ -1825,6 +1992,7 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
         activeStreamType = stream.streamType
         activeSourceIdentityKey = stream.playerSourceIdentityKey()
         activeStreamTitle = stream.streamLabel
+        activeStreamFilename = stream.mediaFilename
         activeStreamSubtitle = stream.streamSubtitle
         activeProviderName = stream.addonName
         activeProviderAddonId = stream.addonId

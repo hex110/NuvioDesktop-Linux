@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
@@ -42,9 +43,12 @@ import com.nuvio.app.features.p2p.formatP2pSpeed
 import com.nuvio.app.features.player.skip.SKIP_SEGMENT_TYPES
 import com.nuvio.app.features.player.skip.SkipKeyActions
 import com.nuvio.app.features.player.skip.SkipIntroRepository
+import com.nuvio.app.features.playlist.displayTitle
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
+import com.nuvio.app.features.streams.StreamListSort
+import com.nuvio.app.features.streams.StreamListSortOrder
 import com.nuvio.app.features.streams.StreamScore
 import com.nuvio.app.features.streams.StreamScoreContext
 import com.nuvio.app.features.streams.StreamScoreContexts
@@ -183,7 +187,19 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         allLabel = allFilterLabel,
         selectedFilter = null,
     )
-    val sourceItems = buildPlayerControlSourceItems()
+    val sourceItems = buildPlayerControlSourceItems(
+        sortOrder = streamBadgeSettings.listSortOrder,
+        cachedFirst = streamBadgeSettings.listCachedFirst,
+    )
+    val sourceSortOptions = remember(streamBadgeSettings.listSortOrder) {
+        StreamListSortOrder.entries.map { order ->
+            PlayerControlFilterItem(
+                id = order.ordinal.toString(),
+                label = order.label,
+                isSelected = order == streamBadgeSettings.listSortOrder,
+            )
+        }
+    }
     val episodeItems = buildPlayerControlEpisodeItems()
     // Same fallback chain the details screen's episode cards use, so an episode whose still is
     // missing or unreachable shows the show's artwork instead of an empty card.
@@ -243,6 +259,42 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     // keeps its Play button (skip countdown / play now).
     val manualSwitchIsNonSequential = manualEpisodeSwitchInfo != null &&
         manualEpisodeSwitchInfo?.videoId != nextEpisodeInfo?.videoId
+    // The playlist's up-next prompt borrows the next-episode card. Next-episode resolution is off in
+    // playlist mode, so the two only meet when the viewer switches episode by hand from the panel —
+    // that loading feedback wins, since it is about what is happening right now.
+    val playlistCardEntry = playlistUpNext.takeIf {
+        isPlaylistPlayback && (showPlaylistUpNextCard || playlistHandoffRequested) &&
+            nextEpisodeForControls == null && !isProviderDiagnosticVideoPlayback
+    }
+    val peekPlaylists by com.nuvio.app.features.playlist.PlaylistRepository.playlists.collectAsState()
+    val peekActive by com.nuvio.app.features.playlist.PlaylistPlaybackSession.active.collectAsState()
+    val playlistPeek = remember(isPlaylistPlayback, peekPlaylists, peekActive, playlistUpNext) {
+        if (!isPlaylistPlayback) {
+            "" to emptyList()
+        } else {
+            buildPlaylistPeek(
+                playlist = peekActive?.let { active -> peekPlaylists.firstOrNull { it.id == active.playlistId } },
+                currentEntryId = peekActive?.entryId,
+                upNext = playlistUpNext,
+            )
+        }
+    }
+    val playlistPreparedSource = (playlistPrepared as? com.nuvio.app.features.playlist.PlaylistHandoff.Stream)
+        ?.stream?.addonName
+    val playlistStatus = when {
+        playlistCardEntry == null -> ""
+        nextEpisodeAutoPlaySearching -> stringResource(Res.string.player_next_episode_finding_source)
+        !nextEpisodeAutoPlaySourceName.isNullOrBlank() && nextEpisodeAutoPlayCountdown != null ->
+            stringResource(
+                Res.string.player_next_episode_playing_via_countdown,
+                nextEpisodeAutoPlaySourceName.orEmpty(),
+                nextEpisodeAutoPlayCountdown ?: 0,
+            )
+        playlistHandedOff -> "Starting…"
+        playlistPreparedSource != null -> "Ready · $playlistPreparedSource"
+        playlistPrepared is com.nuvio.app.features.playlist.PlaylistHandoff.Downloaded -> "Ready · downloaded"
+        else -> ""
+    }
     val nextEpisodeStatus = when {
         nextEpisodeForControls == null -> ""
         !nextEpisodeForControls.hasAired && !nextEpisodeForControls.unairedMessage.isNullOrBlank() ->
@@ -297,6 +349,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         title = title,
         episodeText = episodeText,
         streamTitle = activeStreamTitle,
+        streamFilename = activeStreamFilename.orEmpty(),
         providerName = activeProviderName,
         pauseOverlayWatchingLabel = stringResource(Res.string.compose_player_youre_watching),
         pauseOverlayLogo = logo,
@@ -347,13 +400,17 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         desktopAnimeSvpEnabled = playerSettingsUiState.desktopAnimeSvpEnabled,
         playbackInfoPanelEnabled = playerSettingsUiState.desktopPlaybackInfoPanelEnabled,
         activeSubtitleLabel = activePlaybackSubtitleLabel(),
-        seekThumbnailsEnabled = seekThumbnailsAllowed(
+        // The native decoder stands down while Seekr has (or is still fetching) this playback's
+        // sprites, and takes over again only if Seekr has nothing for it.
+        seekThumbnailsEnabled = seekrTrack == null && !seekrLookupPending && seekThumbnailsAllowed(
             mode = playerSettingsUiState.desktopSeekThumbnailMode,
             bufferPreset = playerSettingsUiState.desktopBufferPreset,
             sourceUrl = activeSourceUrl,
             isTorrent = activeTorrentInfoHash != null,
         ),
         seekThumbnailsLocalSource = activeTorrentInfoHash == null && isUserControlledSource(activeSourceUrl),
+        seekrVttUrl = seekrTrack?.vttUrl.orEmpty(),
+        seekrScale = seekrTrack?.scale ?: 1.0,
         seekStepSeconds = playerSettingsUiState.seekStepSeconds,
         tapToUnlockLabel = stringResource(Res.string.compose_player_tap_to_unlock),
         playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
@@ -504,6 +561,13 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         sourceBadgePlacement = streamBadgeSettings.badgePlacement.name.lowercase(),
         sourceFilters = sourceFilters,
         sourceItems = sourceItems,
+        sourceSortOptions = sourceSortOptions,
+        sourceSortLabel = if (streamBadgeSettings.listSortOrder == StreamListSortOrder.DEFAULT) {
+            "Sort"
+        } else {
+            streamBadgeSettings.listSortOrder.label
+        },
+        sourceCachedFirst = streamBadgeSettings.listCachedFirst,
         episodeItems = episodeItems,
         episodeFallbackThumbnail = episodeFallbackThumbnail,
         episodeSeasons = episodeSeasons,
@@ -558,29 +622,48 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         skipPromptDismissed = skipIntervalDismissed,
         skipKeyAction = resolveSkipKeyAction(
             skipPromptActionable = nativeSkipInterval != null && !playerControlsLocked && !skipIntervalDismissed,
-            nextEpisodeActionable = nextEpisodeForControls != null && !playerControlsLocked &&
-                nextEpisodeForControls.hasAired && !manualSwitchIsNonSequential,
+            nextEpisodeActionable = !playerControlsLocked && (
+                (
+                    nextEpisodeForControls != null &&
+                        nextEpisodeForControls.hasAired && !manualSwitchIsNonSequential
+                    ) || playlistCardEntry != null
+                ),
         ),
         skipSubmitToast = skipSubmitToastCopy(),
         skipSubmitToastDismissible = isSkipSubmitToastDismissible(),
-        nextEpisodeVisible = nextEpisodeForControls != null && !playerControlsLocked,
-        nextEpisodeHeaderLabel = stringResource(Res.string.player_next_episode),
-        nextEpisodeTitle = nextEpisodeForControls?.let {
-            stringResource(
-                Res.string.compose_player_episode_title_format,
-                it.season,
-                it.episode,
-                it.title,
-            )
-        }.orEmpty(),
-        nextEpisodeThumbnail = nextEpisodeForControls?.thumbnail.orEmpty(),
-        nextEpisodeStatus = nextEpisodeStatus,
-        nextEpisodeActionLabel = if (nextEpisodeForControls?.hasAired == true) {
+        nextEpisodeVisible = (nextEpisodeForControls != null || playlistCardEntry != null) && !playerControlsLocked,
+        nextEpisodeHeaderLabel = if (playlistCardEntry != null) {
+            playlistUpNextHeader
+        } else {
+            stringResource(Res.string.player_next_episode)
+        },
+        nextEpisodeTitle = if (playlistCardEntry != null) {
+            playlistCardEntry.displayTitle()
+        } else {
+            nextEpisodeForControls?.let {
+                stringResource(
+                    Res.string.compose_player_episode_title_format,
+                    it.season,
+                    it.episode,
+                    it.title,
+                )
+            }.orEmpty()
+        },
+        nextEpisodeThumbnail = if (playlistCardEntry != null) {
+            (playlistCardEntry.episodeThumbnail ?: playlistCardEntry.background ?: playlistCardEntry.poster).orEmpty()
+        } else {
+            nextEpisodeForControls?.thumbnail.orEmpty()
+        },
+        nextEpisodeStatus = if (playlistCardEntry != null) playlistStatus else nextEpisodeStatus,
+        nextEpisodeActionLabel = if (playlistCardEntry != null || nextEpisodeForControls?.hasAired == true) {
             stringResource(Res.string.detail_btn_play)
         } else {
             stringResource(Res.string.player_next_episode_unaired)
         },
-        nextEpisodePlayable = nextEpisodeForControls?.hasAired == true && !manualSwitchIsNonSequential,
+        nextEpisodePlayable = playlistCardEntry != null ||
+            (nextEpisodeForControls?.hasAired == true && !manualSwitchIsNonSequential),
+        playlistPeekTitle = playlistPeek.first,
+        playlistPeekItems = playlistPeek.second,
     )
 
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
@@ -689,6 +772,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                         providerDiagnosticVideoSourceUrl = activeSourceUrl
                         providerDiagnosticProbePendingSourceUrl = null
                         lastTrustedPlaybackPositionMs = 0L
+                        initialResumeReached = false
                         lastMeaningfulPlaybackSnapshot = null
                         hasRequestedScrobbleStartForCurrentItem = false
                         scrobbleStartRequestGeneration += 1L
@@ -714,6 +798,17 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                         snapshot.positionMs in 1 until snapshot.durationMs
                     ) {
                         lastTrustedPlaybackPositionMs = snapshot.positionMs
+                        if (
+                            !initialResumeReached &&
+                            isResumeReached(
+                                trustedPositionMs = snapshot.positionMs,
+                                durationMs = snapshot.durationMs,
+                                initialPositionMs = activeInitialPositionMs,
+                                initialProgressFraction = activeInitialProgressFraction,
+                            )
+                        ) {
+                            initialResumeReached = true
+                        }
                     }
                     if (
                         !isProviderDiagnosticVideoPlayback &&
@@ -747,6 +842,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     // Stop completion persistence/scrobbling before mpv's failed seek can expose
                     // its synthetic last-frame position to the EOF/autoplay effects.
                     playbackSourceFailureActive = true
+                    PlaybackErrorLog.error(playbackAttemptId, activeSourceUrl, message)
 
                     val isRateLimited =
                         playbackErrorFailure(message) == PlaybackSourceFailure.DebridRateLimited
@@ -768,6 +864,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
 
                     providerDiagnosticRecoveryAttemptedSourceUrl = failedUrl
                     controlsVisible = !playerControlsLocked
+                    PlaybackErrorLog.decision(playbackAttemptId, "provider diagnostic probe")
                     scope.launch {
                         val diagnostic = resolveProviderDiagnosticVideo(
                             sourceUrl = failedUrl,
@@ -782,6 +879,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                             return@launch
                         }
 
+                        PlaybackErrorLog.decision(playbackAttemptId, "provider diagnostic video")
                         activateProviderDiagnosticVideo(diagnostic)
                     }
                 },
@@ -834,7 +932,10 @@ private fun PlayerScreenRuntime.presentUnrecoverablePlaybackError(
     val isRateLimited = playbackErrorFailure(message) == PlaybackSourceFailure.DebridRateLimited
     // A provider-side rate limit is not an expired credential. Refreshing a signed URL here can
     // silently retry the same throttled provider and leave the user on the failed player longer.
-    if (!isRateLimited && tryRefreshCredentialedSourceAfterError(message)) return
+    if (!isRateLimited && tryRefreshCredentialedSourceAfterError(message)) {
+        PlaybackErrorLog.decision(playbackAttemptId, "refresh credentialed source")
+        return
+    }
     // Failover carries the same hazard on a rate limit: any hop onto the SAME throttled provider
     // just earns another 429 and deepens the throttle (rapid episode-switching walked the whole
     // list this way). Passing rateLimited scopes the walk to the failed source's provider — it
@@ -846,8 +947,13 @@ private fun PlayerScreenRuntime.presentUnrecoverablePlaybackError(
             rateLimited = isRateLimited,
         )
     ) {
+        PlaybackErrorLog.decision(playbackAttemptId, "failover (see StreamFailover)")
         return
     }
+    PlaybackErrorLog.decision(
+        playbackAttemptId,
+        if (playerSettingsUiState.streamFailoverEnabled) "exit (failover did not apply)" else "exit (failover off)",
+    )
     exitAfterPlaybackFailure(message, playbackFailedToast)
 }
 
@@ -924,35 +1030,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             onSourcesClick = if (activeVideoId != null) { { openSourcesPanel() } } else null,
             onEpisodesClick = if (isSeries) { { openEpisodesPanel() } } else null,
-            onOpenInExternalPlayer = args.onOpenInExternalPlayer?.let { openExternal ->
-                {
-                    val loadedSubtitles = addonSubtitles
-                        .takeIf { it.isNotEmpty() }
-                        ?.map { sub ->
-                            SubtitleInput(
-                                url = sub.url,
-                                name = buildString {
-                                    if (!sub.addonName.isNullOrBlank()) append("[${sub.addonName}] ")
-                                    append(sub.display)
-                                },
-                                lang = sub.language,
-                            )
-                        }
-                    openExternal(
-                        ExternalPlayerPlaybackRequest(
-                            sourceUrl = activeSourceUrl,
-                            title = title,
-                            streamTitle = activeStreamTitle,
-                            sourceHeaders = activeSourceHeaders,
-                            resumePositionMs = playbackSnapshot.positionMs,
-                            subtitles = loadedSubtitles,
-                            season = activeSeasonNumber,
-                            episode = activeEpisodeNumber,
-                            episodeTitle = activeEpisodeTitle,
-                        ),
-                    )
-                }
-            },
+            onOpenInExternalPlayer = args.onOpenInExternalPlayer?.let { { openInExternalPlayer() } },
             onSubmitIntroClick = if (
                 isSeries &&
                 playerSettingsUiState.introSubmitEnabled &&
@@ -1105,6 +1183,14 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         "reloadSources" -> {
             prepareSourcesForPlayerControls(forceRefresh = true)
         }
+        // The streams screen's Sort chip setting, so the panel and the picker always agree.
+        "setSourceSort" -> {
+            StreamListSortOrder.entries.getOrNull(value.toInt())
+                ?.let(StreamBadgeSettingsRepository::setListSortOrder)
+        }
+        "setSourceCachedFirst" -> {
+            StreamBadgeSettingsRepository.setListCachedFirst(value > 0.5)
+        }
         "sourcesPanelClosed" -> {
             pendingSourcesEpisode = null
             showSourcesPanel = false
@@ -1127,6 +1213,7 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
                 switchToSource(stream, keepSourcesPanelOpen = true)
             }
         }
+        "playlistJump" -> if (isPlaylistPlayback) jumpToPlaylistEntry(value.toInt())
         "selectEpisode" -> {
             val episode = playerMetaVideos.getOrNull(value.toInt()) ?: return true
             if (selectDownloadedEpisodeForPlayback(
@@ -1186,14 +1273,13 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         // Right-click on the HUD prompt: hide it for this segment without seeking. Cleared again by
         // the position effect when playback enters the next segment.
         "dismissSkipInterval" -> skipIntervalDismissed = true
-        "playNextEpisode" -> {
-            if (nextEpisodeInfo?.hasAired == true) {
-                nextEpisodeAutoPlayJob?.cancel()
+        "playNextEpisode", "nextEpisode" -> {
+            if (isPlaylistPlayback && playlistUpNext != null) {
+                advancePlaylist()
+            } else if (nextEpisodeInfo?.hasAired == true) {
+                if (type == "playNextEpisode") nextEpisodeAutoPlayJob?.cancel()
                 playNextEpisode()
             }
-        }
-        "nextEpisode" -> {
-            if (nextEpisodeInfo?.hasAired == true) playNextEpisode()
         }
         "previousEpisode" -> {
             val previous = PlayerNextEpisodeRules.resolvePreviousEpisode(
@@ -1587,28 +1673,54 @@ private fun PlayerScreenRuntime.handlePlayerControlsScrubFinished(positionMs: Lo
 
 private fun PlayerScreenRuntime.openInExternalPlayer() {
     val openExternal = args.onOpenInExternalPlayer ?: return
-    val loadedSubtitles = addonSubtitles
-        .takeIf { it.isNotEmpty() }
-        ?.map { sub ->
-            SubtitleInput(
-                url = sub.url,
-                name = buildString {
-                    if (!sub.addonName.isNullOrBlank()) append("[${sub.addonName}] ")
-                    append(sub.display)
-                },
-                lang = sub.language,
-            )
-        }
-    openExternal(
-        ExternalPlayerPlaybackRequest(
-            sourceUrl = activeSourceUrl,
-            title = title,
-            streamTitle = activeStreamTitle,
-            sourceHeaders = activeSourceHeaders,
-            resumePositionMs = playbackSnapshot.positionMs,
-            subtitles = loadedSubtitles,
-        ),
+    if (externalHandoffInProgress) return
+    externalHandoffInProgress = true
+    val request = ExternalPlayerPlaybackRequest(
+        sourceUrl = activeSourceUrl,
+        title = title,
+        streamTitle = activeStreamTitle,
+        sourceHeaders = activeSourceHeaders,
+        resumePositionMs = playbackSnapshot.positionMs,
+        season = activeSeasonNumber,
+        episode = activeEpisodeNumber,
+        episodeTitle = activeEpisodeTitle,
     )
+    scope.launch {
+        // Same filtering, cap and local caching as a direct external launch. The loaded list used
+        // to be handed over raw: nothing at all under fast startup (no automatic addon fetch),
+        // otherwise every addon subtitle in every language as remote URLs, which MPC-HC and
+        // PotPlayer cannot open. The forwarding switch only exists in External mode, so from the
+        // internal player it counts as on.
+        val prepared = try {
+            prepareExternalPlayerLaunch(
+                request = request,
+                type = activeAddonSubtitleType,
+                videoId = activeVideoId.orEmpty(),
+                forwardSubtitles = !playerSettingsUiState.externalPlayerEnabled ||
+                    playerSettingsUiState.externalPlayerForwardSubtitles,
+                settings = playerSettingsUiState,
+                originalLanguage = OriginalLanguageCache.languageFor(args.parentMetaId),
+                loadedSubtitles = addonSubtitles,
+                pinnedSubtitle = selectedAddonSubtitle.takeIf { useCustomSubtitles },
+                onOverlayMessage = { message ->
+                    playerNoticeSerial += 1
+                    playerNoticeToast = message?.let {
+                        SkipSubmitToastCopy(
+                            visible = true,
+                            phase = "submitting",
+                            title = "Opening in external player",
+                            detail = it,
+                            key = "external-handoff:$playerNoticeSerial",
+                        )
+                    }
+                },
+            )
+        } finally {
+            playerNoticeToast = playerNoticeToast?.takeUnless { it.key.startsWith("external-handoff:") }
+            externalHandoffInProgress = false
+        }
+        openExternal(prepared)
+    }
 }
 
 private fun PlayerScreenRuntime.buildPlayerControlFilters(
@@ -1700,7 +1812,10 @@ private fun playerControlSourceItem(
  * and then stayed that way until playback ended.
  */
 @Composable
-private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerControlSourceItem> {
+private fun PlayerScreenRuntime.buildPlayerControlSourceItems(
+    sortOrder: StreamListSortOrder,
+    cachedFirst: Boolean,
+): List<PlayerControlSourceItem> {
     val canResolveDebrid = DebridSettingsRepository.uiState.value.canResolvePlayableLinks
     val scoreProfile = StreamScoreRepository.profile
     val groups = sourceStreamsState.groups
@@ -1720,6 +1835,8 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
         isEpisode,
         metaId,
         metaType,
+        sortOrder,
+        cachedFirst,
     ) {
         val scoreContext = StreamScoreContexts.forPlayback(
             isEpisode = isEpisode,
@@ -1733,11 +1850,18 @@ private fun PlayerScreenRuntime.buildPlayerControlSourceItems(): List<PlayerCont
         // The desktop sources panel is the HTML overlay, so it cannot reuse the Compose picker's
         // sorting — apply the same score ordering here. The index stays the repository's original
         // one because selection events are dispatched by it.
-        val ordered = if (!scoreProfile.enabled || !scoreProfile.sortStreamList) {
+        val scoreOrdered = if (!scoreProfile.enabled || !scoreProfile.sortStreamList) {
             indexedStreams
         } else {
             indexedStreams.sortedByDescending { (index, _) -> scores[index]?.total ?: 0 }
         }
+        // Then the Sort chip's order on top, exactly as the streams screen layers it over scoring.
+        val ordered = StreamListSort.sortFlat(
+            entries = scoreOrdered,
+            order = sortOrder,
+            cachedFirst = cachedFirst,
+            streamOf = { it.value.second },
+        )
         val current = findCurrentPlayerControlStream(
             entries = ordered,
             identityKey = identityKey,
@@ -2314,19 +2438,23 @@ private fun PlayerScreenRuntime.downloadAddonSubtitle(addon: AddonSubtitle) {
             AddonSubtitleDownloadResult.Failed(error.message ?: subtitleSaveFailedLabel)
         }
         if (downloadingAddonSubtitleId == downloadKey) downloadingAddonSubtitleId = null
-        when (result) {
-            is AddonSubtitleDownloadResult.Saved -> NuvioToastController.show(
-                message = result.path,
-                title = subtitleSavedLabel,
-                durationMillis = 4_000L,
-            )
-            is AddonSubtitleDownloadResult.Failed -> NuvioToastController.show(
-                message = result.reason,
-                title = subtitleSaveFailedLabel,
-                durationMillis = 4_000L,
-            )
-            AddonSubtitleDownloadResult.Cancelled -> Unit
+        val (accepted, noticeTitle, noticeDetail) = when (result) {
+            is AddonSubtitleDownloadResult.Saved -> Triple(true, subtitleSavedLabel, result.path)
+            is AddonSubtitleDownloadResult.Failed -> Triple(false, subtitleSaveFailedLabel, result.reason)
+            AddonSubtitleDownloadResult.Cancelled -> return@launch
         }
+        NuvioToastController.show(message = noticeDetail, title = noticeTitle, durationMillis = 4_000L)
+        // The Compose toast above is hidden under the native player surface, so the HUD gets
+        // the same notice.
+        playerNoticeSerial += 1
+        playerNoticeToast = SkipSubmitToastCopy(
+            visible = true,
+            phase = "result",
+            title = noticeTitle,
+            detail = noticeDetail,
+            accepted = accepted,
+            key = "subtitle-save:$playerNoticeSerial",
+        )
     }
 }
 
