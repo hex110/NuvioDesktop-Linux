@@ -2667,6 +2667,9 @@ JNIEXPORT jint JNICALL NP(decodeSpeechSpot)(JNIEnv *env, jobject, jlong handle, 
     return result;
 }
 
+// Windows HDR state of the window's monitor; the UI compensation it feeds is Windows-only.
+JNIEXPORT jboolean JNICALL NP(isWindowDisplayHdr)(JNIEnv *, jobject, jlong) { return JNI_FALSE; }
+
 // Picture-in-Picture: a floating, draggable, resizable player window driven by
 // Win32 hit-testing and SetWindowPos. Needs a GTK/X11 equivalent.
 JNIEXPORT void JNICALL NP(setCompactPlayerWindow)(JNIEnv *, jobject, jlong, jboolean) {}
