@@ -66,18 +66,31 @@ class EpisodeRatingsTest {
     }
 
     @Test
-    fun `re-rating keeps the providers that already accepted the row`() {
+    fun `re-rating with the same score keeps the providers that accepted the row`() {
         val target = prompt(season = 4, episode = 5)
         val state = EpisodeRatingsUiState()
             .withPrompt(target, maxPending = 20)
             .withRating(target, rating = 7, ratedAtEpochMs = 1L)
 
         val synced = state.withSyncedProvider("trakt", state.ratings.values)
+        val reRated = synced.withRating(target, rating = 7, ratedAtEpochMs = 2L)
+
+        assertEquals(setOf("trakt"), reRated.ratings.getValue(ratingKey("tt10986410", 4, 5)).syncedProviderIds)
+    }
+
+    @Test
+    fun `changing the score makes every provider outstanding again`() {
+        val target = prompt(season = 4, episode = 5)
+        val state = EpisodeRatingsUiState()
+            .withPrompt(target, maxPending = 20)
+            .withRating(target, rating = 7, ratedAtEpochMs = 1L)
+
+        val synced = state.withSyncedProvider("yamtrack", state.ratings.values)
         val reRated = synced.withRating(target, rating = 10, ratedAtEpochMs = 2L)
         val stored = reRated.ratings.getValue(ratingKey("tt10986410", 4, 5))
 
         assertEquals(10, stored.rating)
-        assertEquals(setOf("trakt"), stored.syncedProviderIds)
+        assertEquals(emptySet(), stored.syncedProviderIds)
     }
 
     @Test

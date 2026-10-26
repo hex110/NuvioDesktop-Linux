@@ -45,6 +45,7 @@ object EpisodeRatingsRepository {
     fun ensureLoaded() {
         if (hasLoaded) return
         loadFromDisk(ProfileRepository.activeProfileId)
+        EpisodeRatingYamtrackSync.requestSync()
     }
 
     fun onProfileChanged(profileId: Int) {
@@ -101,6 +102,7 @@ object EpisodeRatingsRepository {
         require(rating in RatingRange) { "rating must be in $RatingRange, was $rating" }
         ensureLoaded()
         mutate { it.withRating(prompt, rating, System.currentTimeMillis()) }
+        EpisodeRatingYamtrackSync.requestSync()
     }
 
     /** Drops [prompt] without recording a rating. */

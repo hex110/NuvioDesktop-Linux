@@ -321,7 +321,78 @@ internal object YamtrackScrobbleRepository {
         @kotlinx.serialization.SerialName("position_seconds") val positionSeconds: Long? = null,
         @kotlinx.serialization.SerialName("duration_seconds") val durationSeconds: Long? = null,
         val completed: Boolean? = null,
+        val manual: Boolean? = null,
+        val score: Int? = null,
     )
+
+    /** What became of an episode-rating push; only [Rejected] and [Unreachable] leave it outstanding. */
+    internal enum class RatingPushResult { Accepted, Unresolvable, Rejected, Unreachable }
+
+    /**
+     * Sets [rating] (1..10) on one episode through a `stop` with `manual = true`: the instance
+     * leaves an already-watched episode as it is instead of recording a rewatch, so this is safe
+     * to repeat and does not need the episode to have been scrobbled first.
+     */
+    suspend fun rateEpisode(
+        metaType: String,
+        metaId: String,
+        showName: String,
+        season: Int,
+        episode: Int,
+        rating: Int,
+    ): RatingPushResult {
+        val (baseUrl, token) = YamtrackSettingsRepository.activeCredentials()
+            ?: return RatingPushResult.Unreachable
+        val item = buildItem(
+            contentType = metaType,
+            parentMetaId = metaId,
+            videoId = "$metaId:$season:$episode",
+            title = showName,
+            episodeTitle = null,
+            seasonNumber = season,
+            episodeNumber = episode,
+            isAnime = metaType.equals("anime", ignoreCase = true),
+        ) as? YamtrackScrobbleItem.Episode ?: return RatingPushResult.Unresolvable
+        val body = json.encodeToString(
+            YamtrackScrobbleRequest(
+                action = "stop",
+                mediaType = "episode",
+                ids = item.ids,
+                title = item.title,
+                seriesTitle = item.seriesTitle,
+                seasonNumber = item.season,
+                episodeNumber = item.episode,
+                completed = true,
+                manual = true,
+                score = rating,
+            ),
+        )
+        val response = runCatching {
+            httpRequestRaw(
+                method = "POST",
+                url = "$baseUrl/api/v1/scrobble/",
+                headers = mapOf(
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "Authorization" to "Bearer $token",
+                    "Idempotency-Key" to "nuvio-rating:${item.itemKey}:$rating",
+                ),
+                body = body,
+            )
+        }.onFailure { if (it is CancellationException) throw it }.getOrNull()
+            ?: return RatingPushResult.Unreachable
+        log.d { "Yamtrack episode rating ${item.itemKey}=$rating: ${response.status} ${response.body.take(200)}" }
+        return when (response.status) {
+            in 200..299 -> RatingPushResult.Accepted
+            // The instance could not resolve the episode through TMDB; retrying will not change that.
+            404 -> RatingPushResult.Unresolvable
+            401, 403 -> {
+                YamtrackSettingsRepository.setConnectionState(YamtrackConnectionState.Unauthorized)
+                RatingPushResult.Rejected
+            }
+            else -> RatingPushResult.Rejected
+        }
+    }
 
     internal fun buildBodyJson(
         action: String,

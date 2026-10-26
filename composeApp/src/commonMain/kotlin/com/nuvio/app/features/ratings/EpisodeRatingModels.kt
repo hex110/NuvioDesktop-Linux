@@ -91,7 +91,8 @@ internal fun EpisodeRatingsUiState.withRating(
         episode = prompt.episode,
         rating = rating,
         ratedAtEpochMs = ratedAtEpochMs,
-        syncedProviderIds = ratings[prompt.key]?.syncedProviderIds.orEmpty(),
+        // A changed score is new information for every provider, so nothing counts as synced.
+        syncedProviderIds = ratings[prompt.key]?.takeIf { it.rating == rating }?.syncedProviderIds.orEmpty(),
     )
     return copy(
         ratings = ratings + (entry.key to entry),
