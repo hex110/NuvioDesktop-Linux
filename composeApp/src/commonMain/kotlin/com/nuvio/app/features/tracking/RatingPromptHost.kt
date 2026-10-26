@@ -18,6 +18,7 @@ import com.nuvio.app.features.ratings.seasonFinaleRedditSearchTerms
 import com.nuvio.app.features.ratings.seriesFinaleRedditSearchTerms
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_done
 import nuvio.composeapp.generated.resources.details_rating_failed
 import nuvio.composeapp.generated.resources.details_rating_kicker
 import nuvio.composeapp.generated.resources.details_rating_saved
@@ -43,7 +44,7 @@ private fun resolveRatingPromptProvider(): TrackingProviderId? {
         LibrarySourceRepository.ensureLoaded()
         LibrarySourceRepository.uiState
     }.collectAsStateWithLifecycle()
-    return trackingRatingProviderFor(librarySource)?.takeIf { it in connectedProviderIds }
+    return ratingProviderWithFallback(librarySource).takeIf { it in connectedProviderIds }
 }
 
 /**
@@ -116,6 +117,7 @@ fun RatingPromptHost(isSuppressed: Boolean) {
         isPending = isPending,
         errorMessage = errorMessage,
         dismissLabel = stringResource(Res.string.rating_prompt_not_now),
+        doneLabel = stringResource(Res.string.action_done),
         onFindDiscussion = {
             runCatching { uriHandler.openUri(redditSearchUrlForRequest(pending)) }
         },
@@ -131,7 +133,8 @@ fun RatingPromptHost(isSuppressed: Boolean) {
                     )
                 }.onSuccess { result ->
                     if (result.isComplete) {
-                        RatingPromptRepository.dismiss()
+                        // Stays open so the score can be changed or the Reddit thread opened;
+                        // the Done button dismisses.
                         NuvioToastController.show(
                             getString(Res.string.details_rating_saved, providerName),
                         )

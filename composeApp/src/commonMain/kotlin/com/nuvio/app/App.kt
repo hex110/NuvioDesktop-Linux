@@ -5203,7 +5203,8 @@ private fun MainAppContent(
             // finishing a season finale asks about the season first and the episode after, rather
             // than stacking both dialogs at once.
             EpisodeRatingPromptHost(
-                isSuppressed = isPlaybackRouteActive ||
+                isPlayerOpen = currentBackStackEntry?.destination?.hasRoute<PlayerRoute>() == true,
+                isSuppressed = streamPickerRequest != null ||
                     isProviderRatingPromptVisible(isPlaybackRouteActive),
             )
 

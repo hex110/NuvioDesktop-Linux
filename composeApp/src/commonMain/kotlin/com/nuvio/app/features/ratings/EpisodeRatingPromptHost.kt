@@ -3,11 +3,15 @@ package com.nuvio.app.features.ratings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.features.details.components.TrackingRatingDialog
 import com.nuvio.app.features.tracking.RatingPromptRepository
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_done
 import nuvio.composeapp.generated.resources.details_rating_kicker
 import nuvio.composeapp.generated.resources.details_rating_title
 import nuvio.composeapp.generated.resources.rating_prompt_episode_body
@@ -21,27 +25,40 @@ import org.jetbrains.compose.resources.stringResource
  * appears after a finale, or when the player was dismissed before the
  * next-episode card had a chance to show.
  *
- * Episodes are queued the moment playback completes, which during a binge is
- * mid auto-play into the next episode, so [isSuppressed] holds the dialog back
- * while the player is on screen — and while the provider-backed finale prompt
- * is up, so a season finale does not stack two dialogs. The queue is durable,
- * so nothing is lost by waiting.
+ * An episode is queued the moment it completes. While the player is still on that
+ * very episode the prompt is held back; as soon as the player moves to another
+ * episode, or closes, the prompt appears. [isSuppressed] additionally holds it
+ * back while the provider-backed finale prompt is up, so a season finale does
+ * not stack two dialogs. The queue is durable, so nothing is lost by waiting.
  *
- * Rendered through the same [TrackingRatingDialog] as the provider prompt: one
- * rating dialog, one set of localized strings, one score rail.
+ * Once shown, the dialog stays open after a score is picked, so the score can be
+ * changed and the discussion link opened; the Done button closes it.
  */
 @Composable
-fun EpisodeRatingPromptHost(isSuppressed: Boolean) {
+fun EpisodeRatingPromptHost(isPlayerOpen: Boolean, isSuppressed: Boolean) {
     LaunchedEffect(Unit) { EpisodeRatingsRepository.ensureLoaded() }
 
     val state by EpisodeRatingsRepository.uiState.collectAsStateWithLifecycle()
+    val playingKey by ActiveEpisodePlayback.current.collectAsStateWithLifecycle()
     // Shares the single "ask me to rate" preference with the provider prompt. Turning that
     // off and still being asked after every episode would plainly be the wrong reading.
     val isEnabled by RatingPromptRepository.isEnabled.collectAsStateWithLifecycle()
     val uriHandler = LocalUriHandler.current
 
-    val prompt = state.nextPrompt
-    if (isSuppressed || !isEnabled || prompt == null) return
+    // The prompt on screen. Held here because rating removes it from the queue, and the
+    // dialog must not jump to the next episode's prompt while the score is still editable.
+    var shown by remember { mutableStateOf<PendingRatingPrompt?>(null) }
+
+    val head = state.nextPrompt
+    val stillWatchingHead = isPlayerOpen && head != null && head.key == playingKey
+    LaunchedEffect(head, stillWatchingHead, isEnabled, isSuppressed) {
+        if (shown == null && head != null && isEnabled && !isSuppressed && !stillWatchingHead) {
+            shown = head
+        }
+    }
+
+    val prompt = shown
+    if (isSuppressed || prompt == null) return
 
     TrackingRatingDialog(
         visible = true,
@@ -54,8 +71,13 @@ fun EpisodeRatingPromptHost(isSuppressed: Boolean) {
         isPending = false,
         errorMessage = null,
         dismissLabel = stringResource(Res.string.rating_prompt_not_now),
+        doneLabel = stringResource(Res.string.action_done),
+        initialScore = EpisodeRatingsRepository.ratingFor(prompt.metaId, prompt.season, prompt.episode)?.rating,
         onRate = { score -> EpisodeRatingsRepository.rate(prompt, score) },
-        onDismiss = { EpisodeRatingsRepository.skip(prompt) },
+        onDismiss = {
+            EpisodeRatingsRepository.skip(prompt)
+            shown = null
+        },
         onFindDiscussion = {
             runCatching {
                 uriHandler.openUri(

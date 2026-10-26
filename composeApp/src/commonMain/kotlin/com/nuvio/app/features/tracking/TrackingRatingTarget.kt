@@ -17,6 +17,10 @@ fun trackingRatingProviderFor(sourceMode: LibrarySourceMode): TrackingProviderId
             provider == TrackingProviderId.YAMTRACK
     }
 
+/** ARI: [trackingRatingProviderFor], falling back to Floppy when the source has no rating provider. */
+fun ratingProviderWithFallback(sourceMode: LibrarySourceMode): TrackingProviderId =
+    trackingRatingProviderFor(sourceMode) ?: TrackingProviderId.YAMTRACK
+
 /** The provider name shown in rating copy. Not localized — these are brand names. */
 fun trackingRatingProviderDisplayName(providerId: TrackingProviderId?): String =
     when (providerId) {
@@ -33,8 +37,7 @@ fun trackingRatingProviderDisplayName(providerId: TrackingProviderId?): String =
  * and enabled, so a rating still lands somewhere instead of the prompt silently never appearing.
  */
 fun activeTrackingRatingProvider(): TrackingProviderId? {
-    val providerId = trackingRatingProviderFor(LibrarySourceRepository.selectedSource())
-        ?: TrackingProviderId.YAMTRACK
+    val providerId = ratingProviderWithFallback(LibrarySourceRepository.selectedSource())
     if (TrackingProviderRegistry.ratingWriter(providerId) == null) return null
     if (!TrackingProviderRegistry.isAuthenticated(providerId)) return null
     return providerId

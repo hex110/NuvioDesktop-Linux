@@ -17,6 +17,8 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -78,10 +80,13 @@ fun TrackingRatingDialog(
     // ARI: optional link out to the episode/title's Reddit thread. Null keeps the dialog
     // exactly as it was for call sites that have nothing to link to.
     onFindDiscussion: (() -> Unit)? = null,
+    // ARI: when set, rating does not close the dialog; this button does, once a score is chosen.
+    doneLabel: String? = null,
+    initialScore: Int? = null,
 ) {
     if (!visible) return
 
-    var selectedScore by remember(visible, headline) { mutableStateOf<Int?>(null) }
+    var selectedScore by remember(visible, headline) { mutableStateOf(initialScore) }
     val closeLabel = dismissLabel ?: stringResource(Res.string.action_cancel)
 
     Dialog(
@@ -210,6 +215,20 @@ fun TrackingRatingDialog(
                                     color = RatingAccent,
                                     style = MaterialTheme.typography.bodySmall,
                                 )
+                            }
+                        }
+
+                        if (doneLabel != null && selectedScore != null) {
+                            Spacer(Modifier.height(16.dp))
+                            Button(
+                                onClick = onDismiss,
+                                enabled = !isPending,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = RatingAccent,
+                                    contentColor = Color(0xFF15191E),
+                                ),
+                            ) {
+                                Text(text = doneLabel, fontWeight = FontWeight.SemiBold)
                             }
                         }
 

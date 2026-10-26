@@ -1219,6 +1219,19 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
 
 @Composable
 private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
+    // ARI: tells the episode rating prompt which episode is on screen.
+    val trackedSeason = activeSeasonNumber
+    val trackedEpisode = activeEpisodeNumber
+    DisposableEffect(parentMetaId, trackedSeason, trackedEpisode) {
+        if (trackedSeason != null && trackedEpisode != null) {
+            com.nuvio.app.features.ratings.ActiveEpisodePlayback.enter(parentMetaId, trackedSeason, trackedEpisode)
+        }
+        onDispose {
+            if (trackedSeason != null && trackedEpisode != null) {
+                com.nuvio.app.features.ratings.ActiveEpisodePlayback.leave(parentMetaId, trackedSeason, trackedEpisode)
+            }
+        }
+    }
     val animeFillerSettings by com.nuvio.app.features.details.filler.AnimeFillerSettings.state.collectAsState()
     LaunchedEffect(activeVideoId, activeSeasonNumber, activeEpisodeNumber, parentMetaId, parentMetaType) {
         parentalWarnings = emptyList()
