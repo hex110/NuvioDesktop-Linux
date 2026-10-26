@@ -1,3 +1,5 @@
+// Ported from NuvioTV-Reshaped (github.com/DavidVamaiotu/NuvioTV-Reshaped, GPL-3.0),
+// app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SpeechAnalyzer.kt.
 package com.nuvio.app.features.player.audiosync
 
 import kotlin.math.PI

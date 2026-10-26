@@ -72,6 +72,8 @@ struct Player {
     // thread, started by the first request (see requestSeekThumbnail). Ported from the Windows
     // bridge; requests carry a generation so a newer hover supersedes an older one mid-seek.
     std::string thumbnailSourceUrl;
+    // A separate audio file was supplied; audio-referenced subtitle sync can't sample those.
+    bool hasExternalAudio = false;
     std::string thumbnailHeaderFields;
     std::thread thumbnailThread;
     std::mutex thumbnailMutex;
@@ -2038,6 +2040,7 @@ JNIEXPORT jlong JNICALL NP(create)(
     const char *cmd[] = {"loadfile", url.c_str(), nullptr};
     mpv_command(player->mpv, cmd);
     player->thumbnailSourceUrl = url;
+    player->hasExternalAudio = !audioFile.empty();
     player->thumbnailHeaderFields = headerFields;
 
     // Bring up the WebKitGTK controls overlay now so it can render the loading
@@ -2592,6 +2595,76 @@ JNIEXPORT void JNICALL NP(requestSeekThumbnail)(JNIEnv *, jobject, jlong handle,
         if (!p->thumbnailThread.joinable()) p->thumbnailThread = std::thread(runThumbnailWorker, p);
     }
     p->thumbnailCv.notify_one();
+}
+
+// Audio-referenced subtitle sync (ported from the Windows bridge). Average bytes per second of an
+// http(s) source, so sampled stretches can be sized to a download budget; negative when unknown
+// and for local files.
+JNIEXPORT jdouble JNICALL NP(speechSourceBytesPerSecond)(JNIEnv *, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p || !p->mpv) return -1.0;
+    const std::string &url = p->thumbnailSourceUrl;
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return -1.0;
+    int64_t size = 0;
+    if (mpv_get_property(p->mpv, "file-size", MPV_FORMAT_INT64, &size) < 0) return -1.0;
+    const double duration = mpvGetDouble(p->mpv, "duration");
+    return size > 0 && duration > 0.0 ? (double)size / duration : -1.0;
+}
+
+// Decodes [start, start+duration) of the film's audio with a throwaway headless mpv over its own
+// connection (same headers, same audio track) to 16 kHz mono float PCM in outputPath. Blocks;
+// runs on a Kotlin background thread. 0 on success.
+JNIEXPORT jint JNICALL NP(decodeSpeechSpot)(JNIEnv *env, jobject, jlong handle, jdouble startSeconds,
+                                            jdouble durationSeconds, jstring outputPath) {
+    Player *p = asPlayer(handle);
+    if (!p || !p->mpv || p->thumbnailStopping.load() || p->thumbnailSourceUrl.empty() ||
+        p->hasExternalAudio) {
+        return -1;
+    }
+    const std::string out = jstringToUtf8(env, outputPath);
+    const std::string aid = mpvGetStr(p->mpv, "aid");
+    const bool numericAid = !aid.empty() && std::all_of(aid.begin(), aid.end(), ::isdigit);
+    const double from = std::max(0.0, startSeconds);
+    const std::string start = std::to_string(from);
+    const std::string end = std::to_string(from + std::max(1.0, durationSeconds));
+    mpv_handle *probe = mpv_create();
+    if (!probe) return -1;
+    for (const auto &[name, value] : std::initializer_list<std::pair<const char *, const char *>>{
+             {"config", "no"}, {"terminal", "no"}, {"load-scripts", "no"}, {"ytdl", "no"},
+             {"input-default-bindings", "no"}, {"vid", "no"}, {"sid", "no"}, {"audio-display", "no"},
+             {"audio-spdif", ""}, {"af", ""}, {"ao", "pcm"}, {"ao-pcm-waveheader", "no"},
+             {"audio-samplerate", "16000"}, {"audio-channels", "mono"}, {"audio-format", "float"},
+             // The spot only; nothing read ahead past its end.
+             {"cache", "no"}, {"demuxer-readahead-secs", "1"}, {"demuxer-max-bytes", "8MiB"},
+             {"hr-seek", "yes"}, {"keep-open", "no"}}) {
+        mpv_set_option_string(probe, name, value);
+    }
+    mpv_set_option_string(probe, "ao-pcm-file", out.c_str());
+    mpv_set_option_string(probe, "start", start.c_str());
+    mpv_set_option_string(probe, "end", end.c_str());
+    if (numericAid) mpv_set_option_string(probe, "aid", aid.c_str());
+    if (!p->thumbnailHeaderFields.empty()) {
+        mpv_set_option_string(probe, "http-header-fields", p->thumbnailHeaderFields.c_str());
+    }
+    int result = -1;
+    if (mpv_initialize(probe) >= 0) {
+        const char *load[] = {"loadfile", p->thumbnailSourceUrl.c_str(), nullptr};
+        if (mpv_command(probe, load) >= 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+            while (std::chrono::steady_clock::now() < deadline && !p->thumbnailStopping.load()) {
+                mpv_event *event = mpv_wait_event(probe, 0.25);
+                if (event->event_id == MPV_EVENT_NONE) continue;
+                if (event->event_id == MPV_EVENT_SHUTDOWN) break;
+                if (event->event_id == MPV_EVENT_END_FILE) {
+                    const auto *endFile = static_cast<mpv_event_end_file *>(event->data);
+                    result = endFile && endFile->reason == MPV_END_FILE_REASON_EOF ? 0 : -2;
+                    break;
+                }
+            }
+        }
+    }
+    mpv_terminate_destroy(probe);
+    return result;
 }
 
 // Picture-in-Picture: a floating, draggable, resizable player window driven by

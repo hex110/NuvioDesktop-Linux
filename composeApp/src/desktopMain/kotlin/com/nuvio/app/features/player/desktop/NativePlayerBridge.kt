@@ -124,6 +124,15 @@ internal object NativePlayerBridge {
     external fun setSubtitleDelayMs(handle: Long, delayMs: Int)
 
     /**
+     * Decodes [durationSeconds] of the playing audio from [startSeconds] to raw 16 kHz mono float32
+     * PCM in [outputPath], with a throwaway headless mpv on its own connection. Blocks; 0 = written.
+     */
+    external fun decodeSpeechSpot(handle: Long, startSeconds: Double, durationSeconds: Double, outputPath: String): Int
+
+    /** The playing source's size over its duration; negative when unknown. */
+    external fun speechSourceBytesPerSecond(handle: Long): Double
+
+    /**
      * mpv's `sub-ass-override` level for ASS/SSA tracks ("no", "yes", "scale" or "force") plus the
      * `sub-scale` factor that goes with it.
      *
@@ -170,6 +179,12 @@ internal object NativePlayerBridge {
     external fun systemIdleMs(): Long
 
     /**
+     * Holds (or releases) a keep-awake request for the display and system while a video plays.
+     * Leaves [systemIdleMs] alone, so the screensaver's idle clock is unaffected.
+     */
+    external fun setWindowsDisplaySleepInhibited(inhibited: Boolean): Boolean
+
+    /**
      * Whether the foreground window belongs to this process. AWT's `Window.isActive` cannot be
      * trusted for this while focus sits in the WebView2 HUD (a non-AWT child of the frame).
      */
@@ -179,6 +194,12 @@ internal object NativePlayerBridge {
     // AWT/Skiko partially loads libgdk-3, or the bridge thread's gtk_init
     // aborts with a GType conflict. No-op off Linux.
     external fun initGtkEarly(): Boolean
+
+    /**
+     * Whether Windows HDR is on for the monitor [windowHwnd] sits on. False when that monitor
+     * cannot be matched, never a guess from another display. See `DesktopHdrUiCompensation`.
+     */
+    external fun isWindowDisplayHdr(windowHwnd: Long): Boolean
 
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
