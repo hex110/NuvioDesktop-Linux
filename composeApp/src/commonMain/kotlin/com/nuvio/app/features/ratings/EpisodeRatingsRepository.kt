@@ -94,6 +94,7 @@ object EpisodeRatingsRepository {
         // without this the episode the user just dismissed would be queued straight back.
         if (prompt.key == lastEnqueuedKey) return
         lastEnqueuedKey = prompt.key
+        logger.i { "episode rating prompt queued: $showName ${episodeLabel(season, episode)}" }
         mutate { it.withPrompt(prompt, MaxPendingPrompts) }
     }
 

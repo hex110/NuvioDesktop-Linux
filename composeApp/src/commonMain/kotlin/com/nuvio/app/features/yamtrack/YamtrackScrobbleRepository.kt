@@ -80,6 +80,13 @@ internal object YamtrackScrobbleRepository {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = false; explicitNulls = false }
 
     private var lastStamp: ScrobbleStamp? = null
+
+    /**
+     * Scrobbles on their way. A stop can fire twice at once (playback completing and the player
+     * closing), and [lastStamp] is only written after the response, so both would pass
+     * [shouldSkip] and Floppy would record the movie twice.
+     */
+    private val inFlight = mutableSetOf<String>()
     private const val MIN_SEND_INTERVAL_MS = 8_000L
     private const val PROGRESS_WINDOW = 1.5f
     private const val MAX_STOP_RETRIES = 2
@@ -207,7 +214,25 @@ internal object YamtrackScrobbleRepository {
         val progress = progressPercent.coerceIn(0f, 100f)
         val itemKey = item.itemKey
         if (shouldSkip(action, itemKey, progress)) return TrackingScrobbleResult.Declined
+        val flightKey = "$action:$itemKey"
+        if (!synchronized(inFlight) { inFlight.add(flightKey) }) return TrackingScrobbleResult.Declined
+        try {
+            return sendReserved(action, item, itemKey, progress, positionSeconds, durationSeconds, baseUrl, token)
+        } finally {
+            synchronized(inFlight) { inFlight.remove(flightKey) }
+        }
+    }
 
+    private suspend fun sendReserved(
+        action: String,
+        item: YamtrackScrobbleItem,
+        itemKey: String,
+        progress: Float,
+        positionSeconds: Long?,
+        durationSeconds: Long?,
+        baseUrl: String,
+        token: String,
+    ): TrackingScrobbleResult {
         val url = "$baseUrl/api/v1/scrobble/"
         val body = buildBodyJson(action, item, progress, positionSeconds, durationSeconds)
         val headers = mapOf(

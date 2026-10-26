@@ -1,5 +1,6 @@
 package com.nuvio.app.features.tracking
 
+import co.touchlab.kermit.Logger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -45,6 +46,7 @@ data class RatingPromptRequest(
  * answering means the older prompt is stale.
  */
 object RatingPromptRepository {
+    private val log = Logger.withTag("RatingPrompt")
     private val _pendingRequest = MutableStateFlow<RatingPromptRequest?>(null)
     val pendingRequest: StateFlow<RatingPromptRequest?> = _pendingRequest.asStateFlow()
 
@@ -89,8 +91,15 @@ object RatingPromptRepository {
      */
     fun offer(request: RatingPromptRequest) {
         ensureLoaded()
-        if (!_isEnabled.value) return
-        if (activeTrackingRatingProvider() == null) return
+        if (!_isEnabled.value) {
+            log.i { "rating prompt not offered for ${request.title}: prompts are switched off" }
+            return
+        }
+        if (activeTrackingRatingProvider() == null) {
+            log.i { "rating prompt not offered for ${request.title}: no connected provider can take a rating" }
+            return
+        }
+        log.i { "rating prompt queued: ${request.contentType} ${request.title} (${request.reason})" }
         // The player flushes progress more than once as a title ends, so the same completion
         // arrives repeatedly. Without this, answering the prompt would be followed by it
         // reappearing for the thing that was just rated.

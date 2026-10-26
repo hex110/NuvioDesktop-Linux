@@ -26,9 +26,15 @@ fun trackingRatingProviderDisplayName(providerId: TrackingProviderId?): String =
         else -> ""
     }
 
-/** The connected, rating-capable provider for the current library source, or null if there is none. */
+/**
+ * The connected, rating-capable provider for the current library source, or null if there is none.
+ *
+ * ARI: when the library source has none (it is Nuvio's own, say), Floppy is used if it is connected
+ * and enabled, so a rating still lands somewhere instead of the prompt silently never appearing.
+ */
 fun activeTrackingRatingProvider(): TrackingProviderId? {
-    val providerId = trackingRatingProviderFor(LibrarySourceRepository.selectedSource()) ?: return null
+    val providerId = trackingRatingProviderFor(LibrarySourceRepository.selectedSource())
+        ?: TrackingProviderId.YAMTRACK
     if (TrackingProviderRegistry.ratingWriter(providerId) == null) return null
     if (!TrackingProviderRegistry.isAuthenticated(providerId)) return null
     return providerId
