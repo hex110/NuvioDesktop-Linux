@@ -2,6 +2,7 @@ package com.nuvio.app.features.games
 
 import java.io.ByteArrayOutputStream
 import java.io.File
+import org.junit.Assume.assumeTrue
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -77,6 +78,9 @@ class GameLaunchTargetTest {
 
     @Test
     fun itemIdListNamesTheTargetWhenThereIsNoLinkInfoAndTheRelativePathIsWrong() {
+        // The id list names a drive (`C:\`) and Windows folders; the fake one is built from the
+        // temp path, which on a `/` host has no drive and so cannot be encoded.
+        assumeTrue("Windows-only: id-list paths name a drive", File.separatorChar == '\\')
         // Riot's shortcuts: no LinkInfo, a relative path that does not lead to the game from
         // where the shortcut sits, and the real target only in the id list.
         val root = tempRoot("idlist")

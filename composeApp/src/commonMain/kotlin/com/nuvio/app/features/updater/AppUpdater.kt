@@ -135,6 +135,10 @@ data class AppUpdaterUiState(
     val showDialog: Boolean = false,
     val showUnknownSourcesDialog: Boolean = false,
     val errorMessage: String? = null,
+    /** Linux: the package manager is running behind the password prompt. */
+    val isInstalling: Boolean = false,
+    /** Linux: the in-app install failed, so the dialog offers the install command instead. */
+    val linuxInstallFailed: Boolean = false,
 )
 
 @Serializable
@@ -476,6 +480,7 @@ class AppUpdaterController internal constructor(
             _uiState.update { state ->
                 state.copy(
                     isChecking = true,
+                    linuxInstallFailed = false,
                     errorMessage = null,
                     showUnknownSourcesDialog = false,
                 )
@@ -556,6 +561,7 @@ class AppUpdaterController internal constructor(
             _uiState.update { state ->
                 state.copy(
                     isChecking = true,
+                    linuxInstallFailed = false,
                     errorMessage = null,
                     showUnknownSourcesDialog = false,
                 )
@@ -672,6 +678,7 @@ class AppUpdaterController internal constructor(
                         isDownloading = false,
                         downloadProgress = null,
                         downloadedApkPath = null,
+                        linuxInstallFailed = AppUpdaterPlatform.isLinux,
                         errorMessage = error.message ?: getString(Res.string.updates_download_failed),
                         showDialog = true,
                     )
@@ -682,6 +689,10 @@ class AppUpdaterController internal constructor(
 
     fun installDownloadedUpdate() {
         val apkPath = _uiState.value.downloadedApkPath ?: return
+        if (AppUpdaterPlatform.isLinux) {
+            installLinuxPackage(apkPath)
+            return
+        }
         if (!AppUpdaterPlatform.canRequestPackageInstalls()) {
             _uiState.update { state -> state.copy(showUnknownSourcesDialog = true, showDialog = true) }
             return
@@ -715,6 +726,30 @@ class AppUpdaterController internal constructor(
                 _uiState.update { state ->
                     state.copy(
                         errorMessage = fallbackMessage,
+                        showDialog = true,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun installLinuxPackage(path: String) {
+        if (_uiState.value.isInstalling) return
+        val update = _uiState.value.update
+        _uiState.update { state -> state.copy(isInstalling = true, errorMessage = null) }
+        scope.launch {
+            AppUpdaterPlatform.installLinuxPackage(path).onSuccess {
+                if (update != null) recordInstalledBuild(update)
+                _uiState.update { state -> state.copy(downloadedApkPath = null) }
+                NuvioToastController.show(getString(Res.string.updates_restarting))
+            }.onFailure { error ->
+                _uiState.update { state ->
+                    state.copy(
+                        isInstalling = false,
+                        downloadProgress = null,
+                        downloadedApkPath = null,
+                        linuxInstallFailed = true,
+                        errorMessage = error.message ?: getString(Res.string.updates_install_failed),
                         showDialog = true,
                     )
                 }
@@ -802,6 +837,10 @@ fun AppUpdaterHost(
     val installCommand = state.update
         ?.takeIf { AppUpdaterPlatform.isLinux && state.isUpdateAvailable && it.assetUrl.isNotBlank() }
         ?.let { AppUpdaterPlatform.linuxInstallCommand(it.assetUrl, it.assetName) }
+    // One button on Linux: download, install behind the password prompt, restart. The command is
+    // the fallback, for a desktop with no way to prompt or after the in-app install failed.
+    val linuxOneClick = installCommand != null && AppUpdaterPlatform.canInstallLinuxPackageInApp && !state.linuxInstallFailed
+    val linuxBusy = state.isDownloading || state.isInstalling
     var snoozeOptionsOpen by remember { mutableStateOf(false) }
     val showPrimaryAction =
         state.showUnknownSourcesDialog || state.isDownloading || state.downloadedApkPath != null || state.isUpdateAvailable
@@ -813,7 +852,7 @@ fun AppUpdaterHost(
     // dialog just grows taller. Going straight to Dialog leaves the width to us.
     Dialog(
         onDismissRequest = {
-            if (!state.isDownloading) {
+            if (!state.isDownloading && !state.isInstalling) {
                 controller.dismissDialog()
             }
         },
@@ -868,8 +907,14 @@ fun AppUpdaterHost(
                                 Res.string.updates_message_switch_build,
                                 updateChannelLabel(state.update?.channel ?: UpdateChannel.Stable),
                             )
-                            state.isUpdateAvailable && AppUpdaterPlatform.isLinux ->
-                                stringResource(Res.string.updates_message_linux)
+                            state.isInstalling -> stringResource(Res.string.updates_message_installing)
+                            state.isUpdateAvailable && AppUpdaterPlatform.isLinux -> stringResource(
+                                when {
+                                    linuxOneClick -> Res.string.updates_message_linux_one_click
+                                    state.linuxInstallFailed -> Res.string.updates_message_linux_fallback
+                                    else -> Res.string.updates_message_linux
+                                },
+                            )
                             state.isUpdateAvailable -> stringResource(Res.string.updates_message_ready)
                             // The box below says "No updates found"; the subtitle says what that
                             // means for the user rather than repeating it.
@@ -910,7 +955,7 @@ fun AppUpdaterHost(
                         isChecking = state.isChecking,
                     )
 
-                    installCommand?.let { command ->
+                    installCommand?.takeIf { !linuxOneClick }?.let { command ->
                         Text(
                             text = command,
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
@@ -1025,14 +1070,14 @@ fun AppUpdaterHost(
                                 Text(stringResource(Res.string.updates_view_release))
                             }
                         }
-                    if (state.isUpdateAvailable && !state.isDownloading && !state.showUnknownSourcesDialog) {
+                    if (state.isUpdateAvailable && !linuxBusy && !state.showUnknownSourcesDialog) {
                         TextButton(onClick = { snoozeOptionsOpen = !snoozeOptionsOpen }) {
                             Text(stringResource(Res.string.updates_remind_me))
                         }
                     }
                     TextButton(
                         onClick = controller::dismissDialog,
-                        enabled = !state.isDownloading,
+                        enabled = !linuxBusy,
                     ) {
                         Text(
                             if (state.isDownloading) {
@@ -1048,10 +1093,17 @@ fun AppUpdaterHost(
                         Button(
                             onClick = {
                                 when {
+                                    AppUpdaterPlatform.isLinux && linuxOneClick -> {
+                                        if (state.downloadedApkPath != null) {
+                                            controller.installDownloadedUpdate()
+                                        } else {
+                                            controller.downloadUpdate()
+                                        }
+                                    }
                                     AppUpdaterPlatform.isLinux -> {
-                                        // Nothing to download: the package manager does that. The
-                                        // button hands over the command, or the release page when the
-                                        // release carries no package for this system.
+                                        // The fallback: the button hands over the command, or the
+                                        // release page when the release carries no package for this
+                                        // system.
                                         if (installCommand != null) {
                                             clipboard.setText(AnnotatedString(installCommand))
                                             scope.launch {
@@ -1067,7 +1119,7 @@ fun AppUpdaterHost(
                                 }
                             },
                             enabled = if (AppUpdaterPlatform.isLinux) {
-                                state.isUpdateAvailable
+                                state.isUpdateAvailable && !linuxBusy
                             } else if (state.showUnknownSourcesDialog || state.downloadedApkPath != null) {
                                 true
                             } else {
@@ -1077,7 +1129,13 @@ fun AppUpdaterHost(
                             Text(
                                 when {
                                     AppUpdaterPlatform.isLinux -> stringResource(
-                                        if (installCommand != null) Res.string.updates_copy_command else Res.string.updates_view_release,
+                                        when {
+                                            state.isInstalling -> Res.string.updates_message_installing_short
+                                            state.isDownloading -> Res.string.updates_message_downloading
+                                            linuxOneClick -> Res.string.action_update
+                                            installCommand != null -> Res.string.updates_copy_command
+                                            else -> Res.string.updates_view_release
+                                        },
                                     )
                                     state.showUnknownSourcesDialog -> stringResource(Res.string.action_continue)
                                     state.downloadedApkPath != null &&

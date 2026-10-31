@@ -162,8 +162,10 @@ fun isProtocolLaunchTarget(path: String): Boolean = PROTOCOL_LAUNCH_TARGET.conta
 
 private val PROTOCOL_LAUNCH_TARGET = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
+// Split on both separators: a Windows path (`C:\Games\x.exe`) can reach a Linux host in a synced
+// or imported library, and java.io.File there treats `\` as part of the name.
 fun executableDisplayName(path: String): String =
-    File(path).nameWithoutExtension
+    path.substringAfterLast('\\').substringAfterLast('/').substringBeforeLast('.')
         .replace(Regex("[_-]+"), " ")
         .trim()
         .replaceFirstChar { it.uppercase() }

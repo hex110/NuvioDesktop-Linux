@@ -2722,6 +2722,10 @@
     <string name="updates_message_linux">A new version is out. Install it with your package manager:</string>
     <string name="updates_copy_command">Copy command</string>
     <string name="updates_command_copied">Install command copied</string>
+    <string name="updates_message_linux_one_click">A new version is out. Update downloads and installs it, then restarts Nuvio. You will be asked for your password.</string>
+    <string name="updates_message_installing">Installing… enter your password in the prompt to continue.</string>
+    <string name="updates_message_installing_short">Installing…</string>
+    <string name="updates_message_linux_fallback">The update could not be installed from here. Install it with your package manager:</string>
     <string name="updates_view_release">View release</string>
     <string name="updates_open_download">Open download</string>
     <string name="updates_remind_me">Remind me…</string>

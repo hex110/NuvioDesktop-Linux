@@ -37,8 +37,8 @@ expect object AppUpdaterPlatform {
     val isSupported: Boolean
 
     /**
-     * The Linux build. Owned by the system package manager, so it only announces updates: the
-     * dialog shows the command that installs the new package instead of swapping files itself.
+     * The Linux build. Owned by the system package manager, so the update is handed to it: in one
+     * step when [canInstallLinuxPackageInApp], otherwise as a command to copy.
      */
     val isLinux: Boolean
 
@@ -55,6 +55,20 @@ expect object AppUpdaterPlatform {
 
     /** The shell command that installs the package at [assetUrl], for the package manager in use. */
     fun linuxInstallCommand(assetUrl: String, assetName: String): String
+
+    /**
+     * Whether this Linux install can update itself in one step: download the package, install it
+     * behind the system's password prompt, restart. False when there is no way to ask for root
+     * from the GUI; the dialog then hands over [linuxInstallCommand] instead.
+     */
+    val canInstallLinuxPackageInApp: Boolean
+
+    /**
+     * Installs the downloaded package at [path] as root (pkexec, else `sudo -A` with an askpass
+     * helper), then schedules a restart into the new build. Fails without side effects when the
+     * prompt is dismissed or the package manager refuses.
+     */
+    suspend fun installLinuxPackage(path: String): Result<UpdateInstallOutcome>
 
     fun getSupportedAbis(): List<String>
 

@@ -182,7 +182,7 @@ internal fun parseShellLink(
             environmentTarget = buffer.nullTerminatedUnicode(offset + 8 + 260, limit = 260)
                 .ifBlank { buffer.nullTerminatedAnsi(offset + 8, limit = 260) }
                 .takeIf(String::isNotBlank)
-                ?.let { expandEnvironmentVariables(it, environment) }
+                ?.let { expandEnvironmentVariables(it, environment).toHostSeparators() }
         }
         offset += size
     }
@@ -197,7 +197,8 @@ internal fun parseShellLink(
         linkInfoPath,
         idListPath,
         relativePath?.takeIf(String::isNotBlank)?.let { relative ->
-            (linkDirectory?.resolve(relative) ?: File(relative)).normalize().absolutePath
+            val hostRelative = relative.toHostSeparators()
+            (linkDirectory?.resolve(hostRelative) ?: File(hostRelative)).normalize().absolutePath
         },
     )
     val targetPath = candidates.firstOrNull { File(it).isFile }
@@ -327,6 +328,14 @@ internal fun expandEnvironmentVariables(value: String, lookup: (String) -> Strin
     }
 
 private val ENVIRONMENT_VARIABLE = Regex("%([^%]+)%")
+
+/**
+ * A shortcut's relative and environment-variable paths use `\`. On a host whose separator is `/`
+ * (a Windows partition's shortcuts read on Linux) they are only found on disk with `/`; the
+ * absolute LinkInfo and id-list paths name a Windows drive and are left as written.
+ */
+private fun String.toHostSeparators(): String =
+    if (File.separatorChar == '\\') this else replace('\\', File.separatorChar)
 
 /**
  * The code page the shell wrote the ANSI strings in. `sun.jnu.encoding` is the JVM's name for the

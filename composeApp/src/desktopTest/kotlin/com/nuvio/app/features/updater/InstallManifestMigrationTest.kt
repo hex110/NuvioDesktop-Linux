@@ -3,6 +3,8 @@ package com.nuvio.app.features.updater
 import java.io.File
 import java.nio.file.Files
 import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
+import org.junit.Assume.assumeTrue
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -13,9 +15,17 @@ import kotlin.test.assertTrue
  * must go as stale files (the previous manifest listed them and the new build does not ship them),
  * everything both layouts ship must stay, and files the user put in the install folder must never
  * be touched. File names are taken from the 2026-10-17 JVM and native build outputs.
+ *
+ * Windows-only: this is the zip updater's install layout (`app\`, `runtime\`, `\` separators).
+ * Linux installs from a package, which owns its files.
  */
 class InstallManifestMigrationTest {
     private val tempRoots = mutableListOf<File>()
+
+    @BeforeTest
+    fun windowsOnly() {
+        assumeTrue("Windows-only: the zip updater's install manifest", File.separatorChar == '\\')
+    }
 
     @AfterTest
     fun cleanUp() {

@@ -85,6 +85,91 @@ actual object AppUpdaterPlatform {
             "curl -fLo /tmp/$assetName $assetUrl && sudo apt install /tmp/$assetName"
         }
 
+    // The package manager the downloaded package goes to, by absolute path: pkexec runs exactly the
+    // program it is given and resets PATH.
+    private val linuxPackageInstaller: List<String>? by lazy {
+        if (usesPacman) {
+            File("/usr/bin/pacman").takeIf(File::canExecute)?.let { listOf(it.path, "-U", "--noconfirm") }
+        } else {
+            File("/usr/bin/apt-get").takeIf(File::canExecute)?.let { listOf(it.path, "install", "-y") }
+        }
+    }
+
+    private val pkexec: File? by lazy { File("/usr/bin/pkexec").takeIf(File::canExecute) }
+
+    // `sudo -A` asks through SUDO_ASKPASS; without one it could only prompt on a terminal the app
+    // does not have.
+    private val sudoAskpass: Boolean by lazy {
+        File("/usr/bin/sudo").canExecute() &&
+            System.getenv("SUDO_ASKPASS")?.let { File(it).canExecute() } == true
+    }
+
+    actual val canInstallLinuxPackageInApp: Boolean
+        get() = isLinux && linuxPackageInstaller != null && (pkexec != null || sudoAskpass)
+
+    actual suspend fun installLinuxPackage(path: String): Result<UpdateInstallOutcome> = withContext(Dispatchers.IO) {
+        runCatching {
+            val installer = checkNotNull(linuxPackageInstaller) { "No package manager to install the update with." }
+            val pkg = File(path)
+            check(pkg.isFile) { "The downloaded update package is missing." }
+            // pacman and apt tell a package file from a package name by the path.
+            val command = installer + pkg.absolutePath
+
+            var result = pkexec?.let { runAsRoot(listOf(it.path) + command) }
+            // 127: no polkit agent to show the prompt (a bare window manager); try sudo's askpass.
+            if ((result == null || result.exitCode == 127) && sudoAskpass) {
+                result = runAsRoot(listOf("/usr/bin/sudo", "-A", "--") + command)
+            }
+            checkNotNull(result) { "No way to ask for the administrator password." }
+            when (result.exitCode) {
+                0 -> Unit
+                // pkexec: the prompt was dismissed or the password refused; sudo -A: likewise.
+                126 -> error("Update cancelled: the password prompt was closed.")
+                127 -> error("No password prompt is available on this desktop. Use the command below instead.")
+                else -> error(
+                    "The package manager could not install the update (exit ${result.exitCode})." +
+                        result.tail.takeIf(String::isNotBlank)?.let { "\n$it" }.orEmpty(),
+                )
+            }
+            updaterLog.i { "Linux package installed: ${pkg.name}" }
+            pkg.delete()
+            relaunchAfterExit()
+            scheduleExit()
+            UpdateInstallOutcome.RESTARTING
+        }
+    }
+
+    private class RootRun(val exitCode: Int, val tail: String)
+
+    private fun runAsRoot(command: List<String>): RootRun {
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        updaterLog.i { "${command.take(3).joinToString(" ")} … exited $exitCode" }
+        if (exitCode != 0) updaterLog.w { output.takeLast(4000) }
+        return RootRun(exitCode, output.lines().filter(String::isNotBlank).takeLast(3).joinToString("\n"))
+    }
+
+    /**
+     * Starts the installed launcher again once this process has exited (the single-instance lock
+     * would hand a second copy straight back to us). The launcher path is this process's own
+     * executable: the jpackage launcher in /opt, which the package just replaced.
+     */
+    private fun relaunchAfterExit() {
+        val launcher = ProcessHandle.current().info().command().orElse(null)
+            ?.takeIf { it.startsWith("/opt/") }
+            ?: return
+        val pid = ProcessHandle.current().pid()
+        val script = "while kill -0 $pid 2>/dev/null; do sleep 0.5; done; exec \"$launcher\""
+        ProcessBuilder("/usr/bin/setsid", "-f", "/bin/sh", "-c", script)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+    }
+
     actual fun getSupportedAbis(): List<String> {
         val arch = System.getProperty("os.arch").orEmpty().lowercase(Locale.ROOT)
         return when {
@@ -179,8 +264,14 @@ actual object AppUpdaterPlatform {
         onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
     ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            require(assetName.endsWith(".zip", ignoreCase = true)) {
-                localizedString(Res.string.updater_this_portable_build_only_supports_zip)
+            if (isLinux) {
+                require(assetName.endsWith(".deb", ignoreCase = true) || assetName.endsWith(".pkg.tar.zst", ignoreCase = true)) {
+                    "This release has no package for this system."
+                }
+            } else {
+                require(assetName.endsWith(".zip", ignoreCase = true)) {
+                    localizedString(Res.string.updater_this_portable_build_only_supports_zip)
+                }
             }
             // Fail closed. The update is unpacked and run automatically, so an asset with no
             // published digest cannot be checked at all; GitHub has published one for every asset
@@ -188,7 +279,9 @@ actual object AppUpdaterPlatform {
             requireNotNull(expectedSha256?.takeIf { it.isNotBlank() }) {
                 localizedString(Res.string.updater_update_refused_github_published_no_sha)
             }
-            tryDeltaDownload(assetUrl, onProgress)?.let { marker -> return@runCatching marker.absolutePath }
+            if (!isLinux) {
+                tryDeltaDownload(assetUrl, onProgress)?.let { marker -> return@runCatching marker.absolutePath }
+            }
 
             val safeName = assetName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
             val updateDirectory = portableUpdatesDirectory().apply { mkdirs() }

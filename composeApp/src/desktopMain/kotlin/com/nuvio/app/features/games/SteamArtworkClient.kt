@@ -471,15 +471,15 @@ internal fun parseSteamAppManifest(text: String): SteamAppManifest? {
 /** The folder directly under `steamapps/common` that holds [executablePath], if it is in one. */
 internal fun steamInstallDirectoryName(executablePath: String?): String? {
     val path = executablePath?.takeIf(String::isNotBlank) ?: return null
-    var current: File? = File(path).parentFile
-    while (current != null) {
-        val parent = current.parentFile ?: return null
-        if (parent.name.equals("common", ignoreCase = true) &&
-            parent.parentFile?.name.equals("steamapps", ignoreCase = true)
+    // Segments split on both separators, so a Windows path also works on a Linux host.
+    val segments = path.split('\\', '/').filter(String::isNotEmpty).dropLast(1)
+    for (index in segments.indices.reversed()) {
+        if (index >= 2 &&
+            segments[index - 1].equals("common", ignoreCase = true) &&
+            segments[index - 2].equals("steamapps", ignoreCase = true)
         ) {
-            return current.name
+            return segments[index]
         }
-        current = parent
     }
     return null
 }
