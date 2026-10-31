@@ -67,6 +67,9 @@ interface PlayerEngineController {
     /** Shows a short, non-blocking notification over the player when the platform supports it. */
     fun showTransientMessage(title: String, value: String) {}
 
+    /** The selected tracks as the engine decodes them, for the stream info panel. Null if unknown. */
+    fun playingMediaFacts(): PlayingMediaFacts? = null
+
     /**
      * Like [showTransientMessage], but survives an imminent source switch: the message is held
      * and shown on the replacement player's overlay once it attaches. Platforms whose overlay
@@ -328,6 +331,8 @@ data class PlayerControlsState(
     val hudVignetteEnabled: Boolean = true,
     // Comma-separated controls.html `data-command`s the user hid from the HUD.
     val hiddenHudButtons: String = "",
+    // Comma-separated action-row `data-command`s in the user's order; empty keeps the authored order.
+    val hudButtonOrder: String = "",
     val alwaysShowClock: Boolean = false,
     val playbackSpeedFineIncrementsEnabled: Boolean = false,
     val playbackSpeedToggleLow: Float = 1f,
@@ -370,6 +375,8 @@ data class PlayerControlsState(
     val playlistPeekItems: List<PlayerControlPlaylistItem> = emptyList(),
     // Watch party: the HUD's party button, top status pill and party panel.
     val party: PlayerControlPartyState = PlayerControlPartyState(),
+    /** The stream info panel's content; null while the panel is closed. */
+    val streamInfo: PlayerControlStreamInfo? = null,
     val showSubmitIntro: Boolean = false,
     val showVideoSettings: Boolean = false,
     val showSources: Boolean = false,
@@ -471,6 +478,10 @@ data class PlayerHeroTrailerState(
     val muted: Boolean = true,
     /** Hero-trailer volume (0..100) reflected by the overlay volume slider. */
     val volume: Int = 0,
+    /** Pre-show only: the label of the "add to library" pill beside Skip. Empty hides the pill. */
+    val libraryLabel: String = "",
+    /** Pre-show only: the title is already in the library, so the pill starts out as done. */
+    val inLibrary: Boolean = false,
     /**
      * Which screen edge holds the navigation chrome while a home hero trailer plays ("top" for the
      * floating top bar, "left" for the sidebar, "none" to disable). The heavyweight native video
@@ -485,6 +496,12 @@ data class PlayerHeroTrailerState(
      * moving onto the strip at all trips the dismiss.
      */
     val navDismissBandFraction: Float = 0.22f,
+    /**
+     * Post-show cards are up and the video is in a corner box: the controls page forwards the D-pad
+     * keys to Kotlin instead of using them. Lives here rather than on [PlayerControlsState] itself,
+     * which is at the JVM's method-signature limit.
+     */
+    val postShowInput: Boolean = false,
 )
 
 /**
@@ -544,6 +561,25 @@ data class PlayerControlPartyState(
     val startNote: String = "",
     val members: List<PlayerControlPartyMember> = emptyList(),
     val labels: Map<String, String> = emptyMap(),
+    /** Chat messages from others not yet seen; drives the badges on the pill, button and tab. */
+    val chatUnread: Int = 0,
+    /** The chat, only while the party panel is open (it is the only place that shows it). */
+    val chatMessages: List<PlayerControlChatMessage> = emptyList(),
+)
+
+data class PlayerControlChatMessage(
+    val key: String,
+    val name: String,
+    val initials: String,
+    val color: String,
+    val avatarUrl: String,
+    val body: String,
+    /** "HH:mm" on the first message after a gap, empty otherwise. */
+    val time: String,
+    val mine: Boolean,
+    val sending: Boolean,
+    val failed: Boolean,
+    val startsGroup: Boolean,
 )
 
 data class PlayerControlPartyMember(

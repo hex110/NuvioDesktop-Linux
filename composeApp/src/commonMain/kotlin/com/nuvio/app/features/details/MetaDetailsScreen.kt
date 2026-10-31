@@ -95,6 +95,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.currentStateAsState
 import com.nuvio.app.features.games.GameModeController
+import com.nuvio.app.features.simkl.SimklRewatchRepository
 import com.nuvio.app.features.streams.StreamPrefetchService
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.build.AppFeaturePolicy
@@ -172,6 +173,7 @@ import com.nuvio.app.features.trakt.TraktCommentsSettings
 import com.nuvio.app.features.trakt.TraktConnectionMode
 import com.nuvio.app.features.trakt.TraktListTab
 import com.nuvio.app.features.trakt.TraktSettingsRepository
+import com.nuvio.app.features.themesong.DetailsThemeSong // fork:themesong
 import com.nuvio.app.features.trailer.TrailerPlaybackResolver
 import com.nuvio.app.features.trailer.TrailerPlaybackSource
 import com.nuvio.app.features.trailer.TrailerResolution
@@ -203,6 +205,7 @@ import org.jetbrains.compose.resources.stringResource
 import kotlin.random.Random
 import androidx.compose.material.icons.rounded.Search
 import com.nuvio.app.core.ui.trackTextInputFocus
+import com.nuvio.app.core.i18n.localizedString
 
 private fun dominantBackdropBlendColor(dominantColor: Color, backgroundColor: Color): Color =
     backgroundColor.blendTowards(dominantColor, fraction = 0.42f)
@@ -600,15 +603,15 @@ fun MetaDetailsScreen(
                 val openLibraryListPicker = remember(meta) {
                     {
                         val libraryItem = meta.toLibraryItem(savedAtEpochMs = 0L)
-                        pickerTabs = LibraryRepository.libraryListTabs()
+                        pickerTabs = LibraryRepository.connectedLibraryTabs()
                         pickerMembership = pickerTabs.associate { it.key to false }
                         pickerPending = true
                         pickerError = null
                         showLibraryListPicker = true
                         detailsScope.launch {
                             runCatching {
-                                val snapshot = LibraryRepository.getMembershipSnapshot(libraryItem)
-                                val tabs = LibraryRepository.libraryListTabs()
+                                val snapshot = LibraryRepository.connectedMembershipSnapshot(libraryItem)
+                                val tabs = LibraryRepository.connectedLibraryTabs().filter { tab -> tab.key in snapshot }
                                 pickerTabs = tabs
                                 pickerMembership = tabs.associate { tab ->
                                     tab.key to (snapshot[tab.key] == true)
@@ -751,12 +754,21 @@ fun MetaDetailsScreen(
                 val movieProgress = progressByVideoId[meta.id]
                     ?.takeUnless { it.isCompleted }
                 val cwPrefs by ContinueWatchingPreferencesRepository.uiState.collectAsStateWithLifecycle()
-                val seriesAction = remember(watchProgressUiState.entries, watchedUiState.items, meta, todayIsoDate, cwPrefs.upNextFromFurthestEpisode) {
+                val simklRewatchUiState by SimklRewatchRepository.uiState.collectAsStateWithLifecycle()
+                val seriesAction = remember(
+                    watchProgressUiState.entries,
+                    watchedUiState.items,
+                    meta,
+                    todayIsoDate,
+                    cwPrefs.upNextFromFurthestEpisode,
+                    simklRewatchUiState.sessions,
+                ) {
                     meta.seriesPrimaryAction(
                         entries = watchProgressUiState.entries,
                         watchedItems = watchedUiState.items,
                         todayIsoDate = todayIsoDate,
                         preferFurthestEpisode = cwPrefs.upNextFromFurthestEpisode,
+                        rewatchSeed = SimklRewatchRepository.rewatchSeedFor(meta.id),
                     ) ?: meta.seriesRestartAction(
                         entries = watchProgressUiState.entries,
                         watchedItems = watchedUiState.items,
@@ -1089,7 +1101,7 @@ fun MetaDetailsScreen(
                     // fall through to the bare show id below: that searches streams for "any
                     // episode" and records progress no episode can ever match.
                     if (hasEpisodes && seriesAction == null) {
-                        NuvioToastController.show("No released episode to play yet")
+                        NuvioToastController.show(localizedString(Res.string.details_no_released_episode_to_play_yet))
                         return@primaryPlay
                     }
                     if (onPlay != null) {
@@ -1221,8 +1233,9 @@ fun MetaDetailsScreen(
                 // immediately and is indistinguishable from an ordinary Resume, so the gesture read
                 // as doing nothing at all. Which `useAlternate` value actually reaches the picker
                 // depends on the preference, so it is resolved rather than hardcoded.
-                val primaryAlternateOpensPicker = localLibraryUiState.playbackPreference
-                    .alternateOpensSourcePicker(primaryHasLocalPlayback)
+                val primaryAlternateOpensPicker = remember(meta.id, primaryPlaybackVideoId, localLibraryUiState) {
+                    LocalLibraryRepository.routingFor(meta.id, primaryPlaybackVideoId)
+                }.alternateOpensSourcePicker(primaryHasLocalPlayback)
                 val showManualPlayOption = alternatePlayHandler != null
                 val onPrimaryPlayLongClick: (() -> Unit)? = alternatePlayHandler
                     ?.let { alternatePlay ->
@@ -1234,7 +1247,7 @@ fun MetaDetailsScreen(
                                 return@playSecondary
                             }
                             if (hasEpisodes && seriesAction == null) {
-                                NuvioToastController.show("No released episode to play yet")
+                                NuvioToastController.show(localizedString(Res.string.details_no_released_episode_to_play_yet))
                                 return@playSecondary
                             }
                             dropTrailerForPlaybackNavigation()
@@ -2642,8 +2655,9 @@ fun MetaDetailsScreen(
                             // on the configured preference, so it is resolved rather than assumed:
                             // under SOURCE_PICKER with a local file present it is the *normal*
                             // click that opens the picker, and the alternate that plays the file.
-                            val alternateOpensPicker = localLibraryUiState.playbackPreference
-                                .alternateOpensSourcePicker(selectedHasLocalPlayback)
+                            val alternateOpensPicker = remember(meta.id, selectedPlaybackVideoId, localLibraryUiState) {
+                                LocalLibraryRepository.routingFor(meta.id, selectedPlaybackVideoId)
+                            }.alternateOpensSourcePicker(selectedHasLocalPlayback)
                             // Only offered when there is a local file AND a normal tap is not
                             // already playing it — with none, or under the Local library
                             // preference, this entry would duplicate the tap.
@@ -2764,7 +2778,7 @@ fun MetaDetailsScreen(
                                         PlaylistAddController.request(
                                             playlistAddTargetForEpisodes(
                                                 meta = meta,
-                                                label = selectedEpisode.season?.let { "Season $it" } ?: "Specials",
+                                                label = selectedEpisode.season?.let { localizedString(Res.string.playlist_add_season, it) } ?: localizedString(Res.string.playlist_specials),
                                                 videos = episodes,
                                             ),
                                         )
@@ -2860,6 +2874,21 @@ fun MetaDetailsScreen(
                             )
                         }
 
+                        DetailsThemeSong( // fork:themesong
+                            metaType = meta.type,
+                            metaName = meta.name,
+                            releaseInfo = meta.releaseInfo,
+                            metaId = meta.id,
+                            deferredWorkAllowed = deferredMetaWorkAllowed,
+                            leavingDetails = isLeavingDetails,
+                            heroTrailerAudible = heroTrailerSourceUrl != null && heroTrailerPlayWhenReady && !heroTrailerMuted,
+                            modalVisible = heroTrailerModalVisible,
+                            // An auto-playing trailer with sound is resolving or counting down.
+                            heroTrailerPending = heroTrailerPlaybackEnabled && heroTrailerCandidate != null &&
+                                !heroTrailerManualOnly && !heroTrailerFinished && !heroTrailerDismissed &&
+                                !heroTrailerMuted,
+                        )
+
                         if (inAppTrailerPlaybackEnabled) {
                             TrailerPlayerPopup(
                                 // On desktop the trailer plays in the full-screen player, so
@@ -2915,7 +2944,7 @@ fun MetaDetailsScreen(
                                     pickerPending = true
                                     pickerError = null
                                     runCatching {
-                                        LibraryRepository.applyMembershipChanges(
+                                        LibraryRepository.applyConnectedMembershipChanges(
                                             item = meta.toLibraryItem(savedAtEpochMs = 0L),
                                             desiredMembership = pickerMembership,
                                         )
@@ -2926,6 +2955,10 @@ fun MetaDetailsScreen(
                                     }
                                     pickerPending = false
                                 }
+                            },
+                            onAddToAll = {
+                                showLibraryListPicker = false
+                                LibraryRepository.addToAllLibraries(meta.toLibraryItem(savedAtEpochMs = 0L))
                             },
                         )
 
@@ -3676,7 +3709,7 @@ private fun ConfiguredMetaSections(
                             )
                         },
                         DetailSecondaryAction(
-                            label = "Add to playlist",
+                            label = stringResource(Res.string.playlist_add_to_playlist_2),
                             icon = Icons.AutoMirrored.Filled.PlaylistAdd,
                             onClick = { PlaylistAddController.request(playlistAddTargetFor(meta)) },
                         ),
@@ -3781,6 +3814,7 @@ private fun ConfiguredMetaSections(
                     val sourceLabel = when (meta.moreLikeThisSource) {
                         MoreLikeThisSource.TMDB -> stringResource(Res.string.detail_more_like_this_powered_by_tmdb)
                         MoreLikeThisSource.TRAKT -> stringResource(Res.string.detail_more_like_this_powered_by_trakt)
+                        MoreLikeThisSource.SIMKL -> stringResource(Res.string.detail_more_like_this_powered_by_simkl)
                         null -> null
                     }
                     DetailPosterRailSection(

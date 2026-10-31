@@ -1,8 +1,12 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.i18n.localizedString
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -23,6 +27,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.runtime.CompositionLocalProvider
 import com.nuvio.app.core.ui.LocalNuvioBaseDensity
 import com.nuvio.app.features.player.desktop.NvidiaRtxDriverState
@@ -33,6 +39,9 @@ import com.nuvio.app.features.player.desktop.DESKTOP_INTERPOLATION_OVERRIDE_KEY
 import com.nuvio.app.features.player.desktop.DESKTOP_SHARPEN_OVERRIDE_KEY
 import com.nuvio.app.features.player.desktop.desktopDebandGrain
 import com.nuvio.app.features.player.desktop.desktopInterpolationProperties
+import com.nuvio.app.features.player.desktop.desktopCustomMpvOptionNames
+import com.nuvio.app.features.player.desktop.desktopInverseToneMappingProperties
+import com.nuvio.app.features.player.desktop.shouldEnableDesktopInverseToneMapping
 import com.nuvio.app.features.player.desktop.desktopTargetContrast
 import com.nuvio.app.features.player.desktop.desktopCasSharpness
 import com.nuvio.app.features.player.desktop.desktopShaderChainWithSharpen
@@ -42,6 +51,9 @@ import com.nuvio.app.features.player.desktop.DesktopWindowGeometryDiagnostics
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.preroll.PostShowKey
+import com.nuvio.app.features.preroll.PostShowScreen
 import com.nuvio.app.features.input.GamepadContext
 import com.nuvio.app.features.screensaver.DesktopScreensaver
 import com.nuvio.app.features.player.desktop.NativePlayerHost
@@ -58,7 +70,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import java.awt.KeyEventDispatcher
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.player_error_debrid_rate_limited
@@ -68,6 +82,8 @@ import org.jetbrains.compose.resources.getString
 import java.awt.KeyboardFocusManager
 import java.awt.event.KeyEvent
 import javax.swing.text.JTextComponent
+import nuvio.composeapp.generated.resources.*
+import org.jetbrains.compose.resources.stringResource
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -187,6 +203,24 @@ private fun NativePlayerSurface(
     val lastKnownPositionMs = remember { mutableStateOf(0L) }
     // Its duration, so a rate-limit reopen can refuse a resume target at the very end.
     val lastKnownDurationMs = remember { mutableStateOf(0L) }
+    // The post-show cards are up and the video belongs in the corner box. A derived value, so the
+    // position ticking every 500 ms does not recompose this surface; only the flip does.
+    val postShowBoxed by PostShowController.active
+    // 0 -> 1 as the post-show starts: the cards fade in under the video's corner box. The video
+    // itself cannot be animated (it is a native window), so it snaps.
+    val postShowProgress by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (postShowBoxed) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = POST_SHOW_SHRINK_MS,
+            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+        ),
+        label = "postShowShrink",
+    )
+    // Keyed on the attempt, so closing the cards on one episode does not carry into the next.
+    DisposableEffect(playbackAttemptId) {
+        PostShowController.reset()
+        onDispose { PostShowController.reset() }
+    }
     val surfaceScope = rememberCoroutineScope()
     LaunchedEffect(playbackAttemptId, sourceUrl) {
         DesktopPlayerLaunchShield.showForActiveWindow()
@@ -364,6 +398,32 @@ private fun NativePlayerSurface(
             }
             val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
             if (focusOwner is JTextComponent) return@KeyEventDispatcher false
+            // Post-show cards are up: a pad's D-pad, A and B (replayed here as arrows, the play/pause key
+            // and Escape) and the number keys drive the cards. Anything else, including the skip key,
+            // carries on below.
+            if (PostShowController.active.value) {
+                val postShowKey = when (event.keyCode) {
+                    KeyEvent.VK_LEFT -> PostShowKey.Left
+                    KeyEvent.VK_RIGHT -> PostShowKey.Right
+                    KeyEvent.VK_UP -> PostShowKey.Up
+                    KeyEvent.VK_DOWN -> PostShowKey.Down
+                    KeyEvent.VK_1, KeyEvent.VK_NUMPAD1 -> PostShowKey.Option1
+                    KeyEvent.VK_2, KeyEvent.VK_NUMPAD2 -> PostShowKey.Option2
+                    KeyEvent.VK_3, KeyEvent.VK_NUMPAD3 -> PostShowKey.Option3
+                    KeyEvent.VK_4, KeyEvent.VK_NUMPAD4 -> PostShowKey.Option4
+                    AppShortcutsRepository.keyCode(AppShortcutAction.DismissOverlay) -> PostShowKey.Back
+                    AppShortcutsRepository.keyCode(AppShortcutAction.SelectFocused) -> PostShowKey.Select
+                    else -> when (PlayerShortcutsRepository.actionForKeyCode(event.keyCode)) {
+                        PlayerShortcutAction.PlayPause, PlayerShortcutAction.AlternatePlayPause -> PostShowKey.Select
+                        else -> null
+                    }
+                }
+                if (postShowKey != null) {
+                    PostShowController.press(postShowKey)
+                    event.consume()
+                    return@KeyEventDispatcher true
+                }
+            }
             // Media keys are deliberately NOT handled here. A KeyEventDispatcher only sees keys
             // routed to a focused Nuvio window, which defeats the point of a media key; they are
             // owned by the Windows media session in player_bridge.cpp and arrive as the
@@ -930,8 +990,33 @@ private fun NativePlayerSurface(
         controller.setResizeMode(resizeMode)
     }
 
-    LaunchedEffect(controller, playerControlsState) {
-        controller.updateControls(playerControlsState)
+    LaunchedEffect(controller, playerControlsState, postShowBoxed) {
+        controller.updateControls(
+            if (postShowBoxed) {
+                // The HUD lives inside the video's container, so it would be squashed into the box.
+                // Its keyboard focus stays, though, so it forwards the D-pad to the cards.
+                // The skip prompt is drawn by the cards screen instead (skipKeyAction stays, so the key works).
+                playerControlsState.copy(
+                    controlsVisible = false,
+                    mouseMoveRevealsControlsEnabled = false,
+                    skipPromptVisible = false,
+                    heroTrailer = playerControlsState.heroTrailer.copy(postShowInput = true),
+                )
+            } else {
+                playerControlsState
+            },
+        )
+    }
+
+    LaunchedEffect(controller) {
+        snapshotFlow { PostShowController.active.value }.drop(1).collect {
+            // mpv repaints a wid-embedded surface oddly after a size change (see forceVideoRedraw),
+            // so nudge it once the new size has settled, and again for a swapchain that lags.
+            delay(250L)
+            controller.forceVideoRedraw()
+            delay(750L)
+            controller.forceVideoRedraw()
+        }
     }
 
     LaunchedEffect(playbackAttemptId, sourceUrl) {
@@ -966,7 +1051,13 @@ private fun NativePlayerSurface(
                     startupProfileRequested = svpStartupProfileAcknowledgementPending.value,
                 )
             },
-            PlayerSettingsRepository.uiState,
+            // The subtitle style lives in the same settings state but plays no part in the video
+            // profile. Left in, every click in the subtitle Style tab re-ran the whole profile
+            // (vf, scalers, shaders, and a forced redraw that waits up to 1.8 s on the VO), which
+            // made the panel lag and, while paused, buried the subtitle repaint under it.
+            PlayerSettingsRepository.uiState
+                .map { it.copy(subtitleStyle = SubtitleStyleState.DEFAULT) }
+                .distinctUntilChanged(),
             NvidiaRtxDriverState.settings,
         ) { videoState, settings, driver -> Triple(videoState, settings, driver) }
             .collect { (videoState, settings, driver) ->
@@ -1014,7 +1105,7 @@ private fun NativePlayerSurface(
                 // Anime4K chain compiling took 1.08 s, all of it a frozen player (2026-10-19 soak).
                 // The collector still waits, so profiles apply in order and the acknowledgement
                 // below still follows its profile.
-                val animeProfile = withContext(Dispatchers.IO) { controller.withVideoProfile {
+                val (animeProfile, inverseToneMappingActive) = withContext(Dispatchers.IO) { controller.withVideoProfile {
                     applyDesktopVideoProfile(
                         controller = controller,
                         hdrMode = settings.desktopHdrMode,
@@ -1023,7 +1114,7 @@ private fun NativePlayerSurface(
                         isHdr = isHdr,
                     )
                     controller.applyDesktopBufferPreset(settings.desktopBufferPreset)
-                    applyDesktopAnimeProfile(
+                    val profile = applyDesktopAnimeProfile(
                         controller = controller,
                         mode = settings.desktopAnimeMode,
                         autoEnabled = settings.desktopAnimeModeAutoEnabled,
@@ -1050,24 +1141,42 @@ private fun NativePlayerSurface(
                         customShaderPaths = settings.desktopCustomShaderPaths,
                         customShaderSelectedPath = settings.desktopCustomShaderSelectedPath,
                     )
+                    // After the anime profile, which is what knows whether True HDR ended up running.
+                    val inverseToneMapping = shouldEnableDesktopInverseToneMapping(
+                        enabled = settings.desktopInverseToneMappingEnabled,
+                        isHdr = isHdr,
+                        displayHdr = videoState.displayHdr,
+                        rtxTrueHdrActive = profile.rtxTrueHdrActive,
+                    )
+                    desktopInverseToneMappingProperties(
+                        active = inverseToneMapping,
+                        peakNits = settings.desktopInverseToneMappingPeakNits,
+                        customOptionNames = desktopCustomMpvOptionNames(settings.desktopCustomMpvOptions),
+                    ).forEach { (key, value) -> controller.setMpvProperty(key, value) }
+                    profile to inverseToneMapping
                 } }
                 // The outcome, not just the inputs above: whether a chain actually took is the
                 // only thing a bug report about shaders can be checked against, and deriving it
                 // from the inputs by hand is exactly the step that gets it wrong.
                 System.out.println(
                     "Desktop anime profile applied: shader=${animeProfile.shaderLabel ?: "none"}, " +
-                        "svp=${videoState.svpActive}",
+                        "svp=${videoState.svpActive}, rtxTrueHdr=${animeProfile.rtxTrueHdrActive}, " +
+                        "inverseToneMapping=$inverseToneMappingActive",
                 )
                 // Same pass, same inputs: the info panel reports what was just applied rather than
                 // re-deriving it from the settings, which would disagree with the picture whenever a
                 // preset didn't actually take (SDR file + HDR mode, live action + anime preset).
                 controller.setPlaybackInfo(
                     session = "$playbackAttemptId:${sourceUrl.hashCode()}",
-                    hdrLabel = desktopHdrInfoLabel(
-                        isHdr = isHdr,
-                        hdrMode = settings.desktopHdrMode,
-                        displayHdr = videoState.displayHdr,
-                    ),
+                    hdrLabel = if (inverseToneMappingActive) {
+                        "SDR Expanded to HDR (mpv)"
+                    } else {
+                        desktopHdrInfoLabel(
+                            isHdr = isHdr,
+                            hdrMode = settings.desktopHdrMode,
+                            displayHdr = videoState.displayHdr,
+                        )
+                    },
                     svpActive = videoState.svpActive,
                     // Both, not one or the other: a shader chain runs on top of the colour preset,
                     // it does not replace it.
@@ -1084,6 +1193,36 @@ private fun NativePlayerSurface(
                     controller.completeSvpStartupProfile()
                 }
             }
+    }
+
+    // Player badges (upstream 344117e73): the badge pack matched against what mpv is actually
+    // decoding, shown in the title block. Polled because the inputs arrive at different moments
+    // (frame size, then the track list, then an audio switch at any time); each read is a cached
+    // JSON string from the bridge, and the HUD is only told when the result changes.
+    LaunchedEffect(controller, playbackAttemptId, sourceUrl) {
+        var lastSent: List<com.nuvio.app.features.streams.StreamBadge>? = null
+        com.nuvio.app.features.streams.StreamBadgeSettingsRepository.ensureLoaded()
+        while (true) {
+            val settings = com.nuvio.app.features.streams.StreamBadgeSettingsRepository.uiState.value
+            // Read every tick even with badges off: it also records the decoded frame for the
+            // stream info panel (NativePlayerController.playingMediaFacts()).
+            val size = videoSourceSize.value
+            val facts = controller.playingMediaFacts(
+                width = size?.width,
+                height = size?.height,
+                isHdr = videoIsHdr.value == true,
+            )
+            val badges = if (settings.showInPlayer) {
+                facts?.let { playerBadges(it, settings.rules.forPlayer(settings.playerBadgeSource)) }.orEmpty()
+            } else {
+                emptyList()
+            }
+            if (badges != lastSent) {
+                lastSent = badges
+                controller.setPlayerBadges(badges)
+            }
+            kotlinx.coroutines.delay(PLAYER_BADGES_POLL_MS)
+        }
     }
 
     LaunchedEffect(controller) {
@@ -1136,6 +1275,7 @@ private fun NativePlayerSurface(
             if (!snapshot.isLoading && snapshot.positionMs > 0L && !snapshot.isEnded) {
                 lastKnownPositionMs.value = snapshot.positionMs
                 if (snapshot.durationMs > 0L) lastKnownDurationMs.value = snapshot.durationMs
+                PostShowController.onTick(snapshot.positionMs, lastKnownDurationMs.value)
             }
             latestOnSnapshot.value(snapshot)
             delay(500L)
@@ -1147,6 +1287,20 @@ private fun NativePlayerSurface(
             .fillMaxSize()
             .background(Color.Black),
     ) {
+        // Drawn first, so the SwingPanel's corner box sits on top of it.
+        if (postShowBoxed) {
+            val skipOffered = playerControlsState.skipPromptVisible &&
+                !playerControlsState.skipPromptDismissed &&
+                playerControlsState.skipKeyAction.isNotEmpty()
+            PostShowScreen(
+                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = postShowProgress },
+                skipLabel = if (skipOffered) playerControlsState.skipPromptLabel else null,
+                skipKeyLabel = playerShortcutKeyCodeLabel(
+                    PlayerShortcutsRepository.keyCode(PlayerShortcutAction.SkipInterval),
+                ),
+                onSkip = { controller.triggerSkipIntervalIfAvailable() },
+            )
+        }
         // SwingPanel positions/sizes the native mpv surface (a real OS window) using whatever
         // LocalDensity is ambient — but that surface must match real screen pixels, not the
         // app's (possibly artificially inflated, see NuvioDesktopViewportDensityScaler) UI
@@ -1157,7 +1311,15 @@ private fun NativePlayerSurface(
                 factory = {
                     host
                 },
-                modifier = if (hostFirstPaintComplete.value) {
+                modifier = if (hostFirstPaintComplete.value && postShowBoxed) {
+                    // One step, not an animation: resizing the native video window every frame
+                    // stuttered on the HTPC. The cards fade in underneath instead.
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = POST_SHOW_BOX_MARGIN_DP.dp, bottom = POST_SHOW_BOX_MARGIN_DP.dp)
+                        .fillMaxWidth(POST_SHOW_BOX_WIDTH)
+                        .aspectRatio(16f / 9f)
+                } else if (hostFirstPaintComplete.value) {
                     Modifier.fillMaxSize()
                 } else {
                     Modifier
@@ -1189,6 +1351,8 @@ private data class DesktopAnimeProfileResult(
     /** Active shader chain's display name, or null when the picture is running ungraded by one. */
     val shaderLabel: String?,
     val svpActive: Boolean,
+    /** RTX True HDR is in the vf chain, including the copy the native side swaps in when SVP skips. */
+    val rtxTrueHdrActive: Boolean = false,
 )
 
 /**
@@ -1223,9 +1387,9 @@ private fun desktopColorProfileInfoLabel(
     isHdr: Boolean?,
     hdrMode: DesktopHdrMode,
 ): String = if (isHdr != false && hdrMode != DesktopHdrMode.AlwaysTonemap) {
-    DesktopColorProfile.Neutral.label
+    localizedString(DesktopColorProfile.Neutral.labelRes)
 } else {
-    colorProfile.label
+    localizedString(colorProfile.labelRes)
 }
 
 /**
@@ -1682,7 +1846,14 @@ private fun applyDesktopAnimeProfile(
         controller.setMpvProperty("scale-blur", "1.05")
         controller.setMpvProperty("deband-threshold", "45")
         controller.setMpvProperty("deband-grain", desktopDebandGrain(filmGrain, "20"))
-        controller.setDesktopShaderChain(customShaderChain)
+        // Same chroma realign pass the Anime4K chain gets under True HDR; see chromaRealignPath.
+        controller.setDesktopShaderChain(
+            if (shaderTrueHdrVf.isNotEmpty()) {
+                listOfNotNull(DesktopAnimeShaders.chromaRealignPath(), customShaderChain).joinToString(";")
+            } else {
+                customShaderChain
+            },
+        )
 
         controller.setSvpBypassVideoFilters("")
         controller.setMpvProperty(
@@ -1694,6 +1865,7 @@ private fun applyDesktopAnimeProfile(
             shaderLabel = customShaderChain.customShaderDisplayName(customShaderPaths)
                 ?.withTrueHdrSuffix(shaderTrueHdrVf.isNotEmpty()),
             svpActive = svpActive,
+            rtxTrueHdrActive = shaderTrueHdrVf.isNotEmpty(),
         )
     }
 
@@ -1725,7 +1897,11 @@ private fun applyDesktopAnimeProfile(
             requestedPreset != null -> "Anime4K off — 4K source"
             else -> "Shader off — 4K source"
         }
-        return DesktopAnimeProfileResult(shaderLabel = skippedLabel, svpActive = svpActive)
+        return DesktopAnimeProfileResult(
+            shaderLabel = skippedLabel,
+            svpActive = svpActive,
+            rtxTrueHdrActive = trueHdrActive || (svpActive && trueHdrActiveWithoutSvp),
+        )
     }
 
     // Anime-tuned scaling + deband (Stremio-Kai's anime-sdr base profile).
@@ -1764,8 +1940,9 @@ private fun applyDesktopAnimeProfile(
     // Anime4K_* files, which is not something to print, and the bare preset label ("Mode A (HQ)")
     // never says what is doing the work.
     return DesktopAnimeProfileResult(
-        shaderLabel = "Anime4K ${effectivePreset.label}".withTrueHdrSuffix(shaderTrueHdrVf.isNotEmpty()),
+        shaderLabel = "Anime4K ${localizedString(effectivePreset.labelRes)}".withTrueHdrSuffix(shaderTrueHdrVf.isNotEmpty()),
         svpActive = svpActive,
+        rtxTrueHdrActive = shaderTrueHdrVf.isNotEmpty(),
     )
 }
 
@@ -1808,7 +1985,7 @@ private fun DesktopStubPlayerSurface(
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "Desktop in-app playback is not available yet.",
+            text = stringResource(Res.string.player_desktop_unavailable),
             color = Color.White,
             style = MaterialTheme.typography.bodyMedium,
         )
@@ -1842,3 +2019,12 @@ private val EXPIRED_PINNED_LINK_STATUS =
 
 private fun looksLikeExpiredPinnedLink(message: String): Boolean =
     EXPIRED_PINNED_LINK_STATUS.containsMatchIn(message)
+
+private const val PLAYER_BADGES_POLL_MS = 2_000L
+
+/** How long the post-show cards take to fade in. */
+private const val POST_SHOW_SHRINK_MS = 500
+
+/** The box's gap from the bottom and right edges, and its width as a share of the space left. */
+private const val POST_SHOW_BOX_MARGIN_DP = 64
+private const val POST_SHOW_BOX_WIDTH = 0.3f

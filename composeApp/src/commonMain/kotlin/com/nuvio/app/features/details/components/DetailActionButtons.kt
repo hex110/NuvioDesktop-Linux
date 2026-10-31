@@ -1,5 +1,6 @@
 package com.nuvio.app.features.details.components
 
+import com.nuvio.app.core.ui.collectIsKeyboardFocusedAsState
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -7,6 +8,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
@@ -38,11 +42,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -68,6 +74,7 @@ import nuvio.composeapp.generated.resources.details_episode_search_placeholder
 import org.jetbrains.compose.resources.stringResource
 import androidx.compose.material.icons.rounded.Search
 import com.nuvio.app.core.ui.trackTextInputFocus
+import nuvio.composeapp.generated.resources.*
 
 data class DetailSecondaryAction(
     val label: String,
@@ -103,7 +110,7 @@ fun DetailActionButtons(
     modifier: Modifier = Modifier,
     playLabel: String = stringResource(Res.string.action_play),
     secondaryActions: List<DetailSecondaryAction> = emptyList(),
-    actionsMenuLabel: String = "More actions",
+    actionsMenuLabel: String = stringResource(Res.string.details_more_actions),
     isTablet: Boolean = false,
     /**
      * Which button in the row holds keyboard focus: 0 is Play, 1+ index into [secondaryActions] in
@@ -126,10 +133,16 @@ fun DetailActionButtons(
     val activeFocusedActionIndex = focusedActionIndex.takeUnless { searchActive }
     // Kept small: this button is wide, so even a few percent of scale would push its edge into
     // the secondary buttons beside it.
-    val playFocused = activeFocusedActionIndex == 0
+    // Real keyboard focus counts too: Details drives the row itself, but a page of ordinary focusable controls (the
+    // music artist page) moves focus onto the buttons and needs them to show it.
+    val playSource = remember { MutableInteractionSource() }
+    val playKeyFocused by playSource.collectIsKeyboardFocusedAsState()
+    val playFocused = activeFocusedActionIndex == 0 || (playKeyFocused && !searchActive)
     val playScale by animateFloatAsState(targetValue = if (playFocused) 1.02f else 1f)
-    val focusRingAlpha by animateFloatAsState(targetValue = if (playFocused) 1f else 0f)
-    val focusRingColor = MaterialTheme.colorScheme.primary
+    // Focus tints the glass toward the accent rather than outlining it: a stronger wash than the
+    // circles' "on" tint, so a focused Play never reads as a toggled state.
+    val focusTintAlpha by animateFloatAsState(targetValue = if (playFocused) 1f else 0f)
+    val focusTint = MaterialTheme.colorScheme.primary.copy(alpha = PlayFocusTintAlpha * focusTintAlpha)
     val hasSecondaryActions = secondaryActions.isNotEmpty()
 
     Box(
@@ -153,25 +166,15 @@ fun DetailActionButtons(
                         scaleX = playScale
                         scaleY = playScale
                     }
-                    // Focus ring: an accent-coloured outline drawn just inside the button edge
-                    // (on top of the fill), so it doesn't overlap the buttons beside it while
-                    // still clearly showing keyboard focus.
-                    .drawWithContent {
-                        drawContent()
-                        if (focusRingAlpha <= 0f) return@drawWithContent
-                        val stroke = 3.dp.toPx()
-                        val inset = stroke / 2f
-                        drawRoundRect(
-                            color = focusRingColor.copy(alpha = focusRingColor.alpha * focusRingAlpha),
-                            topLeft = Offset(inset, inset),
-                            size = Size(size.width - inset * 2f, size.height - inset * 2f),
-                            cornerRadius = CornerRadius((12.dp.toPx() - inset).coerceAtLeast(0f)),
-                            style = Stroke(width = stroke),
-                        )
-                    },
+                    // The same smoked glass as the circle buttons beside it, so the row reads as one
+                    // set; Play stands out by its width and label rather than by a different fill.
+                    .background(DetailActionGlassBase, playShape)
+                    .then(if (focusTintAlpha > 0f) Modifier.background(focusTint, playShape) else Modifier)
+                    .background(DetailActionGlassSheen, playShape)
+                    .border(1.dp, DetailActionGlassEdge, playShape),
                 shape = playShape,
-                color = MaterialTheme.colorScheme.onBackground,
-                contentColor = MaterialTheme.colorScheme.background,
+                color = Color.Transparent,
+                contentColor = Color.White,
             ) {
                 AnimatedContent(
                     targetState = searchActive,
@@ -188,6 +191,8 @@ fun DetailActionButtons(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .combinedClickable(
+                                    interactionSource = playSource,
+                                    indication = LocalIndication.current,
                                     onClick = {
                                         onPlayClick()
                                     },
@@ -354,41 +359,41 @@ internal fun DetailIconAction(
     focused: Boolean = false,
     onLongClick: (() -> Unit)? = null,
 ) {
+    val source = remember { MutableInteractionSource() }
+    val keyFocused by source.collectIsKeyboardFocusedAsState()
     // Matches the Play button's ring so a focus move along the row reads as one continuous control.
-    val focusRingAlpha by animateFloatAsState(targetValue = if (focused) 1f else 0f)
+    val focusRingAlpha by animateFloatAsState(targetValue = if (focused || keyFocused) 1f else 0f)
     val focusRingColor = MaterialTheme.colorScheme.primary
+    val activeTint = MaterialTheme.colorScheme.primary.copy(alpha = 0.38f)
+    // Circles, so the secondary actions read as a set of toggles beside the one wide Play button.
     Surface(
         modifier = modifier.drawWithContent {
             drawContent()
             if (focusRingAlpha <= 0f) return@drawWithContent
             val stroke = 3.dp.toPx()
-            val inset = stroke / 2f
-            drawRoundRect(
+            drawCircle(
                 color = focusRingColor.copy(alpha = focusRingColor.alpha * focusRingAlpha),
-                topLeft = Offset(inset, inset),
-                size = Size(this.size.width - inset * 2f, this.size.height - inset * 2f),
-                cornerRadius = CornerRadius((12.dp.toPx() - inset).coerceAtLeast(0f)),
+                radius = (this.size.minDimension - stroke) / 2f,
                 style = Stroke(width = stroke),
             )
         },
-        shape = RoundedCornerShape(12.dp),
-        color = if (active) {
-            MaterialTheme.colorScheme.onBackground
-        } else {
-            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.88f)
-        },
-        contentColor = if (active) {
-            MaterialTheme.colorScheme.background
-        } else {
-            MaterialTheme.colorScheme.onSurface
-        },
-        tonalElevation = 6.dp,
-        shadowElevation = 8.dp,
+        shape = CircleShape,
+        // Smoked glass: a dark base under a light sheen, so the circles hold their shape over a
+        // bright backdrop as well as a dark one (the old 4.5% white all but vanished on light
+        // art). "On" (in the library, watched) takes an accent tint; the outline stays for focus.
+        color = Color.Transparent,
+        contentColor = if (active) Color.White else Color.White.copy(alpha = 0.9f),
     ) {
         Box(
             modifier = Modifier
                 .size(size)
+                .background(DetailActionGlassBase, CircleShape)
+                .then(if (active) Modifier.background(activeTint, CircleShape) else Modifier)
+                .background(DetailActionGlassSheen, CircleShape)
+                .border(1.dp, DetailActionGlassEdge, CircleShape)
                 .combinedClickable(
+                    interactionSource = source,
+                    indication = LocalIndication.current,
                     onClick = onClick,
                     onLongClick = onLongClick,
                     role = Role.Button,
@@ -404,3 +409,19 @@ internal fun DetailIconAction(
         }
     }
 }
+
+/** Dark under-layer of the detail buttons' glass: what keeps them legible over bright artwork. */
+private val DetailActionGlassBase = Color.Black.copy(alpha = 0.34f)
+
+/** Light falling on the glass from above. */
+private val DetailActionGlassSheen = Brush.verticalGradient(
+    0f to Color.White.copy(alpha = 0.16f),
+    1f to Color.White.copy(alpha = 0.06f),
+)
+
+/** How far a focused Play button's glass is tinted toward the accent. */
+private const val PlayFocusTintAlpha = 0.62f
+
+/** Hairline rim, faint enough not to read as the focus ring. */
+private val DetailActionGlassEdge = Color.White.copy(alpha = 0.12f)
+

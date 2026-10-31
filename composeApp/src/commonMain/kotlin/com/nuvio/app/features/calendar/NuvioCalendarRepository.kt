@@ -33,6 +33,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.concurrent.Volatile
+import nuvio.composeapp.generated.resources.*
+import com.nuvio.app.core.i18n.localizedString
 
 private const val MAX_CONCURRENT_FETCHES = 4
 
@@ -41,6 +43,9 @@ private const val RECHECK_INTERVAL_MS = 15 * 60 * 1000L
 
 /** While a long first pass runs, the grid is refreshed after every this many titles. */
 private const val PUBLISH_EVERY = 20
+
+/** TMDB poster width for calendar days and the day list; neither shows a poster larger than this. */
+private const val CALENDAR_POSTER_SIZE = "w342"
 
 /**
  * The calendar with no tracking service: every show in the profile's Nuvio library and watch
@@ -76,7 +81,7 @@ internal object NuvioCalendarRepository {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     hasLoaded = true,
-                    errorMessage = "Failed to load calendar",
+                    errorMessage = localizedString(Res.string.calendar_failed_to_load_calendar),
                 )
             }
         }
@@ -171,7 +176,9 @@ internal object NuvioCalendarRepository {
     private suspend fun fetchShow(follow: NuvioCalendarFollow): NuvioCalendarCachedItem? {
         val meta = MetaDetailsRepository.fetchForSchedule(follow.type, follow.contentId) ?: return null
         val title = meta.name.ifBlank { follow.title }
-        val poster = follow.posterUrl ?: meta.poster?.takeIf { it.isNotBlank() }
+        val poster = tmdbCalendarPoster(follow)
+            ?: follow.posterUrl
+            ?: meta.poster?.takeIf { it.isNotBlank() }
         val entries = meta.videos.mapNotNull { video ->
             val season = video.season ?: return@mapNotNull null
             val episode = video.episode ?: return@mapNotNull null
@@ -203,6 +210,7 @@ internal object NuvioCalendarRepository {
         val tmdbId = follow.tmdbId
             ?: TmdbService.ensureTmdbId(follow.contentId, "movie")?.toIntOrNull()
         val date = tmdbId?.let { TmdbService.fetchMovieCalendarDate(it) }
+        val poster = tmdbId?.let { tmdbCalendarPoster(follow, it) } ?: follow.posterUrl
         val entries = listOfNotNull(
             date?.let {
                 NuvioCalendarCachedEntry(
@@ -210,7 +218,7 @@ internal object NuvioCalendarRepository {
                     type = "movie",
                     contentId = follow.contentId,
                     title = follow.title,
-                    posterUrl = follow.posterUrl,
+                    posterUrl = poster,
                 )
             },
         )
@@ -221,6 +229,25 @@ internal object NuvioCalendarRepository {
             entries = entries,
         )
     }
+
+    /**
+     * The plain TMDB poster for a title. Preferred over the library or addon poster: those are
+     * often custom art (rating badges, logos, text along the edges) and a calendar day crops a
+     * poster hard, which cut those elements in half. Null with no TMDB key or no match, and the
+     * caller falls back to the poster it had.
+     */
+    private suspend fun tmdbCalendarPoster(follow: NuvioCalendarFollow, knownTmdbId: Int? = null): String? =
+        try {
+            val tmdbId = knownTmdbId
+                ?: follow.tmdbId
+                ?: TmdbService.ensureTmdbId(follow.contentId, follow.type)?.toIntOrNull()
+            tmdbId?.let { TmdbService.fetchPosterUrl(it, follow.type, size = CALENDAR_POSTER_SIZE) }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log.d { "Local calendar: no TMDB poster for ${follow.key}: ${error.message}" }
+            null
+        }
 
     private fun publish(isLoading: Boolean) {
         // The first follow of a title wins (library before history), so a show followed under two

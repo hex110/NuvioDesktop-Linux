@@ -4,10 +4,13 @@ import co.touchlab.kermit.Logger
 import com.nuvio.app.core.perf.PerfTelemetry
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.Locale
 import java.util.Properties
 import java.util.UUID
@@ -62,6 +65,48 @@ internal object DesktopStorage {
     fun store(name: String): Store = synchronized(stores) {
         stores.getOrPut(name) { Store(storeFile(name)) }
     }
+
+    /**
+     * Reads every store already on disk, off the UI thread, shortly after launch.
+     *
+     * Stores load lazily on first use, and that first use is often a composable. On this PC the
+     * file open alone has blocked for 3–7s while an on-access scanner held the file (2026-10-30:
+     * a 79-byte `nuvio_anime_filler_settings` took 7102ms in `CreateFile0` on AWT-EventQueue-0,
+     * earlier launches the same for music library and pre-show). Paying that on a pool thread at
+     * launch means the screen that needs the store later finds it in memory. A few threads, because
+     * one stuck open must not hold up the rest.
+     */
+    fun prewarmStoresAsync() {
+        Thread({
+            val files = runCatching {
+                listOf(accountDir, rootDir).distinct().flatMap { dir ->
+                    Files.list(dir).use { entries ->
+                        entries.filter { it.fileName.toString().endsWith(".properties") }.toList()
+                    }
+                }
+            }.getOrElse { error ->
+                log.w(error) { "store prewarm could not list the data directory" }
+                return@Thread
+            }
+            val names = files.map { it.fileName.toString().removeSuffix(".properties") }
+                // A same-named file in the other folder is not that store; storeFile decides.
+                .filter { name -> files.any { it == storeFile(name) } }
+                .distinct()
+            val startedAt = System.nanoTime()
+            val pool = Executors.newFixedThreadPool(PREWARM_THREADS) { runnable ->
+                Thread(runnable, "nuvio-storage-prewarm").apply {
+                    isDaemon = true
+                    priority = Thread.MIN_PRIORITY
+                }
+            }
+            names.forEach { name -> pool.execute { runCatching { store(name).contains("") } } }
+            pool.shutdown()
+            pool.awaitTermination(1, TimeUnit.MINUTES)
+            log.i { "store prewarm: ${names.size} stores in ${(System.nanoTime() - startedAt) / 1_000_000}ms" }
+        }, "nuvio-storage-prewarm-main").apply { isDaemon = true }.start()
+    }
+
+    private const val PREWARM_THREADS = 4
 
     /** Where [name]'s file lives: the data directory for machine stores, else [accountDir]. */
     fun storeFile(name: String): Path =
@@ -381,7 +426,7 @@ internal object DesktopStorage {
     private const val PORTABLE_RETURN_FLAG = "return-to-appdata"
 
     /** Caches worth keeping across a switch; moved only when that is a rename (see above). */
-    private val PORTABLE_MOVABLE_CACHES = listOf("image_cache", "image_cache_animated", "shader-cache", "cache")
+    private val PORTABLE_MOVABLE_CACHES = listOf("image_cache", "image_cache_animated", "shader-cache", "cache", "musicbrainz") // fork:music
 
     /**
      * Top-level entries the settings copy skips: caches (moved separately, or rebuilt), the torrent
@@ -392,6 +437,7 @@ internal object DesktopStorage {
         "image_cache_animated",
         "cache",
         "shader-cache",
+        "musicbrainz", // fork:music - the offline MusicBrainz copy, 1-2 GB
         "nuvio-engine",
         "logs",
         "updates",
@@ -400,6 +446,20 @@ internal object DesktopStorage {
         "single-instance-port.txt",
         PORTABLE_RETURN_FLAG,
     )
+
+    /**
+     * Top-level entries of the old `Nuvio` folders the legacy migration leaves behind: everything
+     * the portable copy skips, plus what only the official Nuvio Desktop keeps there (its WebView2
+     * profile, crash reports, TorrServer binary and data). All of it is rebuilt on demand.
+     */
+    private val LEGACY_MIGRATION_SKIP = PORTABLE_MIGRATION_SKIP + setOf(
+        "webview2",
+        "sentry",
+        "torrserver",
+    )
+
+    private fun skipsInLegacyMigration(entry: Path): Boolean =
+        entry.fileName.toString().lowercase(Locale.ROOT) in LEGACY_MIGRATION_SKIP
 
     /**
      * Stores HTPC wrote into the shared `Nuvio` directory up to 1.9 (1.10 moved to `NuvioHTPC`)
@@ -420,7 +480,11 @@ internal object DesktopStorage {
     internal fun holdsHtpcOnlyStore(directory: Path): Boolean =
         directory.exists() && HTPC_ONLY_LEGACY_STORES.any { name -> directory.resolve("$name.properties").exists() }
 
-    private fun migrateLegacyDirectories(destination: Path, vararg sources: Path) {
+    // Runs before the window exists, so it copies only settings and user data. It used to take
+    // whole folders: for anyone who had run the official Nuvio Desktop that meant its caches,
+    // staged update installers and WebView2 profile (2 GB or more), and a first launch sat
+    // windowless for minutes while that copied and Defender scanned every file.
+    internal fun migrateLegacyDirectories(destination: Path, vararg sources: Path) {
         synchronized(stores) {
             if (destination.exists()) return
             val staging = destination.resolveSibling("${destination.fileName}.migrating-${UUID.randomUUID()}")
@@ -429,17 +493,22 @@ internal object DesktopStorage {
                 sources
                     .filter { it.exists() && it != destination }
                     .forEach { source ->
-                        Files.walk(source).use { paths ->
-                            paths.forEach { current ->
-                                val target = staging.resolve(source.relativize(current).toString())
-                                if (Files.isDirectory(current)) {
-                                    Files.createDirectories(target)
-                                } else if (!target.exists()) {
-                                    Files.createDirectories(target.parent)
-                                    Files.copy(current, target)
+                        Files.walkFileTree(source, object : SimpleFileVisitor<Path>() {
+                            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                                if (dir != source && dir.parent == source && skipsInLegacyMigration(dir)) {
+                                    return FileVisitResult.SKIP_SUBTREE
                                 }
+                                Files.createDirectories(staging.resolve(source.relativize(dir).toString()))
+                                return FileVisitResult.CONTINUE
                             }
-                        }
+
+                            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                                if (file.parent == source && skipsInLegacyMigration(file)) return FileVisitResult.CONTINUE
+                                val target = staging.resolve(source.relativize(file).toString())
+                                if (!target.exists()) Files.copy(file, target)
+                                return FileVisitResult.CONTINUE
+                            }
+                        })
                     }
                 runCatching { Files.move(staging, destination, StandardCopyOption.ATOMIC_MOVE) }
                     .getOrElse { Files.move(staging, destination) }

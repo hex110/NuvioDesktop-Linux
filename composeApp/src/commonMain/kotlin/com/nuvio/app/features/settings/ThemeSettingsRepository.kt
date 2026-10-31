@@ -30,6 +30,9 @@ data class CustomThemeSettings(
         )
 }
 
+const val DEFAULT_APP_FONT_SCALE_PERCENT = 100
+val APP_FONT_SCALE_PERCENT_RANGE = 70..130
+
 object ThemeSettingsRepository {
     private val _selectedTheme = MutableStateFlow(AppTheme.OCEAN)
     val selectedTheme: StateFlow<AppTheme> = _selectedTheme.asStateFlow()
@@ -46,7 +49,7 @@ object ThemeSettingsRepository {
     private val _liquidGlassNativeTabBarEnabled = MutableStateFlow(false)
     val liquidGlassNativeTabBarEnabled: StateFlow<Boolean> = _liquidGlassNativeTabBarEnabled.asStateFlow()
 
-    private val _desktopColumnGuidesVisible = MutableStateFlow(true)
+    private val _desktopColumnGuidesVisible = MutableStateFlow(false)
     val desktopColumnGuidesVisible: StateFlow<Boolean> = _desktopColumnGuidesVisible.asStateFlow()
 
     /** Settings shell spans the whole window instead of a centred fixed-width column set. */
@@ -83,6 +86,11 @@ object ThemeSettingsRepository {
     private val _appFontFamily = MutableStateFlow("")
     val appFontFamily: StateFlow<String> = _appFontFamily.asStateFlow()
 
+    // Text size for a swapped-in font, so one that runs wider or narrower than JetBrains Sans can
+    // be brought back to roughly the same footprint. Ignored while the bundled font is in use.
+    private val _appFontScalePercent = MutableStateFlow(DEFAULT_APP_FONT_SCALE_PERCENT)
+    val appFontScalePercent: StateFlow<Int> = _appFontScalePercent.asStateFlow()
+
     private val _selectedAppLanguage = MutableStateFlow(AppLanguage.ENGLISH)
     val selectedAppLanguage: StateFlow<AppLanguage> = _selectedAppLanguage.asStateFlow()
 
@@ -104,7 +112,7 @@ object ThemeSettingsRepository {
         _accentGradientDirection.value = AccentGradientDirection.Default
         _amoledEnabled.value = false
         _liquidGlassNativeTabBarEnabled.value = false
-        _desktopColumnGuidesVisible.value = true
+        _desktopColumnGuidesVisible.value = false
         _desktopSettingsFullWidth.value = false
         _wasdNavigationEnabled.value = false
         WasdNavigation.enabled = false
@@ -118,6 +126,7 @@ object ThemeSettingsRepository {
         NativeTabBridge.publishAccentColor(ThemeColors.Ocean.nativeAccentHex)
         NativeTabBridge.publishLiquidGlassEnabled(false)
         _appFontFamily.value = ""
+        _appFontScalePercent.value = DEFAULT_APP_FONT_SCALE_PERCENT
         _selectedAppLanguage.value = AppLanguage.ENGLISH
     }
 
@@ -162,7 +171,7 @@ object ThemeSettingsRepository {
         val liquidGlassEnabled = ThemeSettingsStorage.loadLiquidGlassNativeTabBarEnabled() ?: false
         _liquidGlassNativeTabBarEnabled.value = liquidGlassEnabled
         NativeTabBridge.publishLiquidGlassEnabled(liquidGlassEnabled)
-        _desktopColumnGuidesVisible.value = ThemeSettingsStorage.loadDesktopColumnGuidesVisible() ?: true
+        _desktopColumnGuidesVisible.value = ThemeSettingsStorage.loadDesktopColumnGuidesVisible() ?: false
         _desktopSettingsFullWidth.value = ThemeSettingsStorage.loadDesktopSettingsFullWidth() ?: false
         val wasdEnabled = ThemeSettingsStorage.loadWasdNavigationEnabled() ?: false
         _wasdNavigationEnabled.value = wasdEnabled
@@ -180,6 +189,8 @@ object ThemeSettingsRepository {
         _desktopAppUiScaleAppliesToDetails.value =
             ThemeSettingsStorage.loadDesktopAppUiScaleAppliesToDetails() ?: true
         _appFontFamily.value = ThemeSettingsStorage.loadAppFontFamily()?.trim().orEmpty()
+        _appFontScalePercent.value = ThemeSettingsStorage.loadAppFontScalePercent()
+            ?.coerceIn(APP_FONT_SCALE_PERCENT_RANGE) ?: DEFAULT_APP_FONT_SCALE_PERCENT
         val appLanguage = AppLanguage.fromCode(ThemeSettingsStorage.loadSelectedAppLanguage())
         ThemeSettingsStorage.applySelectedAppLanguage(appLanguage.code)
         _selectedAppLanguage.value = appLanguage
@@ -337,6 +348,16 @@ object ThemeSettingsRepository {
         ThemeSettingsStorage.saveDesktopAppUiScalePercent(clamped)
     }
 
+    /**
+     * Nudges the app UI scale by [deltaPercent] (Ctrl+plus / Ctrl+minus, and the size buttons on the
+     * music Library header). Returns the new value so a caller can show it.
+     */
+    fun stepDesktopAppUiScalePercent(deltaPercent: Int): Int {
+        ensureLoaded()
+        setDesktopAppUiScalePercent(_desktopAppUiScalePercent.value + deltaPercent)
+        return _desktopAppUiScalePercent.value
+    }
+
     fun setDesktopAppUiScaleAppliesToDetails(enabled: Boolean) {
         ensureLoaded()
         if (_desktopAppUiScaleAppliesToDetails.value == enabled) return
@@ -351,6 +372,14 @@ object ThemeSettingsRepository {
         if (_appFontFamily.value == next) return
         _appFontFamily.value = next
         ThemeSettingsStorage.saveAppFontFamily(next)
+    }
+
+    fun setAppFontScalePercent(percent: Int) {
+        ensureLoaded()
+        val next = percent.coerceIn(APP_FONT_SCALE_PERCENT_RANGE)
+        if (_appFontScalePercent.value == next) return
+        _appFontScalePercent.value = next
+        ThemeSettingsStorage.saveAppFontScalePercent(next)
     }
 
     fun setAppLanguage(language: AppLanguage) {

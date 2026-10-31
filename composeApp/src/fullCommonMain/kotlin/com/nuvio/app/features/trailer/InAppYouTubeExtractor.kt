@@ -2,6 +2,7 @@ package com.nuvio.app.features.trailer
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.library.LibraryClock
+import com.nuvio.app.features.youtubemusic.YouTubeMusicAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -17,6 +18,10 @@ internal const val TRAILER_EXTRACTOR_TAG = "InAppYouTubeExtractor"
 internal const val TRAILER_REQUEST_TIMEOUT_MS = 20_000L
 
 private const val EXTRACTOR_TIMEOUT_MS = 30_000L
+private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
+
+/** Lower-case fragments of the messages YouTube shows for an age-gated video. */
+private val AGE_GATE_PHRASES = listOf("your age", "age-restricted", "age restricted", "inappropriate for some users")
 
 /**
  * How long a cached watch config is trusted. `visitorData` is a session token that YouTube
@@ -34,6 +39,9 @@ private const val WATCH_CONFIG_TTL_MS = 3L * 60L * 60L * 1000L
  */
 internal const val WATCH_PAGE_BACKOFF_MS = 10L * 60L * 1000L
 private const val PREFERRED_SEPARATE_CLIENT = "visionos"
+
+/** YouTube Premium's enhanced-bitrate formats (356 adaptive VP9 1080p; 616 the HLS one), unplayable without Premium. */
+private val PREMIUM_ITAGS = setOf(356, 616)
 
 private val VIDEO_ID_REGEX = Regex("^[a-zA-Z0-9_-]{11}$")
 private val API_KEY_REGEX = Regex("\"INNERTUBE_API_KEY\":\"([^\"]+)\"")
@@ -64,6 +72,13 @@ internal data class StreamCandidate(
     val fps: Int,
     val bitrate: Double,
     val ext: String,
+    /** 0 when YouTube sent no width (audio, or an old format entry). */
+    val width: Int = 0,
+    /**
+     * Audio only: whether this is the video's original language track. Null when YouTube sent no
+     * `audioTrack` (a single-language video, where every audio format is the original).
+     */
+    val isOriginalAudio: Boolean? = null,
 )
 
 private data class ManifestBestVariant(
@@ -80,6 +95,7 @@ internal data class ManifestCandidate(
     val selectedVariantUrl: String,
     val height: Int,
     val bandwidth: Long,
+    val width: Int = 0,
 )
 
 internal data class TrailerRequestResponse(
@@ -156,6 +172,40 @@ private val CLIENTS = listOf(
     ),
 )
 
+// fork:ytmusic-login — clients for the signed-in retry. The mobile clients above are built for
+// anonymous use and reject a request carrying account cookies, so a signed-in pass needs the
+// TV clients, which accept them and are the ones that serve age-gated videos.
+private val ACCOUNT_CLIENTS = listOf(
+    YouTubeClient(
+        key = "tv",
+        id = "7",
+        version = "7.20250923.13.00",
+        userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+        context = jsonObjectOf(
+            "clientName" to "TVHTML5",
+            "clientVersion" to "7.20250923.13.00",
+            "hl" to "en",
+            "gl" to "US",
+        ),
+        priority = 0,
+    ),
+    // TVHTML5_SIMPLY_EMBEDDED_PLAYER is retired ("no longer supported in this application or
+    // device"); TVHTML5_SIMPLY is the client that replaced it.
+    YouTubeClient(
+        key = "tv_simply",
+        id = "75",
+        version = "1.0",
+        userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+        context = jsonObjectOf(
+            "clientName" to "TVHTML5_SIMPLY",
+            "clientVersion" to "1.0",
+            "hl" to "en",
+            "gl" to "US",
+        ),
+        priority = 1,
+    ),
+)
+
 internal typealias TrailerRequester = suspend (
     url: String,
     method: String,
@@ -168,7 +218,17 @@ class InAppYouTubeExtractor internal constructor(
     private val performRequest: TrailerRequester,
     private val nowMs: () -> Long,
 ) {
-    constructor() : this(TrailerExtractionPlatform::performRequest, LibraryClock::nowEpochMs)
+    constructor() : this(TrailerExtractionPlatform::performRequest, LibraryClock::nowEpochMs) {
+        accountHeaders = YouTubeMusicAuth::authHeaders
+    }
+
+    /**
+     * fork:ytmusic-login — headers that make a request to the given origin act as the signed-in
+     * Google account, or empty when nobody is signed in. A property rather than a constructor
+     * parameter so the existing `InAppYouTubeExtractor(::request) { nowMs }` call shape keeps
+     * working; tests leave the default (no account) so they never touch the stored session.
+     */
+    internal var accountHeaders: (origin: String) -> Map<String, String> = { emptyMap() }
 
     private val log = Logger.withTag(TRAILER_EXTRACTOR_TAG)
 
@@ -191,28 +251,70 @@ class InAppYouTubeExtractor internal constructor(
         val fetchedAtMs: Long,
     )
 
-    suspend fun extractPlaybackSource(youtubeUrl: String): TrailerResolution = withContext(Dispatchers.Default) {
+    suspend fun extractPlaybackSource(youtubeUrl: String): TrailerResolution = extract(youtubeUrl, singleUrl = false)
+
+    /**
+     * One URL carrying both video and audio, for a stream that is only a YouTube id (upstream
+     * 94976222d): the HLS master playlist (every quality, audio as a rendition), or a progressive
+     * file when there is none. The adaptive formats are skipped because their audio is separate.
+     */
+    suspend fun extractSingleUrl(youtubeUrl: String): String? =
+        (extract(youtubeUrl, singleUrl = true) as? TrailerResolution.Available)?.source?.videoUrl
+
+    /** fork:innertube - the shared session for the search / YouTube Music requests in YouTubeInnerTube.kt. */
+    internal suspend fun innerTubeSession(): InnerTubeSession =
+        ensureWatchConfig(INNERTUBE_SEED_VIDEO_ID, forceRefresh = false).let { InnerTubeSession(it.apiKey, it.visitorData) }
+
+    private suspend fun extract(youtubeUrl: String, singleUrl: Boolean): TrailerResolution = withContext(Dispatchers.Default) {
         if (youtubeUrl.isBlank()) return@withContext TrailerResolution.Unavailable(TrailerUnavailableReason.UNKNOWN)
 
         val hadCachedConfig = configMutex.withLock { cachedConfig != null }
-        val first = attemptExtraction(youtubeUrl, forceRefreshConfig = false)
+        val first = attemptExtraction(youtubeUrl, forceRefreshConfig = false, singleUrl = singleUrl)
 
         // A session that has expired server-side is indistinguishable from an unplayable video:
         // every client answers LOGIN_REQUIRED with no `streamingData`. Retry once against a
         // freshly fetched watch config before believing the verdict. Skipped when this attempt
         // already fetched a config, and when YouTube gave a definitive reason a new session
         // cannot change, so the common failure paths still cost a single pass.
-        if (first is TrailerResolution.Available || !hadCachedConfig || !first.warrantsFreshConfig()) {
-            return@withContext first
+        val anonymous =
+            if (first is TrailerResolution.Available || !hadCachedConfig || !first.warrantsFreshConfig()) {
+                first
+            } else {
+                log.i { "Retrying extraction with a fresh watch config" }
+                attemptExtraction(youtubeUrl, forceRefreshConfig = true, singleUrl = singleUrl)
+            }
+
+        // fork:ytmusic-login — a video YouTube gates behind a sign-in (age restriction, "confirm
+        // you're not a bot") is retried once as the signed-in Google account. Anonymous stays the
+        // default so the account's cookies only ever leave the machine for videos that need them.
+        val needsAccount = anonymous is TrailerResolution.Unavailable &&
+            anonymous.reason == TrailerUnavailableReason.AGE_RESTRICTED
+        if (needsAccount && accountHeaders(YOUTUBE_ORIGIN).isNotEmpty()) {
+            log.i { "Retrying login-gated video as the signed-in account" }
+            return@withContext attemptExtraction(youtubeUrl, forceRefreshConfig = false, singleUrl = singleUrl, useAccount = true)
         }
-        log.i { "Retrying extraction with a fresh watch config" }
-        attemptExtraction(youtubeUrl, forceRefreshConfig = true)
+        anonymous
     }
 
-    private suspend fun attemptExtraction(youtubeUrl: String, forceRefreshConfig: Boolean): TrailerResolution =
+    /**
+     * fork:music-resolver — drops the cached watch config so the next extraction fetches a fresh
+     * session. For a caller that has just proved the URLs it was given are dead: YouTube issues
+     * URLs that serve nothing to a session it has reservations about, and a stale `visitorData`
+     * is one way to be that session.
+     */
+    suspend fun forgetSession() {
+        configMutex.withLock { cachedConfig = null }
+    }
+
+    private suspend fun attemptExtraction(
+        youtubeUrl: String,
+        forceRefreshConfig: Boolean,
+        singleUrl: Boolean,
+        useAccount: Boolean = false,
+    ): TrailerResolution =
         runCatching {
             withTimeout(EXTRACTOR_TIMEOUT_MS) {
-                extractPlaybackSourceInternal(youtubeUrl, forceRefreshConfig)
+                extractPlaybackSourceInternal(youtubeUrl, forceRefreshConfig, singleUrl, useAccount)
             }
         }.onFailure {
             log.w { "Trailer extractor failed for $youtubeUrl: ${it.message}" }
@@ -315,6 +417,8 @@ class InAppYouTubeExtractor internal constructor(
     private suspend fun extractPlaybackSourceInternal(
         youtubeUrl: String,
         forceRefreshConfig: Boolean,
+        singleUrl: Boolean = false,
+        useAccount: Boolean = false,
     ): TrailerResolution {
         val videoId = extractVideoId(youtubeUrl)
             ?: return TrailerResolution.Unavailable(TrailerUnavailableReason.UNKNOWN)
@@ -331,17 +435,25 @@ class InAppYouTubeExtractor internal constructor(
         // whichever client responded last.
         var lastPlayabilityStatus: JsonObject? = null
 
-        for (client in CLIENTS) {
+        for (client in if (useAccount) ACCOUNT_CLIENTS else CLIENTS) {
             runCatching {
                 val playerResponse = fetchPlayerResponse(
                     apiKey = apiKey,
                     videoId = videoId,
                     client = client,
                     visitorData = watchConfig.visitorData,
+                    useAccount = useAccount,
                 )
 
                 val streamingData = playerResponse.objectValue("streamingData")
                 if (streamingData == null) {
+                    if (useAccount) {
+                        val status = playerResponse.objectValue("playabilityStatus")
+                        log.i {
+                            "Signed-in ${client.key} for $videoId: ${status?.stringValue("status")} " +
+                                "${status?.stringValue("reason")}"
+                        }
+                    }
                     lastPlayabilityStatus = playerResponse.objectValue("playabilityStatus")
                         ?: lastPlayabilityStatus
                     return@runCatching
@@ -376,11 +488,19 @@ class InAppYouTubeExtractor internal constructor(
                         fps = fps,
                         bitrate = bitrate,
                         ext = if (mimeType.contains("webm")) "webm" else "mp4",
+                        width = (format.numberValue("width") ?: 0.0).toInt(),
                     )
                 }
 
                 for (format in streamingData.listObjectValue("adaptiveFormats")) {
                     val url = format.stringValue("url") ?: continue
+                    // YouTube Premium's enhanced-bitrate 1080p is listed to everyone and scores highest on bitrate, but
+                    // without Premium its URL serves the start and then refuses the rest (a seek, or playing on): the
+                    // video hung at the same point every time while others opened at once (2026-10-31).
+                    if (isPremiumFormat(format)) {
+                        log.i { "skipping Premium format itag=${format.numberValue("itag")?.toInt()} for $videoId (${client.key})" }
+                        continue
+                    }
                     val mimeType = format.stringValue("mimeType").orEmpty()
                     val hasVideo = mimeType.contains("video/")
                     val hasAudio = mimeType.contains("audio/") || mimeType.startsWith("audio/")
@@ -406,6 +526,7 @@ class InAppYouTubeExtractor internal constructor(
                             fps = fps,
                             bitrate = bitrate,
                             ext = if (mimeType.contains("webm")) "webm" else "mp4",
+                            width = (format.numberValue("width") ?: 0.0).toInt(),
                         )
                     } else if (hasAudio) {
                         val bitrate = format.numberValue("bitrate")
@@ -423,9 +544,13 @@ class InAppYouTubeExtractor internal constructor(
                             fps = 0,
                             bitrate = bitrate,
                             ext = if (mimeType.contains("webm")) "webm" else "m4a",
+                            isOriginalAudio = format.isOriginalAudioTrack(url),
                         )
                     }
                 }
+            }.onFailure { error ->
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                log.i { "Player client ${client.key} failed for $videoId (account=$useAccount): ${error.message}" }
             }
         }
 
@@ -446,6 +571,7 @@ class InAppYouTubeExtractor internal constructor(
                     selectedVariantUrl = variant.url,
                     height = variant.height,
                     bandwidth = variant.bandwidth,
+                    width = variant.width,
                 )
                 if (
                     bestManifest == null ||
@@ -458,18 +584,32 @@ class InAppYouTubeExtractor internal constructor(
         }
 
         val bestProgressive = sortCandidates(progressive).firstOrNull()
+        if (singleUrl) {
+            // The master playlist, not the best variant: variant playlists carry video only, with
+            // audio as a rendition only the master links.
+            val single = bestManifest?.manifestUrl?.takeIf { it.isNotBlank() } ?: bestProgressive?.url
+            log.i { "Selected single-url stream manifest=${bestManifest != null} progressive=${bestProgressive?.height ?: 0}p" }
+            return single?.let { TrailerResolution.Available(TrailerPlaybackSource(videoUrl = it)) }
+                ?: TrailerResolution.Unavailable(TrailerUnavailableReason.UNKNOWN)
+        }
         val bestVideo = pickBestVideoForClient(
             items = adaptiveVideo,
             clientKey = PREFERRED_SEPARATE_CLIENT,
             preferredHeights = TrailerExtractionPlatform.preferredSeparateVideoHeights,
             preferClient = TrailerExtractionPlatform.preferSeparateVideoClient,
         )
-        val bestAudio = pickBestForClient(adaptiveAudio, PREFERRED_SEPARATE_CLIENT)
+        // Multi-language uploads (studio trailers, and anything YouTube has auto-dubbed) carry one
+        // audio format per language, and the highest-bitrate one was as likely to be a dub as the
+        // original: The Housemaid (2025) played in another language. Only the original track
+        // competes when YouTube says which one that is.
+        val originalAudio = adaptiveAudio.filter { it.isOriginalAudio == true }
+        val bestAudio = pickBestForClient(originalAudio.ifEmpty { adaptiveAudio }, PREFERRED_SEPARATE_CLIENT)
 
         log.i {
             "Selected trailer streams adaptive=${bestVideo?.height ?: 0}p/${bestVideo?.fps ?: 0}fps " +
                 "progressive=${bestProgressive?.height ?: 0}p manifest=${bestManifest?.height ?: 0}p " +
-                "separateAudio=${bestAudio != null}"
+                "separateAudio=${bestAudio != null} videoClient=${bestVideo?.client} audioClient=${bestAudio?.client} " +
+                "manifestClient=${bestManifest?.client}"
         }
 
         val source = TrailerExtractionPlatform.buildPlaybackSource(
@@ -478,7 +618,20 @@ class InAppYouTubeExtractor internal constructor(
             bestVideo = bestVideo,
             bestAudio = bestAudio,
         )
-        return source?.let { TrailerResolution.Available(it) }
+        // fork:trailer-quality - the upload's real ceiling (the HLS ladder often tops out above the
+        // adaptive rendition picked for playback), and whether the streams came from the client whose
+        // URLs are not cut off, so uploads of the same trailer can be compared.
+        // Measured on the short side, so a vertical 1080x1920 upload counts as 1080p, not 1920p, and
+        // it is flagged: cropped to fill a wide hero it shows only a soft middle slice.
+        val dimensions = listOfNotNull(
+            bestManifest?.let { it.width to it.height },
+            bestVideo?.let { it.width to it.height },
+            bestProgressive?.let { it.width to it.height },
+        )
+        val sharpest = dimensions.maxOfOrNull { (w, h) -> if (w > 0) minOf(w, h) else h } ?: 0
+        val portrait = dimensions.any { (w, h) -> w in 1 until h }
+        val reliable = bestVideo?.client == PREFERRED_SEPARATE_CLIENT || bestManifest?.client == PREFERRED_SEPARATE_CLIENT
+        return source?.let { TrailerResolution.Available(it.copy(heightPx = sharpest, reliable = reliable, portrait = portrait)) }
             ?: TrailerResolution.Unavailable(TrailerUnavailableReason.UNKNOWN)
     }
 
@@ -500,7 +653,14 @@ class InAppYouTubeExtractor internal constructor(
             playabilityText.contains("country") || playabilityText.contains("region") ->
                 TrailerUnavailableReason.REGION_BLOCKED
             status?.stringValue("status").equals("LOGIN_REQUIRED", ignoreCase = true) ||
-                playabilityText.contains("sign in to confirm") ->
+                playabilityText.contains("sign in to confirm") ||
+                // fork:ytmusic-login — the other ways YouTube words an age gate; all of them are
+                // cleared by a signed-in account, so they take the same retry.
+                status?.stringValue("status").let {
+                    it.equals("AGE_CHECK_REQUIRED", ignoreCase = true) ||
+                        it.equals("AGE_VERIFICATION_REQUIRED", ignoreCase = true)
+                } ||
+                AGE_GATE_PHRASES.any { playabilityText.contains(it) } ->
                 TrailerUnavailableReason.AGE_RESTRICTED
             playabilityText.contains("removed") || playabilityText.contains("private") ||
                 playabilityText.contains("no longer available") ->
@@ -514,18 +674,23 @@ class InAppYouTubeExtractor internal constructor(
         videoId: String,
         client: YouTubeClient,
         visitorData: String?,
+        useAccount: Boolean = false,
     ): JsonObject {
         val endpoint = "https://www.youtube.com/youtubei/v1/player" +
             apiKey?.let { "?key=${encodeUrlComponent(it)}" }.orEmpty()
 
+        val accountHeadersForRequest = if (useAccount) accountHeaders(YOUTUBE_ORIGIN) else emptyMap()
         val headers = buildMap {
             putAll(TrailerExtractionPlatform.defaultHeaders)
             put("content-type", "application/json")
-            put("origin", "https://www.youtube.com")
+            put("origin", YOUTUBE_ORIGIN)
             put("x-youtube-client-name", client.id)
             put("x-youtube-client-version", client.version)
             put("user-agent", client.userAgent)
             if (!visitorData.isNullOrBlank()) put("x-goog-visitor-id", visitorData)
+            // fork:ytmusic-login — cookie + SAPISIDHASH for the signed-in account (see the
+            // retry in extractPlaybackSource). Empty when nobody is signed in.
+            putAll(accountHeadersForRequest)
         }
 
         val payload = jsonObjectOf(
@@ -539,6 +704,12 @@ class InAppYouTubeExtractor internal constructor(
         )
 
         val response = performRequest(endpoint, "POST", headers, payload.toString(), TRAILER_REQUEST_TIMEOUT_MS)
+
+        if (accountHeadersForRequest.isNotEmpty()) {
+            // The saved session is kept either way; the settings page just shows a "sign in again" hint.
+            if (response.status == 401 || response.status == 403) YouTubeMusicAuth.onSessionRejected()
+            else if (response.ok) YouTubeMusicAuth.onSessionAccepted()
+        }
 
         if (!response.ok) {
             val preview = response.body.take(200)
@@ -695,6 +866,11 @@ class InAppYouTubeExtractor internal constructor(
         return width to height
     }
 
+    /** YouTube Premium's enhanced-bitrate formats: itag 356 (VP9 1080p) and anything labelled Premium. */
+    private fun isPremiumFormat(format: JsonObject): Boolean =
+        format.numberValue("itag")?.toInt() in PREMIUM_ITAGS ||
+            format.stringValue("qualityLabel")?.contains("premium", ignoreCase = true) == true
+
     private fun parseQualityLabel(label: String?): Int? {
         if (label.isNullOrBlank()) return null
         return QUALITY_LABEL_REGEX.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -839,6 +1015,25 @@ private fun parseUrl(input: String): ParsedUrl? {
         pathSegments = path.trim('/').split('/').filter { it.isNotBlank() },
         query = query,
     )
+}
+
+/**
+ * Whether an audio format is the original language. YouTube marks it in `audioTrack.audioIsDefault`
+ * and in the URL's `xtags` (`acont=original` against `acont=dubbed`/`dubbed-auto`); null when
+ * neither says, which is a video with only one audio language.
+ */
+private fun JsonObject.isOriginalAudioTrack(url: String): Boolean? {
+    val track = objectValue("audioTrack")
+    (track?.get("audioIsDefault") as? JsonPrimitive)?.content?.toBooleanStrictOrNull()?.let { return it }
+    val xtags = Regex("""[?&]xtags=([^&]*)""").find(url)?.groupValues?.get(1)
+        ?.replace("%3D", "=", ignoreCase = true)
+        ?.replace("%3A", ":", ignoreCase = true)
+        ?: return if (track != null) false else null
+    return when {
+        "acont=original" in xtags -> true
+        "acont=dubbed" in xtags || "acont=descriptive" in xtags -> false
+        else -> null
+    }
 }
 
 private fun JsonObject.objectValue(key: String): JsonObject? {

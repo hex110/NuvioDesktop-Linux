@@ -491,8 +491,8 @@ private fun discoverFamilyTitle(family: DiscoverRowFamily): String = when (famil
     DiscoverRowFamily.Because -> stringResource(Res.string.settings_discover_because_rows)
     DiscoverRowFamily.Favourites -> stringResource(Res.string.settings_discover_more_like_favourites)
     DiscoverRowFamily.Gems -> stringResource(Res.string.settings_discover_hidden_gems)
-    DiscoverRowFamily.TopPicks -> "Top Picks For You"
-    DiscoverRowFamily.People -> "More From / More With"
+    DiscoverRowFamily.TopPicks -> stringResource(Res.string.settings_discover_top_picks)
+    DiscoverRowFamily.People -> stringResource(Res.string.settings_discover_people_rows)
     DiscoverRowFamily.Trending -> stringResource(Res.string.settings_discover_trending_rows)
 }
 
@@ -504,9 +504,9 @@ private fun discoverFamilyDescription(family: DiscoverRowFamily): String = when 
         stringResource(Res.string.settings_discover_more_like_favourites_description)
     DiscoverRowFamily.Gems -> stringResource(Res.string.settings_discover_hidden_gems_description)
     DiscoverRowFamily.TopPicks ->
-        "Titles your watch history keeps being recommended alongside, weighted by how recently and how much you watched each title. A show you dropped counts against what it recommends."
+        stringResource(Res.string.settings_discover_top_picks_description)
     DiscoverRowFamily.People ->
-        "Film directors and actors who appear in three or more of the things you've watched, and their other work. Up to two directors and three actors."
+        stringResource(Res.string.settings_discover_people_rows_description)
     DiscoverRowFamily.Trending -> stringResource(Res.string.settings_discover_trending_rows_description)
 }
 
@@ -662,8 +662,9 @@ private fun DiscoverRowShell(
         ) {
             Text(
                 text = title,
+                modifier = settingsRowTitleAccentMask(title),
                 style = MaterialTheme.typography.bodyLarge,
-                color = tokens.colors.textPrimary,
+                color = settingsRowTitleColor(title),
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -1105,10 +1106,11 @@ private fun CustomDiscoverRefPicker(
                 // behind with no results under it looks like the search broke.
                 onDismissRequest = { query = "" },
                 properties = PopupProperties(focusable = false),
-                containerColor = tokens.colors.surfaceCard,
+                containerColor = tokens.colors.background,
                 tonalElevation = 0.dp,
                 shadowElevation = 0.dp,
-                border = BorderStroke(1.dp, tokens.colors.borderDefault),
+                border = BorderStroke(1.dp, SettingsSectionGlassEdge),
+                shape = SettingsSectionGlassShape,
                 modifier = Modifier.heightIn(max = RefResultsMaxHeight),
             ) {
                 results.take(MAX_REF_RESULTS).forEach { candidate ->

@@ -38,6 +38,7 @@ import nuvio.composeapp.generated.resources.cw_action_resync
 import nuvio.composeapp.generated.resources.cw_action_start_from_beginning
 import nuvio.composeapp.generated.resources.play_choose_source
 import org.jetbrains.compose.resources.stringResource
+import nuvio.composeapp.generated.resources.*
 
 @Composable
 fun NuvioContinueWatchingActionSheet(
@@ -54,6 +55,12 @@ fun NuvioContinueWatchingActionSheet(
     // local-library routes, it is the one that overrides stream auto-play, so it is offered
     // whether or not this item has a local file to alternate to.
     onChooseSource: (() -> Unit)? = null,
+    /**
+     * This title's own plain-click override ("Always play local file for this title" and so on),
+     * built by the caller since which entries apply depends on the configured preference. Shown as
+     * their own group after the play entries; empty for a title with no local copy.
+     */
+    titlePlaybackActions: List<PosterZoomOverlayAction> = emptyList(),
     onResync: () -> Unit,
     onRemove: () -> Unit,
     /** Queues this card in a playlist. Null hides the row. */
@@ -103,11 +110,12 @@ fun NuvioContinueWatchingActionSheet(
                 ),
             )
         }
+        addAll(titlePlaybackActions)
         onAddToPlaylist?.let { addToPlaylist ->
             add(
                 PosterZoomOverlayAction(
                     icon = Icons.AutoMirrored.Filled.PlaylistAdd,
-                    label = "Add to playlist",
+                    label = stringResource(Res.string.playlist_add_to_playlist),
                     onSelected = addToPlaylist,
                     group = 2,
                 ),

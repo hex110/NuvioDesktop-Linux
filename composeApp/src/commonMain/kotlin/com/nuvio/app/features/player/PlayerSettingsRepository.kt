@@ -4,6 +4,7 @@ import com.nuvio.app.core.ui.frameBudgetSetProbesEnabled
 import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.features.player.skip.NextEpisodeThresholdMode
 import com.nuvio.app.features.player.skip.SkipAutoAcceptMode
+import com.nuvio.app.features.streams.CwStreamCache
 import com.nuvio.app.features.streams.StreamAutoPlayMode
 import com.nuvio.app.features.streams.STREAM_PREFETCH_DEFAULT_CACHE_MINUTES
 import com.nuvio.app.features.streams.STREAM_PREFETCH_CACHE_MINUTE_VALUES
@@ -73,13 +74,15 @@ data class PlayerSettingsUiState(
     val desktopUltraHudEnabled: Boolean = false,
     val desktopOfficialHudEnabled: Boolean = false,
     // Minimal layout only: each control group sits on its own translucent pill.
-    val desktopMinimalHudPillsEnabled: Boolean = false,
+    val desktopMinimalHudPillsEnabled: Boolean = true,
     // Draw the round handle on the seek bar; off leaves the coloured fill edge as the marker.
     val desktopSeekHandleEnabled: Boolean = true,
     // The dark top/bottom edge gradients that fade in with the HUD so its controls stay legible.
     val desktopHudVignetteEnabled: Boolean = true,
     // HUD buttons the user switched off, by their controls.html `data-command`.
     val desktopHiddenHudButtons: Set<String> = emptySet(),
+    // The action row's buttons in the user's order, by `data-command`; empty keeps controls.html's order.
+    val desktopHudButtonOrder: List<String> = emptyList(),
     val desktopAlwaysShowClockEnabled: Boolean = false,
     // Adds the playing source (release name + provider) as the bottom row of the paused metadata
     // overlay. Off by default: the raw release strings are noisy, and only some viewers want them.
@@ -127,12 +130,14 @@ data class PlayerSettingsUiState(
     // audio-description tracks. Rejected tracks are hidden from the player's lists and never
     // selected automatically. See PlayerTrackRejectKeywords.kt.
     val rejectedSubtitleKeywords: Set<SubtitleRejectKeyword> = emptySet(),
-    val rejectedAudioKeywords: Set<AudioRejectKeyword> = emptySet(),
+    val rejectedAudioKeywords: Set<AudioRejectKeyword> = DEFAULT_REJECTED_AUDIO_KEYWORDS,
     val streamReuseLastLinkEnabled: Boolean = false,
     val streamReuseLastLinkCacheHours: Int = 24,
     val streamPrefetchScope: StreamPrefetchScope = StreamPrefetchScope.OFF,
     val streamPrefetchCacheMinutes: Int = STREAM_PREFETCH_DEFAULT_CACHE_MINUTES,
     val streamPrefetchResolveLinks: Boolean = true,
+    val streamCwCacheEnabled: Boolean = true,
+    val preloadNextEpisodeSources: Boolean = false,
     val decoderPriority: Int = 1,
     val nvidiaRtxSuperResolutionEnabled: Boolean = false,
     val nvidiaRtxHdrEnabled: Boolean = false,
@@ -195,6 +200,13 @@ data class PlayerSettingsUiState(
     val iosSaturation: Int = 0,
     val iosGamma: Int = 0,
     val desktopHdrMode: DesktopHdrMode = DesktopHdrMode.Auto,
+    /**
+     * mpv's own SDR-to-HDR expansion (`inverse-tone-mapping`), for any GPU. Only on SDR video with
+     * Windows HDR on, and never while RTX Video True HDR is running, which it is an alternative to.
+     */
+    val desktopInverseToneMappingEnabled: Boolean = false,
+    /** The `target-peak` the expansion aims for, in nits. */
+    val desktopInverseToneMappingPeakNits: Int = DESKTOP_INVERSE_TONE_MAPPING_DEFAULT_PEAK_NITS,
     val desktopColorProfile: DesktopColorProfile = DesktopColorProfile.Neutral,
     /**
      * mpv equalizer offsets for [DesktopColorProfile.Custom]. Ignored by every other profile, so
@@ -283,10 +295,11 @@ object PlayerSettingsRepository {
     private var desktopMinimalHudEnabled = true
     private var desktopUltraHudEnabled = false
     private var desktopOfficialHudEnabled = false
-    private var desktopMinimalHudPillsEnabled = false
+    private var desktopMinimalHudPillsEnabled = true
     private var desktopSeekHandleEnabled = true
     private var desktopHudVignetteEnabled = true
     private var desktopHiddenHudButtons: Set<String> = emptySet()
+    private var desktopHudButtonOrder: List<String> = emptyList()
     private var desktopAlwaysShowClockEnabled = false
     private var desktopPauseOverlaySourceEnabled = false
     private var desktopPlaybackSpeedFineIncrementsEnabled = false
@@ -312,12 +325,14 @@ object PlayerSettingsRepository {
     private var addonSubtitleStartupMode = AddonSubtitleStartupMode.ALL_SUBTITLES
     private var preferAddonSubtitles = false
     private var rejectedSubtitleKeywords: Set<SubtitleRejectKeyword> = emptySet()
-    private var rejectedAudioKeywords: Set<AudioRejectKeyword> = emptySet()
+    private var rejectedAudioKeywords: Set<AudioRejectKeyword> = DEFAULT_REJECTED_AUDIO_KEYWORDS
     private var streamReuseLastLinkEnabled = false
     private var streamReuseLastLinkCacheHours = 24
     private var streamPrefetchScope = StreamPrefetchScope.OFF
     private var streamPrefetchCacheMinutes = STREAM_PREFETCH_DEFAULT_CACHE_MINUTES
     private var streamPrefetchResolveLinks = true
+    private var streamCwCacheEnabled = true
+    private var preloadNextEpisodeSources = false
     private var decoderPriority = 1
     private var nvidiaRtxSuperResolutionEnabled = false
     private var nvidiaRtxHdrEnabled = false
@@ -369,6 +384,8 @@ object PlayerSettingsRepository {
     private var iosSaturation = 0
     private var iosGamma = 0
     private var desktopHdrMode = DesktopHdrMode.Auto
+    private var desktopInverseToneMappingEnabled = false
+    private var desktopInverseToneMappingPeakNits = DESKTOP_INVERSE_TONE_MAPPING_DEFAULT_PEAK_NITS
     private var desktopColorProfile = DesktopColorProfile.Neutral
     private var desktopColorContrast = 0
     private var desktopColorBrightness = 0
@@ -418,6 +435,7 @@ object PlayerSettingsRepository {
         // setting; nothing speculatively gathered for the old one is answering for this one.
         StreamPrefetchCache.clear()
         StreamPrefetchService.reset()
+        CwStreamCache.onProfileChanged()
         loadFromDisk()
     }
 
@@ -431,10 +449,11 @@ object PlayerSettingsRepository {
         desktopMinimalHudEnabled = true
         desktopUltraHudEnabled = false
         desktopOfficialHudEnabled = false
-        desktopMinimalHudPillsEnabled = false
+        desktopMinimalHudPillsEnabled = true
         desktopSeekHandleEnabled = true
         desktopHudVignetteEnabled = true
         desktopHiddenHudButtons = emptySet()
+        desktopHudButtonOrder = emptyList()
         desktopAlwaysShowClockEnabled = false
         desktopPauseOverlaySourceEnabled = false
         desktopPlaybackSpeedFineIncrementsEnabled = false
@@ -460,12 +479,14 @@ object PlayerSettingsRepository {
         addonSubtitleStartupMode = AddonSubtitleStartupMode.ALL_SUBTITLES
         preferAddonSubtitles = false
         rejectedSubtitleKeywords = emptySet()
-        rejectedAudioKeywords = emptySet()
+        rejectedAudioKeywords = DEFAULT_REJECTED_AUDIO_KEYWORDS
         streamReuseLastLinkEnabled = false
         streamReuseLastLinkCacheHours = 24
         streamPrefetchScope = StreamPrefetchScope.OFF
         streamPrefetchCacheMinutes = STREAM_PREFETCH_DEFAULT_CACHE_MINUTES
         streamPrefetchResolveLinks = true
+        streamCwCacheEnabled = true
+        preloadNextEpisodeSources = false
         decoderPriority = 1
         nvidiaRtxSuperResolutionEnabled = false
         nvidiaRtxHdrEnabled = false
@@ -517,6 +538,8 @@ object PlayerSettingsRepository {
         iosSaturation = 0
         iosGamma = 0
         desktopHdrMode = DesktopHdrMode.Auto
+        desktopInverseToneMappingEnabled = false
+        desktopInverseToneMappingPeakNits = DESKTOP_INVERSE_TONE_MAPPING_DEFAULT_PEAK_NITS
         desktopColorProfile = DesktopColorProfile.Neutral
         desktopColorContrast = 0
         desktopColorBrightness = 0
@@ -575,9 +598,15 @@ object PlayerSettingsRepository {
             ?: (storedLegacyHud == null && storedUltraHud == null && storedOfficialHud == null)
         desktopUltraHudEnabled = storedUltraHud ?: false
         desktopOfficialHudEnabled = storedOfficialHud ?: false
-        desktopMinimalHudPillsEnabled = PlayerSettingsStorage.loadDesktopMinimalHudPillsEnabled() ?: false
+        desktopMinimalHudPillsEnabled = PlayerSettingsStorage.loadDesktopMinimalHudPillsEnabled() ?: true
         desktopSeekHandleEnabled = PlayerSettingsStorage.loadDesktopSeekHandleEnabled() ?: true
         desktopHudVignetteEnabled = PlayerSettingsStorage.loadDesktopHudVignetteEnabled() ?: true
+        desktopHudButtonOrder = PlayerSettingsStorage.loadDesktopHudButtonOrder()
+            ?.split(',')
+            ?.map(String::trim)
+            ?.filter(String::isNotEmpty)
+            ?.distinct()
+            .orEmpty()
         desktopHiddenHudButtons = PlayerSettingsStorage.loadDesktopHiddenHudButtons()
             ?.split(',')
             ?.map(String::trim)
@@ -675,8 +704,10 @@ object PlayerSettingsRepository {
         preferAddonSubtitles = PlayerSettingsStorage.loadPreferAddonSubtitles() ?: false
         rejectedSubtitleKeywords =
             parseSubtitleRejectKeywords(PlayerSettingsStorage.loadRejectedSubtitleKeywords())
-        rejectedAudioKeywords =
-            parseAudioRejectKeywords(PlayerSettingsStorage.loadRejectedAudioKeywords())
+        // Null only when never saved; clearing every keyword stores an empty set, which stays empty.
+        rejectedAudioKeywords = PlayerSettingsStorage.loadRejectedAudioKeywords()
+            ?.let(::parseAudioRejectKeywords)
+            ?: DEFAULT_REJECTED_AUDIO_KEYWORDS
         streamReuseLastLinkEnabled = PlayerSettingsStorage.loadStreamReuseLastLinkEnabled() ?: false
         streamPrefetchScope = PlayerSettingsStorage.loadStreamPrefetchScope()
             ?.let { runCatching { StreamPrefetchScope.valueOf(it) }.getOrNull() }
@@ -685,6 +716,8 @@ object PlayerSettingsRepository {
             ?.takeIf { it in STREAM_PREFETCH_CACHE_MINUTE_VALUES }
             ?: STREAM_PREFETCH_DEFAULT_CACHE_MINUTES
         streamPrefetchResolveLinks = PlayerSettingsStorage.loadStreamPrefetchResolveLinks() ?: true
+        streamCwCacheEnabled = PlayerSettingsStorage.loadStreamCwCacheEnabled() ?: true
+        preloadNextEpisodeSources = PlayerSettingsStorage.loadPreloadNextEpisodeSources() ?: false
         streamReuseLastLinkCacheHours = PlayerSettingsStorage.loadStreamReuseLastLinkCacheHours() ?: 24
         decoderPriority = PlayerSettingsStorage.loadDecoderPriority() ?: 1
         nvidiaRtxSuperResolutionEnabled = PlayerSettingsStorage.loadNvidiaRtxSuperResolutionEnabled() ?: false
@@ -780,6 +813,10 @@ object PlayerSettingsRepository {
         desktopHdrMode = PlayerSettingsStorage.loadDesktopHdrMode()
             ?.let { runCatching { DesktopHdrMode.valueOf(it) }.getOrNull() }
             ?: DesktopHdrMode.Auto
+        desktopInverseToneMappingEnabled = PlayerSettingsStorage.loadDesktopInverseToneMappingEnabled() ?: false
+        desktopInverseToneMappingPeakNits = PlayerSettingsStorage.loadDesktopInverseToneMappingPeakNits()
+            ?.coerceIn(DESKTOP_INVERSE_TONE_MAPPING_PEAK_RANGE)
+            ?: DESKTOP_INVERSE_TONE_MAPPING_DEFAULT_PEAK_NITS
         desktopColorProfile = PlayerSettingsStorage.loadDesktopColorProfile()
             ?.let { runCatching { DesktopColorProfile.valueOf(it) }.getOrNull() }
             ?: DesktopColorProfile.Neutral
@@ -934,6 +971,16 @@ object PlayerSettingsRepository {
         desktopHiddenHudButtons = next
         publish()
         PlayerSettingsStorage.saveDesktopHiddenHudButtons(next.sorted().joinToString(","))
+    }
+
+    /** [order] is every action-row command, first to last; empty goes back to the HUD's own order. */
+    fun setDesktopHudButtonOrder(order: List<String>) {
+        ensureLoaded()
+        val next = order.map(String::trim).filter(String::isNotEmpty).distinct()
+        if (next == desktopHudButtonOrder) return
+        desktopHudButtonOrder = next
+        publish()
+        PlayerSettingsStorage.saveDesktopHudButtonOrder(next.joinToString(","))
     }
 
     fun setDesktopHudLayout(layout: DesktopHudLayout) {
@@ -1280,6 +1327,24 @@ object PlayerSettingsRepository {
         streamPrefetchResolveLinks = enabled
         publish()
         PlayerSettingsStorage.saveStreamPrefetchResolveLinks(enabled)
+    }
+
+    fun setStreamCwCacheEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (streamCwCacheEnabled == enabled) return
+        streamCwCacheEnabled = enabled
+        publish()
+        PlayerSettingsStorage.saveStreamCwCacheEnabled(enabled)
+        // Off means off: nothing kept on disk for a feature the user turned away from.
+        if (!enabled) CwStreamCache.clear()
+    }
+
+    fun setPreloadNextEpisodeSources(enabled: Boolean) {
+        ensureLoaded()
+        if (preloadNextEpisodeSources == enabled) return
+        preloadNextEpisodeSources = enabled
+        publish()
+        PlayerSettingsStorage.savePreloadNextEpisodeSources(enabled)
     }
 
     fun setDecoderPriority(priority: Int) {
@@ -1745,6 +1810,7 @@ object PlayerSettingsRepository {
             desktopSeekHandleEnabled = desktopSeekHandleEnabled,
             desktopHudVignetteEnabled = desktopHudVignetteEnabled,
             desktopHiddenHudButtons = desktopHiddenHudButtons,
+            desktopHudButtonOrder = desktopHudButtonOrder,
             desktopAlwaysShowClockEnabled = desktopAlwaysShowClockEnabled,
             desktopPauseOverlaySourceEnabled = desktopPauseOverlaySourceEnabled,
             desktopPlaybackSpeedFineIncrementsEnabled = desktopPlaybackSpeedFineIncrementsEnabled,
@@ -1775,6 +1841,8 @@ object PlayerSettingsRepository {
             streamPrefetchScope = streamPrefetchScope,
             streamPrefetchCacheMinutes = streamPrefetchCacheMinutes,
             streamPrefetchResolveLinks = streamPrefetchResolveLinks,
+            streamCwCacheEnabled = streamCwCacheEnabled,
+            preloadNextEpisodeSources = preloadNextEpisodeSources,
             streamReuseLastLinkCacheHours = streamReuseLastLinkCacheHours,
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
@@ -1827,6 +1895,8 @@ object PlayerSettingsRepository {
             iosSaturation = iosSaturation,
             iosGamma = iosGamma,
             desktopHdrMode = desktopHdrMode,
+            desktopInverseToneMappingEnabled = desktopInverseToneMappingEnabled,
+            desktopInverseToneMappingPeakNits = desktopInverseToneMappingPeakNits,
             desktopColorProfile = desktopColorProfile,
             desktopColorContrast = desktopColorContrast,
             desktopColorBrightness = desktopColorBrightness,
@@ -1873,6 +1943,23 @@ object PlayerSettingsRepository {
         desktopHdrMode = mode
         publish()
         PlayerSettingsStorage.saveDesktopHdrMode(mode.name)
+    }
+
+    fun setDesktopInverseToneMappingEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (desktopInverseToneMappingEnabled == enabled) return
+        desktopInverseToneMappingEnabled = enabled
+        publish()
+        PlayerSettingsStorage.saveDesktopInverseToneMappingEnabled(enabled)
+    }
+
+    fun setDesktopInverseToneMappingPeakNits(nits: Int) {
+        ensureLoaded()
+        val clamped = nits.coerceIn(DESKTOP_INVERSE_TONE_MAPPING_PEAK_RANGE)
+        if (desktopInverseToneMappingPeakNits == clamped) return
+        desktopInverseToneMappingPeakNits = clamped
+        publish()
+        PlayerSettingsStorage.saveDesktopInverseToneMappingPeakNits(clamped)
     }
 
     fun setDesktopColorProfile(profile: DesktopColorProfile) {
@@ -2243,6 +2330,9 @@ object PlayerSettingsRepository {
         }
     }
 }
+
+const val DESKTOP_INVERSE_TONE_MAPPING_DEFAULT_PEAK_NITS = 400
+val DESKTOP_INVERSE_TONE_MAPPING_PEAK_RANGE = 200..1000
 
 // The RTX settings as the player applies them: the menu's session toggle wins over the saved one.
 val PlayerSettingsUiState.effectiveRtxVsrEnabled: Boolean

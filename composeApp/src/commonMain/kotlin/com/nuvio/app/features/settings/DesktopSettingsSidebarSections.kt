@@ -50,16 +50,16 @@ internal fun desktopSettingsSidebarSubItems(
     return when (sidebarPage) {
         SettingsPage.Playback -> listOfNotNull(
             if (isWindows) section(SettingsPage.Playback, Res.string.settings_playback_nvidia_rtx_video_section) else null,
-            section(SettingsPage.Playback, Res.string.settings_playback_section_player),
+            if (isDesktop) section(SettingsPage.Playback, Res.string.settings_playback_section_picture_audio) else null,
             if (isDesktop) section(SettingsPage.Playback, Res.string.settings_playback_section_anime) else null,
             if (isDesktop) section(SettingsPage.Playback, Res.string.settings_playback_section_advanced) else null,
-            section(SettingsPage.Playback, Res.string.settings_playback_section_subtitle_audio),
-            section(SettingsPage.Playback, Res.string.settings_playback_section_subtitle_rendering),
-            if (P2pSettingsRepository.isVisible) section(SettingsPage.Playback, Res.string.settings_p2p_title) else null,
-            section(SettingsPage.Playback, Res.string.settings_playback_section_stream_selection),
-            section(SettingsPage.Playback, Res.string.settings_playback_section_stream_auto_play),
-            section(SettingsPage.Playback, Res.string.settings_playback_section_skip_segments),
-            section(SettingsPage.Playback, Res.string.settings_playback_section_next_episode),
+        )
+        SettingsPage.Player -> listOf(
+            section(SettingsPage.Player, Res.string.settings_playback_section_player),
+            section(SettingsPage.Player, Res.string.settings_playback_section_subtitle_audio),
+            section(SettingsPage.Player, Res.string.settings_playback_section_subtitle_rendering),
+            section(SettingsPage.Player, Res.string.settings_playback_section_skip_segments),
+            section(SettingsPage.Player, Res.string.settings_playback_section_next_episode),
         )
         SettingsPage.Homescreen -> {
             val catalogCount = homescreenItems.count { !it.isCollection }
@@ -74,9 +74,22 @@ internal fun desktopSettingsSidebarSubItems(
                 section(SettingsPage.Homescreen, Res.string.settings_home_display_mode),
                 section(SettingsPage.Homescreen, Res.string.settings_homescreen_section_hero),
                 section(SettingsPage.Homescreen, Res.string.settings_homescreen_section_search),
+                // Continue Watching's panel, merged in above hero sources (see desktopMergedInto).
+                section(SettingsPage.Homescreen, Res.string.compose_settings_page_continue_watching),
                 section(SettingsPage.Homescreen, Res.string.settings_homescreen_section_hero_sources),
                 section(SettingsPage.Homescreen, catalogsTitle),
             )
+        }
+        SettingsPage.Addons -> if (AppFeaturePolicy.pluginsEnabled) {
+            listOf(
+                DesktopSettingsSidebarSubItem(
+                    label = stringResource(Res.string.compose_settings_page_plugins),
+                    page = SettingsPage.Addons,
+                    anchor = SettingsScrollAnchor.searchKey("plugins"),
+                ),
+            )
+        } else {
+            emptyList()
         }
         SettingsPage.Appearance -> listOf(
             section(SettingsPage.Appearance, Res.string.settings_appearance_section_theme),
@@ -84,15 +97,8 @@ internal fun desktopSettingsSidebarSubItems(
             section(SettingsPage.Appearance, Res.string.settings_appearance_section_display),
             section(SettingsPage.Appearance, Res.string.settings_poster_card_style),
             section(SettingsPage.Appearance, Res.string.settings_appearance_card_depth),
-        )
-        SettingsPage.ContinueWatching -> listOf(
-            section(SettingsPage.ContinueWatching, Res.string.settings_continue_watching_section_card_style),
-            section(SettingsPage.ContinueWatching, Res.string.settings_continue_watching_section_default_action),
-            section(SettingsPage.ContinueWatching, Res.string.settings_cw_source_section),
-            section(SettingsPage.ContinueWatching, Res.string.settings_continue_watching_section_up_next_behavior),
-            section(SettingsPage.ContinueWatching, Res.string.settings_continue_watching_section_on_launch),
-            section(SettingsPage.ContinueWatching, Res.string.settings_advanced_section_cache),
-            section(SettingsPage.ContinueWatching, Res.string.settings_continue_watching_section_sort_order),
+            // Detail Page's panel, merged in at the end (see desktopMergedInto).
+            section(SettingsPage.Appearance, Res.string.compose_settings_page_meta_screen),
         )
         SettingsPage.Account -> listOfNotNull(
             section(SettingsPage.Account, Res.string.compose_settings_page_account),
@@ -107,8 +113,7 @@ internal fun desktopSettingsSidebarSubItems(
             section(SettingsPage.Advanced, Res.string.settings_advanced_section_cache),
         )
         SettingsPage.Integrations -> listOfNotNull(
-            section(SettingsPage.Integrations, Res.string.settings_library_source_section),
-            section(SettingsPage.Integrations, Res.string.settings_calendar_source_section),
+            section(SettingsPage.Integrations, Res.string.settings_integrations_sources_section),
             section(SettingsPage.Integrations, Res.string.settings_integrations_section_title),
             subPage(SettingsPage.TmdbEnrichment),
             subPage(SettingsPage.MdbListRatings),
@@ -118,16 +123,20 @@ internal fun desktopSettingsSidebarSubItems(
             subPage(SettingsPage.TraktAuthentication),
             subPage(SettingsPage.SimklAuthentication),
             subPage(SettingsPage.YamtrackAuthentication),
+            if (isDesktop) subPage(SettingsPage.YouTubeAccount) else null,
             if (isDesktop) subPage(SettingsPage.Seekr) else null,
             if (isDesktop) subPage(SettingsPage.Lights) else null,
             if (isDesktop) subPage(SettingsPage.DiscordPresence) else null,
         )
-        SettingsPage.Streams -> listOf(
+        SettingsPage.Streams -> listOfNotNull(
             // The page's own "Stream scoring" section holds only the row that opens the sub-page,
             // so the sub-page is the one entry - listing both put the same label twice.
             section(SettingsPage.Streams, Res.string.settings_stream_badges_section),
             section(SettingsPage.Streams, Res.string.settings_stream_display_section),
             subPage(SettingsPage.StreamScoring),
+            if (P2pSettingsRepository.isVisible) section(SettingsPage.Streams, Res.string.settings_p2p_title) else null,
+            section(SettingsPage.Streams, Res.string.settings_playback_section_stream_selection),
+            section(SettingsPage.Streams, Res.string.settings_playback_section_stream_auto_play),
         )
         SettingsPage.Discover -> listOf(
             section(SettingsPage.Discover, Res.string.settings_discover_section_row_order),
@@ -144,6 +153,20 @@ internal fun desktopSettingsSidebarSubItems(
         SettingsPage.Screensaver -> listOf(
             section(SettingsPage.Screensaver, Res.string.settings_screensaver_section_title),
             section(SettingsPage.Screensaver, Res.string.settings_screensaver_section_shutdown),
+        )
+        SettingsPage.Music -> listOf( // fork:music
+            section(SettingsPage.Music, Res.string.settings_music_section_general),
+            section(SettingsPage.Music, Res.string.settings_music_section_sources),
+            section(SettingsPage.Music, Res.string.settings_music_section_playback),
+        )
+        SettingsPage.Preshow -> listOf(
+            sectionTitled(SettingsPage.Preshow, PRESHOW_SECTION_RUNNING_ORDER),
+            section(SettingsPage.Preshow, Res.string.settings_preshow_section_trailers),
+            sectionTitled(SettingsPage.Preshow, PRESHOW_SECTION_RATING_CARD),
+            sectionTitled(SettingsPage.Preshow, PRESHOW_SECTION_PREVIOUSLY_ON),
+            sectionTitled(SettingsPage.Preshow, PRESHOW_SECTION_POST_SHOW),
+            section(SettingsPage.Preshow, Res.string.settings_theme_song_section),
+            sectionTitled(SettingsPage.Preshow, PRESHOW_SECTION_CLIP_SOURCES),
         )
         SettingsPage.Games -> listOf(
             section(SettingsPage.Games, Res.string.settings_games_title),
@@ -165,6 +188,7 @@ internal fun desktopSettingsSidebarSubItems(
             section(SettingsPage.LocalLibrary, Res.string.settings_local_library_catalogs_title),
         )
         SettingsPage.AutoDownloads -> listOf(
+            // The downloads list, on top since Downloads took this page over.
             section(SettingsPage.AutoDownloads, Res.string.compose_settings_root_downloads_title),
             section(SettingsPage.AutoDownloads, Res.string.library_downloads_section_settings),
             section(SettingsPage.AutoDownloads, Res.string.library_downloads_section_monitored),

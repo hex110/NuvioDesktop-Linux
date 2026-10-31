@@ -31,6 +31,7 @@ internal actual object PlayerSettingsStorage {
     private const val desktopSeekHandleEnabledKey = "desktop_seek_handle_enabled"
     private const val desktopHudVignetteEnabledKey = "desktop_hud_vignette_enabled"
     private const val desktopHiddenHudButtonsKey = "desktop_hidden_hud_buttons"
+    private const val desktopHudButtonOrderKey = "desktop_hud_button_order"
     private const val desktopAlwaysShowClockEnabledKey = "desktop_always_show_clock_enabled"
     private const val desktopPauseOverlaySourceEnabledKey = "desktop_pause_overlay_source_enabled"
     private const val desktopPlaybackSpeedFineIncrementsEnabledKey = "desktop_playback_speed_fine_increments_enabled"
@@ -82,6 +83,8 @@ internal actual object PlayerSettingsStorage {
     private const val streamPrefetchScopeKey = "stream_prefetch_scope"
     private const val streamPrefetchCacheMinutesKey = "stream_prefetch_cache_minutes"
     private const val streamPrefetchResolveLinksKey = "stream_prefetch_resolve_links"
+    private const val streamCwCacheEnabledKey = "stream_cw_cache_enabled"
+    private const val preloadNextEpisodeSourcesKey = "preload_next_episode_sources"
     private const val decoderPriorityKey = "decoder_priority"
     private const val nvidiaRtxSuperResolutionEnabledKey = "nvidia_rtx_super_resolution_enabled"
     private const val mapDV7ToHevcKey = "map_dv7_to_hevc"
@@ -207,6 +210,8 @@ internal actual object PlayerSettingsStorage {
         streamPrefetchScopeKey,
         streamPrefetchCacheMinutesKey,
         streamPrefetchResolveLinksKey,
+        streamCwCacheEnabledKey,
+        preloadNextEpisodeSourcesKey,
         decoderPriorityKey,
         nvidiaRtxSuperResolutionEnabledKey,
         mapDV7ToHevcKey,
@@ -289,6 +294,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveDesktopHudVignetteEnabled(enabled: Boolean) = saveBoolean(desktopHudVignetteEnabledKey, enabled)
     actual fun loadDesktopHiddenHudButtons(): String? = loadString(desktopHiddenHudButtonsKey)
     actual fun saveDesktopHiddenHudButtons(commands: String) = saveString(desktopHiddenHudButtonsKey, commands)
+    actual fun loadDesktopHudButtonOrder(): String? = loadString(desktopHudButtonOrderKey)
+    actual fun saveDesktopHudButtonOrder(commands: String) = saveString(desktopHudButtonOrderKey, commands)
     actual fun loadDesktopAlwaysShowClockEnabled(): Boolean? = loadBoolean(desktopAlwaysShowClockEnabledKey)
     actual fun saveDesktopAlwaysShowClockEnabled(enabled: Boolean) = saveBoolean(desktopAlwaysShowClockEnabledKey, enabled)
     actual fun loadDesktopPauseOverlaySourceEnabled(): Boolean? = loadBoolean(desktopPauseOverlaySourceEnabledKey)
@@ -416,6 +423,10 @@ internal actual object PlayerSettingsStorage {
     actual fun saveStreamPrefetchCacheMinutes(minutes: Int) = saveInt(streamPrefetchCacheMinutesKey, minutes)
     actual fun loadStreamPrefetchResolveLinks(): Boolean? = loadBoolean(streamPrefetchResolveLinksKey)
     actual fun saveStreamPrefetchResolveLinks(enabled: Boolean) = saveBoolean(streamPrefetchResolveLinksKey, enabled)
+    actual fun loadStreamCwCacheEnabled(): Boolean? = loadBoolean(streamCwCacheEnabledKey)
+    actual fun saveStreamCwCacheEnabled(enabled: Boolean) = saveBoolean(streamCwCacheEnabledKey, enabled)
+    actual fun loadPreloadNextEpisodeSources(): Boolean? = loadBoolean(preloadNextEpisodeSourcesKey)
+    actual fun savePreloadNextEpisodeSources(enabled: Boolean) = saveBoolean(preloadNextEpisodeSourcesKey, enabled)
     actual fun loadDecoderPriority(): Int? = loadInt(decoderPriorityKey)
     actual fun saveDecoderPriority(priority: Int) = saveInt(decoderPriorityKey, priority)
 
@@ -520,6 +531,10 @@ internal actual object PlayerSettingsStorage {
     actual fun saveIosGamma(value: Int) = saveInt(iosGammaKey, value)
     actual fun loadDesktopHdrMode(): String? = loadString(desktopHdrModeKey)
     actual fun saveDesktopHdrMode(mode: String) = saveString(desktopHdrModeKey, mode)
+    actual fun loadDesktopInverseToneMappingEnabled(): Boolean? = loadBoolean("desktop_inverse_tone_mapping_enabled")
+    actual fun saveDesktopInverseToneMappingEnabled(enabled: Boolean) = saveBoolean("desktop_inverse_tone_mapping_enabled", enabled)
+    actual fun loadDesktopInverseToneMappingPeakNits(): Int? = loadInt("desktop_inverse_tone_mapping_peak_nits")
+    actual fun saveDesktopInverseToneMappingPeakNits(nits: Int) = saveInt("desktop_inverse_tone_mapping_peak_nits", nits)
     actual fun loadDesktopColorProfile(): String? = loadString(desktopColorProfileKey)
     actual fun saveDesktopColorProfile(profile: String) = saveString(desktopColorProfileKey, profile)
     actual fun loadDesktopColorContrast(): Int? = loadInt(desktopColorContrastKey)
@@ -657,6 +672,8 @@ internal actual object PlayerSettingsStorage {
         loadStreamPrefetchScope()?.let { put(streamPrefetchScopeKey, encodeSyncString(it)) }
         loadStreamPrefetchCacheMinutes()?.let { put(streamPrefetchCacheMinutesKey, encodeSyncInt(it)) }
         loadStreamPrefetchResolveLinks()?.let { put(streamPrefetchResolveLinksKey, encodeSyncBoolean(it)) }
+        loadStreamCwCacheEnabled()?.let { put(streamCwCacheEnabledKey, encodeSyncBoolean(it)) }
+        loadPreloadNextEpisodeSources()?.let { put(preloadNextEpisodeSourcesKey, encodeSyncBoolean(it)) }
         loadDecoderPriority()?.let { put(decoderPriorityKey, encodeSyncInt(it)) }
         loadNvidiaRtxSuperResolutionEnabled()?.let { put(nvidiaRtxSuperResolutionEnabledKey, encodeSyncBoolean(it)) }
         loadMapDV7ToHevc()?.let { put(mapDV7ToHevcKey, encodeSyncBoolean(it)) }
@@ -752,6 +769,8 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(streamPrefetchScopeKey)?.let(::saveStreamPrefetchScope)
         payload.decodeSyncInt(streamPrefetchCacheMinutesKey)?.let(::saveStreamPrefetchCacheMinutes)
         payload.decodeSyncBoolean(streamPrefetchResolveLinksKey)?.let(::saveStreamPrefetchResolveLinks)
+        payload.decodeSyncBoolean(streamCwCacheEnabledKey)?.let(::saveStreamCwCacheEnabled)
+        payload.decodeSyncBoolean(preloadNextEpisodeSourcesKey)?.let(::savePreloadNextEpisodeSources)
         payload.decodeSyncInt(decoderPriorityKey)?.let(::saveDecoderPriority)
         payload.decodeSyncBoolean(nvidiaRtxSuperResolutionEnabledKey)?.let(::saveNvidiaRtxSuperResolutionEnabled)
         payload.decodeSyncBoolean(mapDV7ToHevcKey)?.let(::saveMapDV7ToHevc)

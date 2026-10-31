@@ -1,5 +1,6 @@
 package com.nuvio.app.features.streams
 
+import com.nuvio.app.core.ui.smoothBorder
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
@@ -140,6 +141,7 @@ import com.nuvio.app.features.librarypvr.videoExtension
 import com.nuvio.app.features.locallibrary.LocalFolder
 import com.nuvio.app.features.locallibrary.LocalFolderType
 import com.nuvio.app.features.metadata.isAnimeNativeId
+import com.nuvio.app.features.metadata.nativeAnimeEntryEpisode
 import com.nuvio.app.features.locallibrary.LocalLibraryRepository
 import kotlinx.coroutines.CoroutineScope
 import com.nuvio.app.features.player.PlaybackStartTrace
@@ -274,6 +276,11 @@ fun StreamsScreen(
         }
     }
     val isEpisode = seasonNumber != null && episodeNumber != null
+    // Library downloads number episodes in the opened entry's own coordinates; see
+    // nativeAnimeEntryEpisode. Everything else (lookup, resume, badges) keeps the canonical pair.
+    val entryEpisodeNumber = remember(parentMetaId, videoId) { nativeAnimeEntryEpisode(parentMetaId, videoId) }
+    val librarySeasonNumber = if (entryEpisodeNumber != null) 1 else seasonNumber
+    val libraryEpisodeNumber = entryEpisodeNumber ?: episodeNumber
     val clipboardManager = LocalClipboardManager.current
     val uriHandler = LocalUriHandler.current
     val downloadScope = rememberCoroutineScope()
@@ -393,6 +400,19 @@ fun StreamsScreen(
         val index = selectableStreams.indexOfFirst { it === target }
         if (index >= 0) focusedStreamIndex = index
     }
+    // Right from the last addon chip walks on to these; Down or Left past the first returns to the chips and list.
+    var headerFocus by remember(videoId) { mutableStateOf<StreamPickerHeaderControl?>(null) }
+    var openSortTick by remember(videoId) { mutableIntStateOf(0) }
+    val headerControls = buildList {
+        add(StreamPickerHeaderControl.Sort)
+        if (isPanel) {
+            if (panelTwoColumnsFit) add(StreamPickerHeaderControl.Layout)
+            add(StreamPickerHeaderControl.Refresh)
+            add(StreamPickerHeaderControl.Close)
+        }
+    }
+    // A chip clicked with the mouse puts the keyboard back on the chips.
+    LaunchedEffect(uiState.selectedFilter) { headerFocus = null }
 
     LaunchedEffect(type, videoId, seasonNumber, episodeNumber, manualSelection) {
         StreamsRepository.load(
@@ -404,6 +424,12 @@ fun StreamsScreen(
             episode = episodeNumber,
             manualSelection = manualSelection,
             preferLocalStreams = preferLocalStreams,
+        )
+        // The viewer has committed to playing this title: warm the pre-show trivia now so it is
+        // cached by the time playback opens. No-op unless the feature is enabled and configured.
+        com.nuvio.app.features.preroll.TriviaRepository.prefetchFor(
+            type = type,
+            metaId = parentMetaId ?: videoId,
         )
     }
 
@@ -546,8 +572,8 @@ fun StreamsScreen(
                 val result = SeasonPackGrabService.inspect(
                     stream = stream,
                     folder = folder,
-                    season = seasonNumber,
-                    currentEpisode = episodeNumber,
+                    season = librarySeasonNumber,
+                    currentEpisode = libraryEpisodeNumber,
                     target = libraryTarget,
                 )
             ) {
@@ -656,8 +682,8 @@ fun StreamsScreen(
                 releaseYear = resolvedReleaseYear,
                 isEpisode = isEpisode,
                 isAnimeFolder = folder.isAnime,
-                seasonNumber = seasonNumber,
-                episodeNumber = episodeNumber,
+                seasonNumber = librarySeasonNumber,
+                episodeNumber = libraryEpisodeNumber,
                 episodeTitle = episodeTitle,
                 extension = extension,
                 // Reuse whatever folder this show already occupies here. Even with the year
@@ -789,6 +815,25 @@ fun StreamsScreen(
                                 return@onPreviewKeyEvent false
                             }
                             val navKey = event.navigationKey()
+                            val onHeader = headerFocus
+                            if (onHeader != null && navKey != Key.Backspace && navKey != Key.Escape) {
+                                val at = headerControls.indexOf(onHeader)
+                                when (navKey) {
+                                    Key.DirectionLeft -> headerFocus = headerControls.getOrNull(at - 1)
+                                    Key.DirectionRight -> headerFocus = headerControls.getOrNull(at + 1) ?: onHeader
+                                    Key.DirectionDown -> headerFocus = null
+                                    Key.Enter, Key.NumPadEnter -> when (onHeader) {
+                                        StreamPickerHeaderControl.Sort -> openSortTick++
+                                        StreamPickerHeaderControl.Layout ->
+                                            StreamBadgeSettingsRepository.setListTwoColumns(!streamBadgeSettings.listTwoColumns)
+                                        StreamPickerHeaderControl.Refresh -> reloadStreams()
+                                        StreamPickerHeaderControl.Close -> onBack()
+                                    }
+                                    Key.DirectionUp -> Unit
+                                    else -> return@onPreviewKeyEvent false
+                                }
+                                return@onPreviewKeyEvent true
+                            }
                             when (navKey) {
                                 Key.Backspace -> {
                                     onBack()
@@ -838,6 +883,8 @@ fun StreamsScreen(
                                     if (nextFilterIndex != currentFilterIndex) {
                                         StreamsRepository.selectFilter(providerIds[nextFilterIndex])
                                         focusedStreamIndex = 0
+                                    } else if (delta > 0) {
+                                        headerFocus = headerControls.first()
                                     }
                                     true
                                 }
@@ -942,7 +989,10 @@ fun StreamsScreen(
             isEpisodeView = isEpisode,
         )
 
-        CompositionLocalProvider(LocalStreamRowActions provides streamRowActions) {
+        CompositionLocalProvider(
+            LocalStreamRowActions provides streamRowActions,
+            LocalStreamPickerHeaderFocus provides StreamPickerHeaderFocus(headerFocus, openSortTick),
+        ) {
         if (isPanel) {
             PanelStreamsLayout(
                 isEpisode = isEpisode,
@@ -961,7 +1011,7 @@ fun StreamsScreen(
                 resumeProgressFraction = effectiveResumeProgressFraction,
                 providerListState = providerListState,
                 streamListState = streamListState,
-                focusedStream = focusedStream,
+                focusedStream = focusedStream.takeIf { headerFocus == null },
                 onStreamSelected = { stream, positionMs, progressFraction ->
                     tracedStreamSelection(stream, positionMs, progressFraction)
                 },
@@ -995,7 +1045,7 @@ fun StreamsScreen(
                 resumeProgressFraction = effectiveResumeProgressFraction,
                 providerListState = providerListState,
                 streamListState = streamListState,
-                focusedStream = focusedStream,
+                focusedStream = focusedStream.takeIf { headerFocus == null },
                 onStreamSelected = { stream, positionMs, progressFraction ->
                     tracedStreamSelection(stream, positionMs, progressFraction)
                 },
@@ -1021,7 +1071,7 @@ fun StreamsScreen(
                 resumeProgressFraction = effectiveResumeProgressFraction,
                 providerListState = providerListState,
                 streamListState = streamListState,
-                focusedStream = focusedStream,
+                focusedStream = focusedStream.takeIf { headerFocus == null },
                 onStreamSelected = { stream, positionMs, progressFraction ->
                     tracedStreamSelection(stream, positionMs, progressFraction)
                 },
@@ -1041,8 +1091,6 @@ fun StreamsScreen(
                 onClick = onBack,
                 modifier = Modifier
                     .size(40.dp),
-                containerColor = MaterialTheme.colorScheme.background.copy(alpha = 0.45f),
-                contentColor = MaterialTheme.colorScheme.onBackground,
             )
 
             Box(
@@ -1855,15 +1903,20 @@ private fun StreamSortChip() {
     val order = settings.listSortOrder
     val cachedFirst = settings.listCachedFirst
     var expanded by remember { mutableStateOf(false) }
+    val headerFocus = LocalStreamPickerHeaderFocus.current
+    LaunchedEffect(headerFocus.openSortTick) {
+        if (headerFocus.openSortTick > 0) expanded = true
+    }
     val label = listOfNotNull(
         order.takeIf { it != StreamListSortOrder.DEFAULT }?.label,
-        "Cached first".takeIf { cachedFirst },
+        stringResource(Res.string.streams_sort_cached_first).takeIf { cachedFirst },
     ).joinToString(" · ")
     Box {
         FilterChip(
             label = if (label.isEmpty()) "Sort" else "Sort: $label",
             isSelected = label.isNotEmpty(),
             onClick = { expanded = true },
+            focused = headerFocus.control == StreamPickerHeaderControl.Sort,
         )
         DropdownMenu(
             expanded = expanded,
@@ -1884,7 +1937,7 @@ private fun StreamSortChip() {
             // A toggle, not an order: it stacks on whichever order is picked above, so the menu
             // stays open to show the check flip.
             HorizontalDivider(color = LibraryNavMenuBorderColor, modifier = Modifier.padding(vertical = 4.dp))
-            LibraryMenuItem(label = "Cached first", selected = cachedFirst) {
+            LibraryMenuItem(label = stringResource(Res.string.streams_sort_cached_first), selected = cachedFirst) {
                 StreamBadgeSettingsRepository.setListCachedFirst(!cachedFirst)
             }
         }
@@ -1896,6 +1949,8 @@ private fun FilterChip(
     label: String,
     isSelected: Boolean,
     onClick: () -> Unit,
+    /** The picker's keyboard highlight (see [LocalStreamPickerHeaderFocus]). */
+    focused: Boolean = false,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
@@ -1947,10 +2002,11 @@ private fun FilterChip(
                 .clip(chipShape)
                 .background(containerColor)
                 .then(
-                    if (glass && isSelected) {
-                        Modifier.border(1.dp, StreamGlass.Edge, chipShape)
-                    } else {
-                        Modifier
+                    when {
+                        focused && glass -> Modifier.smoothBorder(1.5.dp, StreamGlass.Edge, chipShape)
+                        focused -> Modifier.smoothBorder(2.dp, MaterialTheme.colorScheme.onSurface, chipShape)
+                        glass && isSelected -> Modifier.border(1.dp, StreamGlass.Edge, chipShape)
+                        else -> Modifier
                     },
                 )
                 .padding(horizontal = 14.dp, vertical = 8.dp),
@@ -2139,6 +2195,7 @@ internal fun StreamList(
                         is StreamListEntry.SectionHeader -> StreamSectionHeader(
                             addonName = entry.addonName,
                             isLoading = entry.isLoading,
+                            cachedAtMs = entry.cachedAtMs,
                         )
 
                         is StreamListEntry.SourceHeader -> StreamSourceHeader(sourceName = entry.sourceName)
@@ -2279,6 +2336,8 @@ internal sealed interface StreamListEntry {
         override val key: String,
         val addonName: String,
         val isLoading: Boolean,
+        /** Oldest Continue Watching cache time among the section's rows; null when all are live. */
+        val cachedAtMs: Long? = null,
     ) : StreamListEntry
 
     data class SourceHeader(
@@ -2401,6 +2460,8 @@ internal fun buildStreamListEntries(
                 key = uniqueKey("header:${group.addonId}"),
                 addonName = group.addonName,
                 isLoading = group.isLoading,
+                cachedAtMs = group.streams.minOfOrNull { it.cachedAtMs ?: Long.MAX_VALUE }
+                    ?.takeIf { it != Long.MAX_VALUE },
             )
         }
 
@@ -2479,6 +2540,7 @@ private fun StreamSectionHeader(
     addonName: String,
     isLoading: Boolean,
     modifier: Modifier = Modifier,
+    cachedAtMs: Long? = null,
 ) {
     Row(
         modifier = modifier
@@ -2495,6 +2557,15 @@ private fun StreamSectionHeader(
             ),
             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f),
         )
+        Spacer(modifier = Modifier.weight(1f))
+        cachedAtMs?.let { at ->
+            Text(
+                text = cachedAgoLabel(at),
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(end = if (isLoading) 10.dp else 0.dp),
+            )
+        }
         AnimatedVisibility(visible = isLoading, enter = fadeIn(), exit = fadeOut()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(
@@ -2510,6 +2581,17 @@ private fun StreamSectionHeader(
                 )
             }
         }
+    }
+}
+
+/** "Cached 2d ago" for a section whose rows came from the Continue Watching cache. */
+@Composable
+private fun cachedAgoLabel(cachedAtMs: Long): String {
+    val ageMinutes = ((System.currentTimeMillis() - cachedAtMs) / 60_000L).coerceAtLeast(0L)
+    return when {
+        ageMinutes < 60L -> stringResource(Res.string.streams_cached_minutes_ago, ageMinutes.toInt())
+        ageMinutes < 24L * 60L -> stringResource(Res.string.streams_cached_hours_ago, (ageMinutes / 60L).toInt())
+        else -> stringResource(Res.string.streams_cached_days_ago, (ageMinutes / (24L * 60L)).toInt())
     }
 }
 

@@ -82,6 +82,8 @@ import nuvio.composeapp.generated.resources.settings_appearance_app_font_default
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_no_matches
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_none_installed
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_player_note
+import nuvio.composeapp.generated.resources.settings_appearance_app_font_scale
+import nuvio.composeapp.generated.resources.settings_appearance_app_font_scale_description
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_search_placeholder
 import nuvio.composeapp.generated.resources.settings_appearance_app_font_sheet_title
 import nuvio.composeapp.generated.resources.settings_appearance_app_language
@@ -215,6 +217,7 @@ internal fun LazyListScope.appearanceSettingsContent(
         var showLanguageSheet by remember { mutableStateOf(false) }
         var showFontSheet by remember { mutableStateOf(false) }
         val appFontFamily by remember { ThemeSettingsRepository.appFontFamily }.collectAsState()
+        val appFontScalePercent by remember { ThemeSettingsRepository.appFontScalePercent }.collectAsState()
         val startWindowed by remember {
             DesktopWindowStartupPreference.ensureLoaded()
             DesktopWindowStartupPreference.startWindowed
@@ -269,6 +272,21 @@ internal fun LazyListScope.appearanceSettingsContent(
                         isTablet = isTablet,
                         modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("app-font")),
                         onClick = { showFontSheet = true },
+                    )
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSliderRow(
+                        title = stringResource(Res.string.settings_appearance_app_font_scale),
+                        description = stringResource(Res.string.settings_appearance_app_font_scale_description),
+                        value = appFontScalePercent,
+                        valueText = "$appFontScalePercent%",
+                        valueTextForValue = { "$it%" },
+                        valueRange = APP_FONT_SCALE_PERCENT_RANGE,
+                        step = 5,
+                        isTablet = isTablet,
+                        // Only a swapped-in font is rescaled; the bundled one is the reference.
+                        enabled = appFontFamily.isNotBlank(),
+                        modifier = Modifier.settingsScrollAnchor(SettingsScrollAnchor.searchKey("app-font-scale")),
+                        onValueChange = ThemeSettingsRepository::setAppFontScalePercent,
                     )
                     SettingsGroupDivider(isTablet = isTablet)
                     SettingsSwitchRow(
@@ -447,10 +465,14 @@ internal fun LazyListScope.appearanceSettingsContent(
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppearanceFontBottomSheet(
+internal fun AppearanceFontBottomSheet(
     selectedFontFamily: String,
     onFontFamilySelected: (String) -> Unit,
     onDismiss: () -> Unit,
+    title: String = stringResource(Res.string.settings_appearance_app_font_sheet_title),
+    note: String = stringResource(Res.string.settings_appearance_app_font_player_note),
+    /** The "no system font" choice, which picking "" selects. */
+    defaultLabel: String = stringResource(Res.string.settings_appearance_app_font_default),
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
@@ -464,8 +486,6 @@ private fun AppearanceFontBottomSheet(
             installedFonts.filter { it.contains(trimmed, ignoreCase = true) }
         }
     }
-    val defaultLabel = stringResource(Res.string.settings_appearance_app_font_default)
-
     val dismiss = {
         coroutineScope.launch {
             dismissNuvioBottomSheet(sheetState = sheetState, onDismiss = onDismiss)
@@ -484,14 +504,14 @@ private fun AppearanceFontBottomSheet(
         ) {
             item {
                 Text(
-                    text = stringResource(Res.string.settings_appearance_app_font_sheet_title),
+                    text = title,
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
                 )
                 Text(
-                    text = stringResource(Res.string.settings_appearance_app_font_player_note),
+                    text = note,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 12.dp),

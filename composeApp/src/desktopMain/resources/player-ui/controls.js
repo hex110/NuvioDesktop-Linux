@@ -8,6 +8,26 @@ const isHeroTrailerSurface = (() => {
   }
 })();
 
+// The pre-show pipeline plays each clip and trailer as a plain video: a Skip button and nothing else
+// (no mute, no volume slider). Known from the page URL, like the hero-trailer flag above.
+const isPreshowSurface = (() => {
+  try {
+    return new URLSearchParams(location.search).get("preshow") === "1";
+  } catch (_err) {
+    return false;
+  }
+})();
+
+// fork:music - The music player draws its own controls and wants the bare picture: no stop button, volume pill or
+// fade scrim from the hero-trailer chrome (they showed up shrunk inside the mini-player thumbnail).
+const isChromelessSurface = (() => {
+  try {
+    return new URLSearchParams(location.search).get("chromeless") === "1";
+  } catch (_err) {
+    return false;
+  }
+})();
+
 const root = document.getElementById("playerRoot");
 const contextMenu = document.getElementById("contextMenu");
 const seek = document.getElementById("seek");
@@ -211,6 +231,8 @@ const bottomOffsetLabel = document.getElementById("bottomOffsetLabel");
 const assStyleModeLabel = document.getElementById("assStyleModeLabel");
 const assStyleModeSelect = document.getElementById("assStyleModeSelect");
 const assScaleRow = document.getElementById("assScaleRow");
+const subtitleOutlineGroup = document.getElementById("subtitleOutlineGroup");
+const subtitleShadowGroup = document.getElementById("subtitleShadowGroup");
 const assScaleLabel = document.getElementById("assScaleLabel");
 const assScaleMinus = document.getElementById("assScaleMinus");
 const assScaleValue = document.getElementById("assScaleValue");
@@ -288,6 +310,48 @@ const p2pConsentCloseButton = document.getElementById("p2pConsentCloseButton");
 const p2pConsentBody = document.getElementById("p2pConsentBody");
 const p2pConsentCancelButton = document.getElementById("p2pConsentCancelButton");
 const p2pConsentEnableButton = document.getElementById("p2pConsentEnableButton");
+
+// The HUD's own text comes from the app's string resources: Kotlin sends them once per page as
+// `hudLabels` (key = strings.xml name) with the first controls push. Every call site keeps its
+// English as the fallback, so a missing key, or text drawn before that push, still reads right.
+function hudText(key, fallback) {
+  const labels = typeof state === "object" && state ? state.hudLabels : null;
+  const value = labels && key ? labels[key] : null;
+  return typeof value === "string" && value ? value : fallback;
+}
+
+// hudText for a string resource with %1$s-style arguments.
+function hudFormat(key, fallback, ...args) {
+  return hudText(key, fallback).replace(/%(\d+)\$[sd]/g, (match, index) => {
+    const arg = args[Number(index) - 1];
+    return arg == null ? "" : String(arg);
+  });
+}
+
+// Static markup carries its key in data-i18n* attributes (controls.html); this rewrites those
+// nodes once the labels arrive. Text JS sets later goes through hudText at its own call site.
+const HUD_I18N_ATTRIBUTES = [
+  ["i18nAriaLabel", "aria-label"],
+  ["i18nTitle", "title"],
+  ["i18nPlaceholder", "placeholder"],
+  ["i18nTooltip", "data-tooltip"],
+  ["i18nAlt", "alt"],
+];
+function applyHudLabels(root = document) {
+  root.querySelectorAll("[data-i18n]").forEach(element => {
+    element.textContent = hudText(element.dataset.i18n, element.textContent);
+  });
+  HUD_I18N_ATTRIBUTES.forEach(([datasetKey, attribute]) => {
+    const selector = `[data-${datasetKey.replace(/[A-Z]/g, c => "-" + c.toLowerCase())}]`;
+    root.querySelectorAll(selector).forEach(element => {
+      element.setAttribute(attribute, hudText(element.dataset[datasetKey], element.getAttribute(attribute) || ""));
+    });
+  });
+  // Context-menu rows whose checkmark compares against their own (now translated) label.
+  root.querySelectorAll("[data-i18n-selected-value]").forEach(element => {
+    element.dataset.selectedValue = hudText(element.dataset.i18nSelectedValue, element.dataset.selectedValue || "");
+  });
+}
 
 let state = {
   title: "",
@@ -780,6 +844,7 @@ const setIconHref = (icon, href) => {
 
 const send = (type, value = 0) => {
   if ((type === "toggle" || type === "keyboardToggle") && !state.isLocked) notePlayToggleIntent();
+  predictSubtitleStyle(type, value);
   const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.player;
   if (bridge) {
     bridge.postMessage({ type, value });
@@ -787,6 +852,96 @@ const send = (type, value = 0) => {
   }
   const webViewBridge = window.chrome && window.chrome.webview;
   if (webViewBridge) webViewBridge.postMessage({ type, value });
+};
+
+// --- Optimistic subtitle style ------------------------------------------------------------------
+// The Style tab answers a click at once: the change is predicted here and drawn before Kotlin has
+// saved it and pushed the new state back, which made every step feel like it was waiting on
+// something (it was). Each predictor mirrors its handler in PlayerScreenRuntimeUi exactly (same
+// steps, clamps and alpha rules), so the confirmed state matches and simply replaces the guess.
+// Until it does, a push still carrying the old style keeps the guess rather than flicking the
+// control back; after OptimisticSubtitleStyleMs the pushed state wins regardless, so a change
+// Kotlin refused cannot stick on screen.
+const OptimisticSubtitleStyleMs = 1500;
+let optimisticSubtitleStyle = null;
+let optimisticSubtitleStyleUntil = 0;
+
+const clampInt = (value, min, max) => Math.max(min, Math.min(max, Math.round(value)));
+const argbWithAlpha = (color, alpha) => {
+  const parsed = parseArgb(color);
+  const hex = n => n.toString(16).padStart(2, "0").toUpperCase();
+  return `#${hex(clampInt(alpha, 0, 255))}${hex(parsed.red)}${hex(parsed.green)}${hex(parsed.blue)}`;
+};
+const swatchKeepingAlpha = (swatches, index, current) => {
+  const color = Array.isArray(swatches) ? swatches[index] : null;
+  return color ? argbWithAlpha(color, parseArgb(current).alpha) : null;
+};
+
+const SUBTITLE_STYLE_PREDICTORS = {
+  subtitleFontSizeDelta: (style, v) => ({ fontSizeSp: clampInt((Number(style.fontSizeSp) || 18) + v, 6, 40) }),
+  subtitleFontIndex: (style, v) => {
+    const fonts = Array.isArray(state.subtitleFontFamilies) ? state.subtitleFontFamilies : [];
+    return v >= 0 && v < fonts.length ? { fontFamily: fonts[v] } : null;
+  },
+  subtitleOutlineToggle: style => ({ outlineEnabled: !style.outlineEnabled }),
+  subtitleShadowToggle: style => ({ shadowEnabled: !style.shadowEnabled }),
+  subtitleBoldToggle: style => ({ bold: !style.bold }),
+  subtitleItalicToggle: style => ({ italic: !style.italic }),
+  subtitleOutlineWidthDelta: (style, v) => ({ outlineWidth: clampInt((Number(style.outlineWidth) || 0) + v, 0, 6) }),
+  subtitleShadowOffsetDelta: (style, v) => ({ shadowOffset: clampInt((Number(style.shadowOffset) || 0) + v, 0, 60) }),
+  subtitleBlurDelta: (style, v) => ({ blur: clampInt((Number(style.blur) || 0) + v, 0, 10) }),
+  subtitleBottomOffsetDelta: (style, v) => ({ bottomOffset: clampInt((Number(style.bottomOffset) || 0) + v, 0, 200) }),
+  subtitleAssScaleDelta: (style, v) => ({ assScalePercent: clampInt((Number(style.assScalePercent) || 100) + v, 50, 250) }),
+  subtitleAssStyleMode: (style, v) => {
+    const mode = assStyleModes()[v];
+    return mode ? { assStyleMode: mode.value } : null;
+  },
+  subtitleTextOpacity: (style, v) => ({ textColor: argbWithAlpha(style.textColor, (Math.max(0, Math.min(100, v)) / 100) * 255) }),
+  subtitleShadowOpacity: (style, v) => ({ shadowColor: argbWithAlpha(style.shadowColor, (Math.max(0, Math.min(100, v)) / 100) * 255) }),
+  subtitleTextColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleColorSwatches, v, style.textColor);
+    return color ? { textColor: color } : null;
+  },
+  subtitleOutlineColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleColorSwatches, v, style.outlineColor);
+    return color ? { outlineColor: color } : null;
+  },
+  subtitleShadowColor: (style, v) => {
+    const color = swatchKeepingAlpha(state.subtitleShadowColorSwatches, v, style.shadowColor);
+    return color ? { shadowColor: color } : null;
+  },
+  subtitleBackgroundColor: (style, v) => {
+    const swatches = state.subtitleBackgroundColorSwatches;
+    const color = Array.isArray(swatches) ? swatches[v] : null;
+    return color ? { backgroundColor: color } : null;
+  },
+};
+
+const predictSubtitleStyle = (type, value) => {
+  const predictor = SUBTITLE_STYLE_PREDICTORS[type];
+  if (!predictor || !state.subtitleStyle) return;
+  // Built on the latest guess, so quick repeated clicks stack instead of each starting over.
+  const base = optimisticSubtitleStyle && Date.now() < optimisticSubtitleStyleUntil
+    ? optimisticSubtitleStyle
+    : state.subtitleStyle;
+  const change = predictor(base, Number(value) || 0);
+  if (!change) return;
+  optimisticSubtitleStyle = { ...base, ...change };
+  optimisticSubtitleStyleUntil = Date.now() + OptimisticSubtitleStyleMs;
+  state.subtitleStyle = optimisticSubtitleStyle;
+  if (!subtitleStylePanel.hidden) renderSubtitleStylePanel();
+};
+
+// Called with each pushed state: keep the guess while the push has not caught up with it.
+const reconcileOptimisticSubtitleStyle = () => {
+  if (!optimisticSubtitleStyle) return;
+  const pushed = state.subtitleStyle;
+  const confirmed = pushed && JSON.stringify(pushed) === JSON.stringify(optimisticSubtitleStyle);
+  if (confirmed || Date.now() >= optimisticSubtitleStyleUntil) {
+    optimisticSubtitleStyle = null;
+    return;
+  }
+  state.subtitleStyle = optimisticSubtitleStyle;
 };
 
 const animationDelay = ms => new Promise(resolve => {
@@ -985,7 +1140,7 @@ const durationLabelText = (durationMs, positionMs) => {
 const applyDurationLabel = () => {
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
   durationLabel.textContent = durationLabelText(durationMs, Number(state.positionMs) || 0);
-  durationLabel.title = showRemainingTime ? "Click to show total duration" : "Click to show time remaining";
+  durationLabel.title = showRemainingTime ? hudText("player_hud_click_to_show_total_duration", "Click to show total duration") : hudText("player_hud_click_to_show_time_remaining", "Click to show time remaining");
 };
 
 durationLabel.addEventListener("click", event => {
@@ -1044,7 +1199,7 @@ const applyUltraHudLayout = enabled => {
     minimalTime.parentElement.insertBefore(playerVolumeControl, minimalTime);
   }
   // The same toggle is "the rest of the icons" everywhere else and "the options" here.
-  if (actionOverflowButton) actionOverflowButton.dataset.tooltip = enabled ? "Options" : "More controls";
+  if (actionOverflowButton) actionOverflowButton.dataset.tooltip = enabled ? hudText("player_hud_options", "Options") : hudText("player_hud_more_controls", "More controls");
   // The fold rule changes with the layout (everything folds in ultra), so re-measure.
   invalidateActionRowOverflow();
 };
@@ -1065,6 +1220,7 @@ const setProgress = (positionMs, durationMs) => {
     ? Math.max(percent, Math.min(100, bufferedMs / durationMs * 100))
     : 0;
   seek.style.setProperty("--buffered", `${bufferedPercent}%`);
+  applySeekTrack(percent, bufferedPercent);
   if (pipSeek) {
     pipSeek.value = seek.value;
     pipSeek.style.setProperty("--progress", `${percent}%`);
@@ -1076,6 +1232,68 @@ const setProgress = (positionMs, durationMs) => {
   // Read through the same helper the click handler uses, so a countdown keeps counting down as
   // playback advances rather than freezing at whatever it read when the label was tapped.
   durationLabel.textContent = durationLabelText(durationMs, positionMs);
+};
+
+// --- Seek track ----------------------------------------------------------------------------------
+// The seek line is drawn as glass with the chapters cut into it, YouTube-style: a small gap at
+// each chapter start instead of a notch laid over the bar. Both live in the track's own background,
+// built here as two gradients with the gaps left transparent: the colours (played in the theme
+// fill, buffered and unplayed as lighter and darker see-through white) and a highlight band across
+// the top half. Kept in the background rather than a mask so the thumb is never sliced by a gap.
+let seekChapterPercents = [];
+let seekTrackProgress = 0;
+let seekTrackBuffered = 0;
+
+// Half a chapter gap: 3px wide at full scale, never under 2px in a small window.
+const SEEK_GAP_HALF = "max(1px, calc(var(--user-scale, 1) * 1.5px))";
+const SEEK_PLAYED = "var(--theme-timeline-fill)";
+const SEEK_BUFFERED = "rgba(255, 255, 255, .42)";
+const SEEK_UNPLAYED = "rgba(255, 255, 255, .20)";
+const SEEK_SHEEN_PLAYED = "rgba(255, 255, 255, .30)";
+const SEEK_SHEEN_REST = "rgba(255, 255, 255, .12)";
+
+const seekStop = (percent, offset) => {
+  if (!offset) return `${percent}%`;
+  return `calc(${percent}% ${offset < 0 ? "-" : "+"} ${SEEK_GAP_HALF})`;
+};
+
+const applySeekTrack = (progress, buffered) => {
+  seekTrackProgress = progress;
+  seekTrackBuffered = buffered;
+  // Every place the colour or the gap state changes, in order along the bar. A gap is a chapter
+  // start widened by SEEK_GAP_HALF either side; offset -1/+1 marks its two edges.
+  const events = [
+    { at: progress, offset: 0, kind: "edge" },
+    { at: buffered, offset: 0, kind: "edge" },
+  ];
+  seekChapterPercents.forEach(at => {
+    events.push({ at, offset: -1, kind: "gapStart" });
+    events.push({ at, offset: 1, kind: "gapEnd" });
+  });
+  events.push({ at: 100, offset: 0, kind: "end" });
+  events.sort((a, b) => a.at - b.at || a.offset - b.offset);
+
+  const colours = [];
+  const sheen = [];
+  let from = seekStop(0, 0);
+  let fromAt = 0;
+  let inGap = 0;
+  events.forEach(event => {
+    const to = seekStop(event.at, event.offset);
+    // The segment's colour is decided by where it sits against played/buffered, by its middle.
+    const middle = (fromAt + event.at) / 2;
+    const played = middle < progress;
+    const colour = inGap > 0 ? "transparent" : played ? SEEK_PLAYED : middle < buffered ? SEEK_BUFFERED : SEEK_UNPLAYED;
+    const shine = inGap > 0 ? "transparent" : played ? SEEK_SHEEN_PLAYED : SEEK_SHEEN_REST;
+    colours.push(`${colour} ${from} ${to}`);
+    sheen.push(`${shine} ${from} ${to}`);
+    if (event.kind === "gapStart") inGap += 1;
+    if (event.kind === "gapEnd") inGap = Math.max(0, inGap - 1);
+    from = to;
+    fromAt = event.at;
+  });
+  seek.style.setProperty("--seek-colours", `linear-gradient(to right, ${colours.join(", ")})`);
+  seek.style.setProperty("--seek-sheen", `linear-gradient(to right, ${sheen.join(", ")})`);
 };
 
 let chapterMarkersSignature = "";
@@ -1100,6 +1318,11 @@ const renderChapterMarkers = durationMs => {
   if (signature === chapterMarkersSignature) return;
   chapterMarkersSignature = signature;
   chapterMarkers.textContent = "";
+  // The same chapter starts, as gaps cut into the seek track.
+  seekChapterPercents = durationMs <= 0 ? [] : chapters
+    .filter(chapter => chapter.startTime > 0 && chapter.startTime * 1000 < durationMs)
+    .map(chapter => Math.max(0, Math.min(100, chapter.startTime * 1000 / durationMs * 100)));
+  applySeekTrack(seekTrackProgress, seekTrackBuffered);
   if (durationMs <= 0) return;
   chapters.forEach(chapter => {
     if (chapter.startTime <= 0 || chapter.startTime * 1000 >= durationMs) return;
@@ -1221,6 +1444,25 @@ const hideSeekThumbnail = () => {
 };
 
 const showSeekThumbnailAt = event => {
+  // Live TV: the hovered point as its distance from live ("-0:20"), since a time into the stream
+  // means nothing there. Never a frame preview: that opens a second connection to the channel,
+  // which providers that allow one connection per account answer by dropping the first.
+  const liveWindow = iptvLiveWindow();
+  if (liveWindow) {
+    const liveRect = seek.getBoundingClientRect();
+    if (liveRect.width <= 0) return hideSeekThumbnail();
+    const liveProgress = Math.max(0, Math.min(1, (event.clientX - liveRect.left) / liveRect.width));
+    const behindMs = Math.round((liveWindow.end - liveWindow.start) * (1 - liveProgress));
+    seekThumbnail.classList.add("no-preview");
+    seekThumbnail.classList.remove("seekr");
+    const liveX = Math.max(112, Math.min(liveRect.width - 112, event.clientX - liveRect.left));
+    seekThumbnail.style.left = `${liveRect.left - timeline.getBoundingClientRect().left + liveX}px`;
+    seekThumbnailTime.textContent = behindMs < 1000 ? (state.iptv.liveLabel || "LIVE") : `-${formatTime(behindMs)}`;
+    seekThumbnailChapter.hidden = true;
+    seekThumbnailImage.removeAttribute("src");
+    seekThumbnail.hidden = false;
+    return;
+  }
   // With previews off the card still shows the hovered time and chapter — those cost nothing.
   // Only the frame itself needs the second stream and its range request.
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
@@ -1604,10 +1846,10 @@ const rangePositionMs = (input = seek) => {
 // packed 0xAARRGGBB integer - exact in a Double, and no new string channel to thread through the
 // native player. Alpha is resolved here, on the side that knows the current style.
 const SUBTITLE_COLOR_FIELDS = {
-  textColor: { title: "Custom Text Color", event: "subtitleTextColorArgb" },
-  outlineColor: { title: "Custom Outline Color", event: "subtitleOutlineColorArgb" },
-  backgroundColor: { title: "Custom Background Color", event: "subtitleBackgroundColorArgb" },
-  shadowColor: { title: "Custom Shadow Color", event: "subtitleShadowColorArgb" },
+  textColor: { get title() { return hudText("player_hud_custom_text_color", "Custom Text Color"); }, event: "subtitleTextColorArgb" },
+  outlineColor: { get title() { return hudText("player_hud_custom_outline_color", "Custom Outline Color"); }, event: "subtitleOutlineColorArgb" },
+  backgroundColor: { get title() { return hudText("player_hud_custom_background_color", "Custom Background Color"); }, event: "subtitleBackgroundColorArgb" },
+  shadowColor: { get title() { return hudText("player_hud_custom_shadow_color", "Custom Shadow Color"); }, event: "subtitleShadowColorArgb" },
 };
 
 const SUBTITLE_COLOR_EVENT_FIELDS = {
@@ -1649,7 +1891,7 @@ const updateSubtitleHexPreview = () => {
   const typed = String(subtitleHexInput.value || "").trim();
   const argb = parseHexColorInput(typed, subtitleHexField);
   const valid = argb !== null;
-  subtitleHexStatus.textContent = valid || !typed ? "" : "Enter a hex color like #FFD700 or #B3000000.";
+  subtitleHexStatus.textContent = valid || !typed ? "" : hudText("player_hud_enter_a_hex_color_like_ffd700", "Enter a hex color like #FFD700 or #B3000000.");
   subtitleHexApplyButton.disabled = !valid;
   if (!valid) return;
   const alpha = Math.floor(argb / 0x1000000);
@@ -1723,7 +1965,27 @@ const partyModal = document.getElementById("partyModal");
 const partyPanelTitle = document.getElementById("partyPanelTitle");
 const partyCloseButton = document.getElementById("partyCloseButton");
 const partyBody = document.getElementById("partyBody");
+const partyPillBadge = document.getElementById("partyPillBadge");
+const partyTabs = document.getElementById("partyTabs");
+const partyTabParty = document.getElementById("partyTabParty");
+const partyTabChat = document.getElementById("partyTabChat");
+const partyTabChatLabel = document.getElementById("partyTabChatLabel");
+const partyTabBadge = document.getElementById("partyTabBadge");
+const partyChat = document.getElementById("partyChat");
+const partyChatList = document.getElementById("partyChatList");
+const partyChatEmpty = document.getElementById("partyChatEmpty");
+const partyChatEmptyTitle = document.getElementById("partyChatEmptyTitle");
+const partyChatEmptyMessage = document.getElementById("partyChatEmptyMessage");
+const partyChatForm = document.getElementById("partyChatForm");
+const partyChatInput = document.getElementById("partyChatInput");
+const partyChatSend = document.getElementById("partyChatSend");
 const PartyPillMaxAvatars = 4;
+const PartyChatMaxLength = 500;
+// "party" | "chat": which tab of the panel is showing while in a party.
+let partyTab = "party";
+let partyChatSignature = "";
+// A badge on the party button, created once (the button's own markup is static).
+let partyButtonBadge = null;
 // "" | "end" | "remove:<member index>": the inline confirmation the panel is showing.
 let partyConfirm = "";
 let partyPillSignature = "";
@@ -1805,6 +2067,32 @@ const renderPartyChrome = (isChromeHidden, pictureInPictureActive) => {
   }
   partyPillText.textContent = message;
   partyPillText.hidden = !message;
+};
+
+const partyUnreadText = () => {
+  const party = currentParty();
+  const unread = party.active ? Math.max(0, Number(party.chatUnread) || 0) : 0;
+  return unread > 0 ? (unread > 99 ? "99+" : String(unread)) : "";
+};
+
+// Unread chat on the pill, the party button and the Chat tab. Runs on every render, so it only
+// touches the DOM when the count changes.
+let partyUnreadShown = null;
+const renderPartyUnread = () => {
+  const text = partyUnreadText();
+  if (text === partyUnreadShown) return;
+  partyUnreadShown = text;
+  if (!partyButtonBadge && partyButton) {
+    partyButtonBadge = partyElement("span", "party-badge");
+    partyButtonBadge.hidden = true;
+    partyButton.style.position = partyButton.style.position || "relative";
+    partyButton.appendChild(partyButtonBadge);
+  }
+  [partyPillBadge, partyButtonBadge, partyTabBadge].forEach(badge => {
+    if (!badge) return;
+    badge.textContent = text;
+    badge.hidden = !text;
+  });
 };
 
 const partySwitchRow = (title, description, checked, eventType, note = "") => {
@@ -1982,10 +2270,91 @@ const renderPartyActive = (party, body) => {
   body.appendChild(actions);
 };
 
+const partyChatMessages = () => {
+  const list = currentParty().chatMessages;
+  return Array.isArray(list) ? list : [];
+};
+
+const partyChatNearBottom = () =>
+  partyChatList.scrollHeight - partyChatList.scrollTop - partyChatList.clientHeight < 48;
+
+const renderPartyChat = () => {
+  const party = currentParty();
+  const messages = partyChatMessages();
+  const signature = JSON.stringify([messages, party.labels && party.labels.chatSend]);
+  if (signature === partyChatSignature) return;
+  partyChatSignature = signature;
+  partyChatEmptyTitle.textContent = partyLabel("chatEmptyTitle", "No messages yet");
+  partyChatEmptyMessage.textContent = partyLabel("chatEmptyMessage");
+  partyChatInput.placeholder = partyLabel("chatPlaceholder", "Message");
+  partyChatSend.textContent = partyLabel("chatSend", "Send");
+  partyChatEmpty.hidden = messages.length > 0;
+  partyChatList.hidden = messages.length === 0;
+  // Follow new messages only when already at the bottom, so reading back is not interrupted.
+  const stick = partyChatNearBottom() || partyChatList.childElementCount === 0;
+  partyChatList.replaceChildren();
+  messages.forEach(message => {
+    if (message.time) partyChatList.appendChild(partyElement("div", "party-chat-time", message.time));
+    const classes = ["party-chat-row"];
+    if (message.mine) classes.push("mine");
+    if (message.startsGroup) classes.push("group-start");
+    if (message.sending) classes.push("sending");
+    const row = partyElement("div", classes.join(" "));
+    if (!message.mine) {
+      const avatar = partyAvatarElement(message);
+      if (!message.startsGroup) avatar.classList.add("spacer");
+      row.appendChild(avatar);
+    }
+    const bubble = partyElement("div", "party-chat-bubble");
+    if (!message.mine && message.startsGroup) bubble.appendChild(partyElement("span", "party-chat-name", message.name));
+    bubble.appendChild(partyElement("span", "", message.body));
+    if (message.failed) {
+      const retry = partyElement("button", "party-chat-failed", partyLabel("chatNotSent", "Not sent. Click to retry"));
+      retry.type = "button";
+      retry.addEventListener("click", event => {
+        event.stopPropagation();
+        send(`partyChatRetry:${message.key}`, 0);
+      });
+      bubble.appendChild(retry);
+    }
+    row.appendChild(bubble);
+    partyChatList.appendChild(row);
+  });
+  if (stick) partyChatList.scrollTop = partyChatList.scrollHeight;
+};
+
+const setPartyTab = tab => {
+  const party = currentParty();
+  const next = party.active && tab === "chat" ? "chat" : "party";
+  const changed = next !== partyTab;
+  partyTab = next;
+  partyTabParty.classList.toggle("selected", next === "party");
+  partyTabChat.classList.toggle("selected", next === "chat");
+  partyTabParty.setAttribute("aria-selected", next === "party" ? "true" : "false");
+  partyTabChat.setAttribute("aria-selected", next === "chat" ? "true" : "false");
+  partyBody.hidden = next === "chat";
+  partyChat.hidden = next !== "chat";
+  if (changed) send("partyChatTab", next === "chat" ? 1 : 0);
+  if (next === "chat") {
+    partyChatSignature = "";
+    renderPartyChat();
+    partyChatList.scrollTop = partyChatList.scrollHeight;
+    partyChatInput.focus();
+  }
+};
+
 const renderPartyModal = () => {
   const party = currentParty();
   if (!party.active && partyConfirm) partyConfirm = "";
-  const signature = JSON.stringify([party, partyConfirm]);
+  partyTabs.hidden = !party.active;
+  partyTabParty.textContent = partyLabel("tabParty", "Party");
+  partyTabChatLabel.textContent = partyLabel("tabChat", "Chat");
+  if (!party.active && partyTab !== "party") setPartyTab("party");
+  if (partyTab === "chat") renderPartyChat();
+  // The chat is rendered on its own above; leaving it out here keeps a new message from
+  // rebuilding the party tab's controls under the pointer.
+  const { chatMessages, chatUnread, ...panelState } = party;
+  const signature = JSON.stringify([panelState, partyConfirm]);
   if (signature === partyPanelSignature) return;
   partyPanelSignature = signature;
   partyPanelTitle.textContent = partyLabel("title", "Watch party");
@@ -2000,24 +2369,103 @@ const renderPartyModal = () => {
   partyBody.scrollTop = scrollTop;
 };
 
-const openPartyModal = () => {
+const openPartyModal = (tab = "party") => {
   partyConfirm = "";
   partyPanelSignature = "";
+  partyTab = "";
   openPlayerModal("party");
   send("partyPanelOpened", 0);
+  setPartyTab(tab);
 };
+
+const submitPartyChat = () => {
+  const text = String(partyChatInput.value || "").trim().slice(0, PartyChatMaxLength);
+  if (!text) return;
+  partyChatInput.value = "";
+  // The text rides in the event name (see handlePartyControlsEvent).
+  send(`partyChatSend:${text}`, 0);
+  partyChatList.scrollTop = partyChatList.scrollHeight;
+};
+
+partyTabParty.addEventListener("click", event => {
+  event.stopPropagation();
+  setPartyTab("party");
+});
+partyTabChat.addEventListener("click", event => {
+  event.stopPropagation();
+  setPartyTab("chat");
+});
+partyChatForm.addEventListener("submit", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  submitPartyChat();
+});
+partyChatInput.addEventListener("click", event => event.stopPropagation());
+partyChatInput.addEventListener("keydown", event => {
+  // Enter sends (the form submits); keep other keys away from the player shortcuts. Escape still
+  // reaches the document handler, which closes the panel.
+  if (event.code !== "Escape") event.stopPropagation();
+});
 
 partyPill.addEventListener("click", event => {
   event.stopPropagation();
   partyPill.blur();
-  openPartyModal();
+  // Unread chat is the likeliest reason to click the pill.
+  openPartyModal(partyUnreadText() ? "chat" : "party");
 });
 partyCloseButton.addEventListener("click", event => {
   event.stopPropagation();
   closePlayerModal();
 });
 
+const streamInfoModal = document.getElementById("streamInfoModal");
+const streamInfoTitle = document.getElementById("streamInfoTitle");
+const streamInfoBody = document.getElementById("streamInfoBody");
+const streamInfoCloseButton = document.getElementById("streamInfoCloseButton");
+let streamInfoSignature = "";
+
+// Kotlin fills state.streamInfo only while it knows the panel is open ("streamInfoOpened"), so
+// an empty state right after opening is just the next push on its way.
+const renderStreamInfoModal = () => {
+  const info = state.streamInfo && typeof state.streamInfo === "object" ? state.streamInfo : null;
+  const signature = JSON.stringify(info);
+  if (signature === streamInfoSignature) return;
+  streamInfoSignature = signature;
+  if (!info) return;
+  streamInfoTitle.textContent = info.title || "Stream info";
+  streamInfoCloseButton.textContent = info.closeLabel || "Close";
+  const sections = Array.isArray(info.sections) ? info.sections : [];
+  streamInfoBody.replaceChildren();
+  sections.forEach(section => {
+    const block = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "stream-info-section-title";
+    title.textContent = section.title || "";
+    block.appendChild(title);
+    (Array.isArray(section.rows) ? section.rows : []).forEach(row => {
+      const line = document.createElement("div");
+      line.className = "stream-info-row";
+      const label = document.createElement("span");
+      label.className = "stream-info-label";
+      label.textContent = row.label || "";
+      const value = document.createElement("span");
+      value.className = "stream-info-value";
+      value.textContent = row.value || "";
+      line.appendChild(label);
+      line.appendChild(value);
+      block.appendChild(line);
+    });
+    streamInfoBody.appendChild(block);
+  });
+};
+
+streamInfoCloseButton.addEventListener("click", event => {
+  event.stopPropagation();
+  closePlayerModal();
+});
+
 const modalByName = {
+  streamInfo: streamInfoModal,
   audio: audioModal,
   subtitles: subtitleModal,
   sources: sourceModal,
@@ -2086,6 +2534,9 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   if (closingModal === "party") {
     partyConfirm = "";
     send("partyPanelClosed", 0);
+  }
+  if (closingModal === "streamInfo") {
+    send("streamInfoClosed", 0);
   }
   if (closingModal === "iptvChannels") {
     resetIptvSearch();
@@ -2174,11 +2625,12 @@ const playbackSpeedMenuItems = [
 // Player HUD UI-scale presets (-50..+50%, matching the Playback settings slider). Exposed in the
 // right-click menu for quick testing; each preset checkmarks against the live uiScalePercent and
 // the two nudge rows step by the same 5% as the slider.
-const uiScalePresetItems = [{ label: "Increase (+5%)", action: "uiScaleDelta:5" },
-  { label: "Decrease (−5%)", action: "uiScaleDelta:-5" }];
+const uiScalePresetItems = [{ label: "Increase (+5%)", textKey: "player_hud_increase_5", action: "uiScaleDelta:5" },
+  { label: "Decrease (−5%)", textKey: "player_hud_decrease_5", action: "uiScaleDelta:-5" }];
 for (let pct = 50; pct >= -50; pct -= 10) {
   uiScalePresetItems.push({
     label: pct === 0 ? "Default (0%)" : `${pct > 0 ? "+" : ""}${pct}%`,
+    ...(pct === 0 ? { textKey: "player_hud_default_0" } : {}),
     action: `uiScaleSet:${pct}`,
     selectedField: "uiScalePercentValue",
     selectedValue: String(pct),
@@ -2189,13 +2641,14 @@ for (let pct = 50; pct >= -50; pct -= 10) {
 // leaving playback. Index = DesktopHudLayout.entries order; the checkmark reads the four HUD flags
 // the page already receives (hudLayoutValue below), so it tracks whichever side changed it.
 const hudLayoutItems = [
-  ["standard", "Standard"],
-  ["legacy", "Legacy"],
-  ["minimal", "Minimal"],
-  ["ultra", "Ultra Minimal"],
-  ["official", "Official Nuvio"],
-].map(([value, label], index) => ({
+  ["standard", "Standard", "player_hud_standard"],
+  ["legacy", "Legacy", "player_hud_legacy"],
+  ["minimal", "Minimal", "player_hud_minimal"],
+  ["ultra", "Ultra Minimal", "player_hud_ultra_minimal"],
+  ["official", "Official Nuvio", "player_hud_official_nuvio"],
+].map(([value, label, textKey], index) => ({
   label,
+  textKey,
   action: `hudLayout:${index}`,
   selectedField: "hudLayoutValue",
   selectedValue: value,
@@ -2210,147 +2663,147 @@ const currentHudLayoutValue = () => {
 
 const contextMenuItems = [
   {
-    label: "Playback",
+    label: "Playback", textKey: "player_hud_playback",
     children: [
-      { label: "Play / Pause", action: "send:toggle", shortcut: "K" },
+      { label: "Play / Pause", textKey: "player_hud_play_pause", action: "send:toggle", shortcut: "K" },
       // Labels carry the configured step, so they are rewritten by refreshSeekStepLabels()
       // whenever the setting changes rather than baked in at build time.
-      { label: "Seek back 10 seconds", labelKey: "seekBack", action: "send:seekBack", shortcut: "←" },
-      { label: "Seek forward 10 seconds", labelKey: "seekForward", action: "send:seekForward", shortcut: "→" },
-      { label: "Playback speed", children: playbackSpeedMenuItems },
-      { label: "Previous episode", action: "send:previousEpisode" },
-      { label: "Next episode", action: "send:nextEpisode" },
-      { label: "Picture in picture", action: "send:pictureInPicture" },
+      { label: "Seek back 10 seconds", textKey: "player_hud_seek_back_10_seconds", labelKey: "seekBack", action: "send:seekBack", shortcut: "←" },
+      { label: "Seek forward 10 seconds", textKey: "player_hud_seek_forward_10_seconds", labelKey: "seekForward", action: "send:seekForward", shortcut: "→" },
+      { label: "Playback speed", textKey: "player_hud_playback_speed", children: playbackSpeedMenuItems },
+      { label: "Previous episode", textKey: "player_hud_previous_episode", action: "send:previousEpisode" },
+      { label: "Next episode", textKey: "player_hud_next_episode", action: "send:nextEpisode" },
+      { label: "Picture in picture", textKey: "player_hud_picture_in_picture", action: "send:pictureInPicture" },
     ],
   },
   {
-    label: "Subtitles",
+    label: "Subtitles", textKey: "player_hud_subtitles",
     children: [
-      { label: "Built-in", dynamicKey: "subtitleTracks", children: [] },
-      { label: "Addon", dynamicKey: "addonSubtitles", children: [] },
+      { label: "Built-in", textKey: "player_hud_built_in", dynamicKey: "subtitleTracks", children: [] },
+      { label: "Addon", textKey: "player_hud_addon", dynamicKey: "addonSubtitles", children: [] },
       {
-        label: "Style",
+        label: "Style", textKey: "player_hud_style",
         children: [
-          { label: "Outline", action: "subtitleStyle:outline", toggleKey: "outlineEnabled" },
-          { label: "Outline width", children: [
-            { label: "Increase", action: "send:subtitleOutlineWidthDelta:1" },
-            { label: "Decrease", action: "send:subtitleOutlineWidthDelta:-1" },
+          { label: "Outline", textKey: "player_hud_outline", action: "subtitleStyle:outline", toggleKey: "outlineEnabled" },
+          { label: "Outline width", textKey: "player_hud_outline_width_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleOutlineWidthDelta:1" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleOutlineWidthDelta:-1" },
           ] },
-          { label: "Shadow", action: "subtitleStyle:shadow", toggleKey: "shadowEnabled" },
-          { label: "Shadow offset", children: [
-            { label: "Increase", action: "send:subtitleShadowOffsetDelta:5" },
-            { label: "Decrease", action: "send:subtitleShadowOffsetDelta:-5" },
+          { label: "Shadow", textKey: "player_hud_shadow", action: "subtitleStyle:shadow", toggleKey: "shadowEnabled" },
+          { label: "Shadow offset", textKey: "player_hud_shadow_offset_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleShadowOffsetDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleShadowOffsetDelta:-5" },
           ] },
-          { label: "Shadow intensity", children: [
-            { label: "Increase", action: "subtitleShadowOpacity:10" },
-            { label: "Decrease", action: "subtitleShadowOpacity:-10" },
+          { label: "Shadow intensity", textKey: "player_hud_shadow_intensity_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "subtitleShadowOpacity:10" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "subtitleShadowOpacity:-10" },
           ] },
-          { label: "Blur", children: [
-            { label: "Increase", action: "send:subtitleBlurDelta:1" },
-            { label: "Decrease", action: "send:subtitleBlurDelta:-1" },
+          { label: "Blur", textKey: "player_hud_blur", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleBlurDelta:1" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleBlurDelta:-1" },
           ] },
-          { label: "Bold", action: "subtitleStyle:bold", toggleKey: "bold" },
-          { label: "Italic", action: "subtitleStyle:italic", toggleKey: "italic" },
-          { label: "Font", dynamicKey: "fontFamilies", children: [] },
-          { label: "Text color", dynamicKey: "subtitleColors", children: [] },
-          { label: "Outline color", dynamicKey: "outlineColors", children: [] },
-          { label: "Font size", children: [
-            { label: "Increase", action: "send:subtitleFontSizeDelta:2" },
-            { label: "Decrease", action: "send:subtitleFontSizeDelta:-2" },
+          { label: "Bold", textKey: "player_hud_bold", action: "subtitleStyle:bold", toggleKey: "bold" },
+          { label: "Italic", textKey: "player_hud_italic", action: "subtitleStyle:italic", toggleKey: "italic" },
+          { label: "Font", textKey: "player_hud_font", dynamicKey: "fontFamilies", children: [] },
+          { label: "Text color", textKey: "player_hud_text_color", dynamicKey: "subtitleColors", children: [] },
+          { label: "Outline color", textKey: "player_hud_outline_color_2", dynamicKey: "outlineColors", children: [] },
+          { label: "Font size", textKey: "player_hud_font_size_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleFontSizeDelta:2" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleFontSizeDelta:-2" },
           ] },
-          { label: "Bottom offset", children: [
-            { label: "Increase", action: "send:subtitleBottomOffsetDelta:5" },
-            { label: "Decrease", action: "send:subtitleBottomOffsetDelta:-5" },
+          { label: "Bottom offset", textKey: "player_hud_bottom_offset_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleBottomOffsetDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleBottomOffsetDelta:-5" },
           ] },
           // ASS/SSA scripts ignore everything above unless the styling level says otherwise;
           // "Override" is the only level under which Font size and Bottom offset move them.
           // Listed by name with a tick on the active one, like the HDR and colour-profile menus.
-          { label: "ASS/SSA styling", children: [
-            { label: "Original", action: "send:subtitleAssStyleMode:0", selectedField: "assStyleModeValueLabel" },
-            { label: "Resize", action: "send:subtitleAssStyleMode:1", selectedField: "assStyleModeValueLabel" },
-            { label: "Override", action: "send:subtitleAssStyleMode:2", selectedField: "assStyleModeValueLabel" },
+          { label: "ASS/SSA styling", textKey: "player_hud_ass_ssa_styling_2", children: [
+            { label: "Original", textKey: "player_hud_original", selectedValue: "Original", action: "send:subtitleAssStyleMode:0", selectedField: "assStyleModeValueLabel" },
+            { label: "Resize", textKey: "player_hud_resize", selectedValue: "Resize", action: "send:subtitleAssStyleMode:1", selectedField: "assStyleModeValueLabel" },
+            { label: "Override", textKey: "player_hud_override", selectedValue: "Override", action: "send:subtitleAssStyleMode:2", selectedField: "assStyleModeValueLabel" },
           ] },
-          { label: "ASS/SSA size", children: [
-            { label: "Increase", action: "send:subtitleAssScaleDelta:5" },
-            { label: "Decrease", action: "send:subtitleAssScaleDelta:-5" },
+          { label: "ASS/SSA size", textKey: "player_hud_ass_ssa_size_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleAssScaleDelta:5" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleAssScaleDelta:-5" },
           ] },
-          { label: "Text opacity", children: [
-            { label: "Increase", action: "subtitleOpacity:10" },
-            { label: "Decrease", action: "subtitleOpacity:-10" },
+          { label: "Text opacity", textKey: "player_hud_text_opacity_2", children: [
+            { label: "Increase", textKey: "player_hud_increase", action: "subtitleOpacity:10" },
+            { label: "Decrease", textKey: "player_hud_decrease", action: "subtitleOpacity:-10" },
           ] },
-          { label: "Open style panel", action: "subtitleTab:2" },
-          { label: "Reset style defaults", action: "send:subtitleStyleReset" },
+          { label: "Open style panel", textKey: "player_hud_open_style_panel", action: "subtitleTab:2" },
+          { label: "Reset style defaults", textKey: "player_hud_reset_style_defaults", action: "send:subtitleStyleReset" },
         ],
       },
       // Auto sync needs its full card (status text + cue list) to be usable, so the menu
       // entry opens the style panel where it lives instead of firing blind Reload/Capture.
-      { label: "Auto sync", action: "subtitleTab:2" },
-      { label: "Subtitle delay", children: [
-        { label: "Increase", action: "send:subtitleDelayDelta:100" },
-        { label: "Decrease", action: "send:subtitleDelayDelta:-100" },
-        { label: "Reset", action: "send:subtitleDelayReset" },
+      { label: "Auto sync", textKey: "player_hud_auto_sync_2", action: "subtitleTab:2" },
+      { label: "Subtitle delay", textKey: "player_hud_subtitle_delay_2", children: [
+        { label: "Increase", textKey: "player_hud_increase", action: "send:subtitleDelayDelta:100" },
+        { label: "Decrease", textKey: "player_hud_decrease", action: "send:subtitleDelayDelta:-100" },
+        { label: "Reset", textKey: "player_hud_reset", action: "send:subtitleDelayReset" },
       ] },
     ],
   },
   {
-    label: "Audio",
+    label: "Audio", textKey: "player_hud_audio",
     children: [
-      { label: "Audio tracks", dynamicKey: "audioTracks", children: [] },
-      { label: "Mute", action: "send:keyboardToggleMute", toggleKey: "localMuted" },
+      { label: "Audio tracks", textKey: "player_hud_audio_tracks", dynamicKey: "audioTracks", children: [] },
+      { label: "Mute", textKey: "player_hud_mute", action: "send:keyboardToggleMute", toggleKey: "localMuted" },
     ],
   },
   {
-    label: "Video",
+    label: "Video", textKey: "player_hud_video",
     children: [
-      { label: "Aspect ratio", children: [
-        { label: "Fit", action: "resizeMode:0", selectedField: "resizeModeLabel" },
-        { label: "Fill", action: "resizeMode:1", selectedField: "resizeModeLabel" },
-        { label: "Zoom", action: "resizeMode:2", selectedField: "resizeModeLabel" },
-        { label: "Auto crop", action: "resizeMode:3", selectedField: "resizeModeLabel" },
+      { label: "Aspect ratio", textKey: "player_hud_aspect_ratio", children: [
+        { label: "Fit", textKey: "compose_player_resize_fit", action: "resizeMode:0", selectedField: "resizeModeLabel" },
+        { label: "Fill", textKey: "compose_player_resize_fill", action: "resizeMode:1", selectedField: "resizeModeLabel" },
+        { label: "Zoom", textKey: "compose_player_resize_zoom", action: "resizeMode:2", selectedField: "resizeModeLabel" },
+        { label: "Auto crop", textKey: "compose_player_resize_auto_crop", action: "resizeMode:3", selectedField: "resizeModeLabel" },
       ] },
-      { label: "Video settings", children: [
-        { label: "Auto", action: "send:selectDesktopHdrMode:0", selectedField: "desktopHdrModeLabel" },
-        { label: "Always Tonemap", action: "send:selectDesktopHdrMode:1", selectedField: "desktopHdrModeLabel" },
-        { label: "Always Passthrough", action: "send:selectDesktopHdrMode:2", selectedField: "desktopHdrModeLabel" },
+      { label: "Video settings", textKey: "player_hud_video_settings", children: [
+        { label: "Auto", textKey: "player_hdr_mode_auto_label", action: "send:selectDesktopHdrMode:0", selectedField: "desktopHdrModeLabel" },
+        { label: "Always Tonemap", textKey: "player_hdr_mode_always_tonemap_label", action: "send:selectDesktopHdrMode:1", selectedField: "desktopHdrModeLabel" },
+        { label: "Always Passthrough", textKey: "player_hdr_mode_always_passthrough_label", action: "send:selectDesktopHdrMode:2", selectedField: "desktopHdrModeLabel" },
       ] },
-      { label: "Color profile", children: [
-        { label: "Neutral", action: "send:selectDesktopColorProfile:0", selectedField: "desktopColorProfileLabel" },
-        { label: "Cinematic", action: "send:selectDesktopColorProfile:1", selectedField: "desktopColorProfileLabel" },
-        { label: "Vivid", action: "send:selectDesktopColorProfile:2", selectedField: "desktopColorProfileLabel" },
+      { label: "Color profile", textKey: "player_hud_color_profile_2", children: [
+        { label: "Neutral", textKey: "player_color_profile_neutral_label", action: "send:selectDesktopColorProfile:0", selectedField: "desktopColorProfileLabel" },
+        { label: "Cinematic", textKey: "player_color_profile_cinematic_label", action: "send:selectDesktopColorProfile:1", selectedField: "desktopColorProfileLabel" },
+        { label: "Vivid", textKey: "player_color_profile_vivid_label", action: "send:selectDesktopColorProfile:2", selectedField: "desktopColorProfileLabel" },
         // Selection only: the offsets themselves live in Settings > Playback. Picking Custom here is
         // what makes the C hotkey an A/B between neutral and the user's own grade mid-playback.
-        { label: "Custom", action: "send:selectDesktopColorProfile:3", selectedField: "desktopColorProfileLabel" },
-        { label: "Adjust custom color…", action: "colorGradePanel" },
+        { label: "Custom", textKey: "player_color_profile_custom_label", action: "send:selectDesktopColorProfile:3", selectedField: "desktopColorProfileLabel" },
+        { label: "Adjust custom color…", textKey: "player_hud_adjust_custom_color", action: "colorGradePanel" },
       ] },
-      { label: "Anime shader", dynamicKey: "animeShaders", children: [] },
-      { label: "SVP interpolation", action: "send:keyboardCycleAnimeSvp", toggleKey: "desktopAnimeSvpEnabled" },
+      { label: "Anime shader", textKey: "player_hud_anime_shader", dynamicKey: "animeShaders", children: [] },
+      { label: "SVP interpolation", textKey: "player_hud_svp_interpolation", action: "send:keyboardCycleAnimeSvp", toggleKey: "desktopAnimeSvpEnabled" },
       // This session only; the saved defaults stay in Settings > Playback. Neither runs with SVP.
-      { label: "RTX Super Resolution", action: "send:toggleRtxVsr", toggleKey: "rtxVsrEnabled" },
-      { label: "RTX True HDR", action: "send:toggleRtxTrueHdr", toggleKey: "rtxTrueHdrEnabled" },
-      { label: "Advanced (mpv)", dynamicKey: "mpvOptions", children: [] },
-      { label: "UI scale", children: uiScalePresetItems },
-      { label: "Controls layout", children: hudLayoutItems },
+      { label: "RTX Super Resolution", textKey: "player_hud_rtx_super_resolution", action: "send:toggleRtxVsr", toggleKey: "rtxVsrEnabled" },
+      { label: "RTX True HDR", textKey: "player_hud_rtx_true_hdr", action: "send:toggleRtxTrueHdr", toggleKey: "rtxTrueHdrEnabled" },
+      { label: "Advanced (mpv)", textKey: "player_hud_advanced_mpv", dynamicKey: "mpvOptions", children: [] },
+      { label: "UI scale", textKey: "player_hud_ui_scale", children: uiScalePresetItems },
+      { label: "Controls layout", textKey: "player_hud_controls_layout", children: hudLayoutItems },
     ],
   },
   {
-    label: "Tools",
+    label: "Tools", textKey: "player_hud_tools",
     children: [
-      { label: "Sources", action: "modal:sources" },
-      { label: "Episodes", action: "modal:episodes" },
-      { label: "Submit intro / outro", action: "modal:submitIntro" },
+      { label: "Sources", textKey: "player_hud_sources", action: "modal:sources" },
+      { label: "Episodes", textKey: "player_hud_episodes", action: "modal:episodes" },
+      { label: "Submit intro / outro", textKey: "player_hud_submit_intro_outro", action: "modal:submitIntro" },
     ],
   },
   {
-    label: "Window",
+    label: "Window", textKey: "player_hud_window",
     children: [
-      { label: "Fullscreen", action: "send:toggleFullscreen", shortcut: "F11" },
-      { label: "Close playback", action: "send:back", shortcut: "Esc" },
+      { label: "Fullscreen", textKey: "player_hud_fullscreen", action: "send:toggleFullscreen", shortcut: "F11" },
+      { label: "Close playback", textKey: "player_hud_close_playback", action: "send:back", shortcut: "Esc" },
     ],
   },
-  { label: "Copy stream link", action: "copyStreamUrl" },
-  { label: "Stream failover", action: "toggleStreamFailover", toggleKey: "streamFailoverEnabled" },
-  { label: "MPV diagnostics", action: "toggleMpvDiagnostics", toggleKey: "mpvDiagnosticsEnabled" },
-  { label: "Close menu after selecting", action: "toggleCloseOnSelect", toggleKey: "closeMenuOnSelect" },
+  { label: "Copy stream link", textKey: "player_hud_copy_stream_link", action: "copyStreamUrl" },
+  { label: "Stream failover", textKey: "player_hud_stream_failover", action: "toggleStreamFailover", toggleKey: "streamFailoverEnabled" },
+  { label: "MPV diagnostics", textKey: "player_hud_mpv_diagnostics", action: "toggleMpvDiagnostics", toggleKey: "mpvDiagnosticsEnabled" },
+  { label: "Close menu after selecting", textKey: "player_hud_close_menu_after_selecting", action: "toggleCloseOnSelect", toggleKey: "closeMenuOnSelect" },
 ];
 
 let contextMenuOpen = false;
@@ -2369,7 +2822,7 @@ window.nuvioToggleMpvDiagnostics = () => {
   mpvDiagnosticsEnabled = !mpvDiagnosticsEnabled;
   renderChrome();
   refreshContextMenuIndicators();
-  window.nuvioShowPresetPill("MPV diagnostics", mpvDiagnosticsEnabled ? "On" : "Off");
+  window.nuvioShowPresetPill(hudText("player_hud_mpv_diagnostics", "MPV diagnostics"), mpvDiagnosticsEnabled ? hudText("compose_action_on", "On") : hudText("compose_action_off", "Off"));
   send("toggleMpvDiagnostics", mpvDiagnosticsEnabled ? 1 : 0);
 };
 
@@ -2438,10 +2891,9 @@ const seekStepSeconds = () => {
 // there is no number to redraw there.
 const refreshSeekStepLabels = () => {
   const seconds = seekStepSeconds();
-  const unit = seconds === 1 ? "second" : "seconds";
   const labels = {
-    seekBack: `Seek back ${seconds} ${unit}`,
-    seekForward: `Seek forward ${seconds} ${unit}`,
+    seekBack: seconds === 1 ? hudText("player_hud_seek_back_1_second", "Seek back 1 second") : hudFormat("player_hud_seek_back_1_s_seconds", "Seek back %1$s seconds", seconds),
+    seekForward: seconds === 1 ? hudText("player_hud_seek_forward_1_second", "Seek forward 1 second") : hudFormat("player_hud_seek_forward_1_s_seconds", "Seek forward %1$s seconds", seconds),
   };
   Object.entries(labels).forEach(([key, text]) => {
     if (contextMenu) {
@@ -2494,7 +2946,7 @@ const setContextMenuDynamicItems = (key, items) => {
   contextMenuDynamicSignatures.set(key, signature);
   submenu.textContent = "";
   buildContextMenu(entries.map((item, index) => ({
-    label: String(item.label || item.display || item.languageLabel || item.title || "Option"),
+    label: String(item.label || item.display || item.languageLabel || item.title || hudText("player_hud_option", "Option")),
     action: item.action || (key === "subtitleTracks"
       ? `send:selectBuiltInSubtitleTrack:${Number(item.index ?? index)}`
       : key === "addonSubtitles"
@@ -2514,7 +2966,7 @@ const setContextMenuDynamicItems = (key, items) => {
   if (normalized.length === 0) {
     const empty = document.createElement("div");
     empty.className = "context-menu-empty";
-    empty.textContent = key === "addonSubtitles" ? "No addon subtitles loaded" : "No tracks available";
+    empty.textContent = key === "addonSubtitles" ? hudText("player_hud_no_addon_subtitles_loaded", "No addon subtitles loaded") : hudText("player_hud_no_tracks_available", "No tracks available");
     submenu.appendChild(empty);
   }
   refreshContextMenuIndicators();
@@ -2561,14 +3013,14 @@ const renderColorGradePanel = () => {
   Object.entries(COLOR_GRADE_VALUE_ELEMENTS).forEach(([command, element]) => {
     if (element) element.textContent = formatColorGradeValue(state[COLOR_GRADE_STATE_FIELDS[command]]);
   });
-  const isCustom = String(state.desktopColorProfileLabel || "") === "Custom";
+  const isCustom = String(state.desktopColorProfileLabel || "") === hudText("player_color_profile_custom_label", "Custom");
   if (colorGradeNote) {
     // Two different reasons the panel can look like it is doing nothing, and the user cannot tell
     // them apart from the picture alone: a preset is active (so these values are not in play), or
     // the grade is suppressed because the content is HDR.
     colorGradeNote.textContent = isCustom
-      ? "Not applied to HDR playback"
-      : `${state.desktopColorProfileLabel || "Neutral"} active — adjusting switches to Custom`;
+      ? hudText("player_hud_not_applied_to_hdr_playback", "Not applied to HDR playback")
+      : hudFormat("player_hud_1_s_active_adjusting_switches_to", "%1$s active — adjusting switches to Custom", state.desktopColorProfileLabel || hudText("player_color_profile_neutral_label", "Neutral"));
   }
   if (colorGradeReset) {
     const isNeutral = Object.values(COLOR_GRADE_STATE_FIELDS)
@@ -2660,16 +3112,23 @@ const openSubtitleContextTab = tab => {
 // Auto crop needs a few frames (~10 s) before the bars come off, so its pill says so and stays
 // up longer; otherwise picking it looks like nothing happened.
 const showAspectPill = label => {
-  if (label === "Auto crop") {
-    window.nuvioShowPresetPill("Aspect ratio", "Auto crop · detecting bars, ~10s", 4000);
+  if (label === resizeModeLabels()[3]) {
+    window.nuvioShowPresetPill(hudText("player_hud_aspect_ratio", "Aspect ratio"), hudText("player_hud_auto_crop_detecting_bars_10s", "Auto crop · detecting bars, ~10s"), 4000);
   } else {
-    window.nuvioShowPresetPill("Aspect ratio", label);
+    window.nuvioShowPresetPill(hudText("player_hud_aspect_ratio", "Aspect ratio"), label);
   }
 };
 
+const resizeModeLabels = () => [
+  hudText("compose_player_resize_fit", "Fit"),
+  hudText("compose_player_resize_fill", "Fill"),
+  hudText("compose_player_resize_zoom", "Zoom"),
+  hudText("compose_player_resize_auto_crop", "Auto crop"),
+];
+
 const cycleAspectFromControls = () => {
-  const modes = ["Fit", "Fill", "Zoom", "Auto crop"];
-  const currentIndex = Math.max(0, modes.findIndex(mode => mode.toLowerCase() === String(state.resizeModeLabel || "Fit").toLowerCase()));
+  const modes = resizeModeLabels();
+  const currentIndex = Math.max(0, modes.findIndex(mode => mode.toLowerCase() === String(state.resizeModeLabel || modes[0]).toLowerCase()));
   const next = modes[(currentIndex + 1) % modes.length];
   state = { ...state, resizeModeLabel: next };
   if (resizeLabel) resizeLabel.textContent = next;
@@ -2707,7 +3166,7 @@ const executeContextAction = action => {
   }
   if (kind === "resizeMode") {
     const index = Number(parts.shift() || 0);
-    const label = ["Fit", "Fill", "Zoom", "Auto crop"][index] || "Fit";
+    const label = resizeModeLabels()[index] || resizeModeLabels()[0];
     state = { ...state, resizeModeLabel: label };
     if (resizeLabel) resizeLabel.textContent = label;
     refreshContextMenuIndicators();
@@ -2716,7 +3175,7 @@ const executeContextAction = action => {
     return;
   }
   if (kind === "copyStreamUrl") {
-    window.nuvioShowPresetPill("Stream link", "Copied");
+    window.nuvioShowPresetPill(hudText("player_hud_stream_link", "Stream link"), hudText("player_hud_copied", "Copied"));
     send("copyStreamUrl", 0);
     return;
   }
@@ -2729,7 +3188,7 @@ const executeContextAction = action => {
     // persists the setting and pushes the corrected value back.
     const enabled = Boolean(state.streamFailoverEnabled);
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Stream failover", enabled ? "On" : "Off");
+    window.nuvioShowPresetPill(hudText("player_hud_stream_failover", "Stream failover"), enabled ? hudText("compose_action_on", "On") : hudText("compose_action_off", "Off"));
     send("toggleStreamFailover", enabled ? 1 : 0);
     return;
   }
@@ -2740,7 +3199,7 @@ const executeContextAction = action => {
     state = { ...state, uiScalePercent: clamped };
     applyUserUiScale(clamped);
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("UI scale", `${clamped > 0 ? "+" : ""}${clamped}%`);
+    window.nuvioShowPresetPill(hudText("player_hud_ui_scale", "UI scale"), `${clamped > 0 ? "+" : ""}${clamped}%`);
     send("setDesktopUiScalePercent", clamped);
     return;
   }
@@ -2758,7 +3217,7 @@ const executeContextAction = action => {
     };
     renderChrome();
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Controls layout", hudLayoutItems[index].label);
+    window.nuvioShowPresetPill(hudText("player_hud_controls_layout", "Controls layout"), hudText(hudLayoutItems[index].textKey, hudLayoutItems[index].label));
     send("selectDesktopHudLayout", index);
     return;
   }
@@ -2768,7 +3227,7 @@ const executeContextAction = action => {
     state = { ...state, playbackSpeedLabel: label };
     speedLabel.textContent = label;
     refreshContextMenuIndicators();
-    window.nuvioShowPresetPill("Playback speed", label);
+    window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), label);
     send("setPlaybackSpeed", next);
     return;
   }
@@ -2879,7 +3338,8 @@ const buildContextMenu = (items, parent) => {
     if (item.labelKey) button.dataset.labelKey = item.labelKey;
     if (item.selectedField) {
       button.dataset.selectedField = item.selectedField;
-      button.dataset.selectedValue = String(item.selectedValue ?? item.label);
+      button.dataset.selectedValue = String(item.selectedValue ?? hudText(item.textKey, item.label));
+      if (item.selectedValue == null && item.textKey) button.dataset.i18nSelectedValue = item.textKey;
     }
     if (item.swatch) {
       const dot = document.createElement("span");
@@ -2889,7 +3349,8 @@ const buildContextMenu = (items, parent) => {
     }
     const label = document.createElement("span");
     label.className = "context-menu-label";
-    label.textContent = item.label;
+    label.textContent = hudText(item.textKey, item.label);
+    if (item.textKey) label.dataset.i18n = item.textKey;
     button.appendChild(label);
     if (item.toggleKey || item.selectedField || item.selected) {
       const indicator = document.createElement("span");
@@ -2962,9 +3423,9 @@ window.nuvioOpenAnimeShaderContextMenu = items => {
 // option) mid-interaction even with "Close menu after selecting" turned off. A selection-only
 // change is therefore applied to the existing rows instead of rebuilding them.
 const mpvOptionsStructureSignature = list => JSON.stringify(list.map(option => [
-  String(option.label || "Option"),
+  String(option.label || hudText("player_hud_option", "Option")),
   (Array.isArray(option.choices) ? option.choices : [])
-    .map(choice => [String(choice.label || "Option"), Number(choice.index) || 0]),
+    .map(choice => [String(choice.label || hudText("player_hud_option", "Option")), Number(choice.index) || 0]),
 ]));
 
 let mpvOptionsMenuSignature = "";
@@ -3011,14 +3472,14 @@ window.nuvioSetMpvOptionsMenu = options => {
   if (list.length === 0) {
     const empty = document.createElement("div");
     empty.className = "context-menu-empty";
-    empty.textContent = "No options available";
+    empty.textContent = hudText("player_hud_no_options_available", "No options available");
     submenu.appendChild(empty);
     return;
   }
   buildContextMenu(list.map(option => ({
-    label: String(option.label || "Option"),
+    label: String(option.label || hudText("player_hud_option", "Option")),
     children: (Array.isArray(option.choices) ? option.choices : []).map(choice => ({
-      label: String(choice.label || "Option"),
+      label: String(choice.label || hudText("player_hud_option", "Option")),
       action: `send:selectMpvOption:${Number(choice.index) || 0}`,
       selected: Boolean(choice.selected),
     })),
@@ -3043,7 +3504,8 @@ const SUBTITLE_COLOR_NAMES = {
 const describeSubtitleColor = value => {
   const clean = String(value || "").replace(/^#/, "").toUpperCase();
   const rgb = clean.length >= 6 ? clean.slice(-6) : clean.padStart(6, "0");
-  return { css: `#${rgb}`, name: SUBTITLE_COLOR_NAMES[rgb] || null };
+  const name = SUBTITLE_COLOR_NAMES[rgb];
+  return { css: `#${rgb}`, name: name ? hudText(`player_hud_color_${name.toLowerCase()}`, name) : null };
 };
 
 const subtitleColorContextEntries = field => {
@@ -3051,7 +3513,7 @@ const subtitleColorContextEntries = field => {
   const entries = (state.subtitleColorSwatches || []).map((value, index) => {
     const info = describeSubtitleColor(value);
     return {
-      label: info.name || `Color ${index + 1}`,
+      label: info.name || hudFormat("player_hud_color_1_s", "Color %1$s", index + 1),
       swatch: info.css,
       // Compared on RGB alone, like the swatch row: the opacity stepper moves the alpha of the
       // same chosen colour, and that should not read as "nothing is selected".
@@ -3060,7 +3522,7 @@ const subtitleColorContextEntries = field => {
   });
   const custom = !entries.some(entry => entry.selected);
   entries.push({
-    label: "Custom...",
+    label: hudText("player_hud_custom", "Custom..."),
     action: `subtitleColorPrompt:${field}`,
     swatch: custom ? describeSubtitleColor(style[field]).css : undefined,
     selected: custom,
@@ -3074,7 +3536,7 @@ const refreshSubtitleStyleContextSubmenus = () => {
     "fontFamilies",
     (state.subtitleFontFamilies || []).map(value => ({
       value,
-      label: value || "Default",
+      label: value || hudText("player_hud_default", "Default"),
       selected: value === style.fontFamily,
     })),
   );
@@ -3297,19 +3759,19 @@ const renderAudioTrackList = () => {
     if (context) {
       context.font = `700 15px ${uiFontStack}`;
       const widest = tracks.reduce((width, track, index) => {
-        const label = track.label || track.language || `Track ${Number(track.index || index) + 1}`;
+        const label = track.label || track.language || hudFormat("player_hud_track_1_s", "Track %1$s", Number(track.index || index) + 1);
         return Math.max(width, context.measureText(String(label)).width);
-      }, context.measureText("Audio tracks").width);
+      }, context.measureText(hudText("player_hud_audio_tracks", "Audio tracks")).width);
       const viewportLimit = Math.max(320, window.innerWidth * .70);
       audioPanel.style.width = `${Math.round(Math.min(viewportLimit, Math.max(360, (widest + 104) * 1.15)))}px`;
     }
   }
   if (tracks.length === 0) {
-    appendEmptyTrackState(audioTrackList, "No audio tracks available");
+    appendEmptyTrackState(audioTrackList, hudText("player_hud_no_audio_tracks_available", "No audio tracks available"));
     return;
   }
   tracks.forEach(track => {
-    const label = track.label || track.language || `Track ${Number(track.index || 0) + 1}`;
+    const label = track.label || track.language || hudFormat("player_hud_track_1_s", "Track %1$s", Number(track.index || 0) + 1);
     // A track whose label is already just its language ("Tamil", from a title-less track) would
     // otherwise repeat itself on both lines.
     const languageLabel = String(track.languageLabel || "");
@@ -3356,7 +3818,7 @@ const renderSubtitleTrackList = () => {
     () => send("selectBuiltInSubtitleTrack", -1),
   );
   tracks.forEach(track => {
-    const label = track.label || track.language || `Subtitle ${Number(track.index || 0) + 1}`;
+    const label = track.label || track.language || hudFormat("player_hud_subtitle_1_s", "Subtitle %1$s", Number(track.index || 0) + 1);
     const detail = [track.language, track.id ? `ID: ${track.id}` : ""].filter(Boolean).join(" · ");
     appendSubtitleTrackRow(
       subtitleTrackList,
@@ -3393,7 +3855,7 @@ const renderAddonSubtitleList = () => {
   addonSubtitleListRenderKey = nextRenderKey;
   addonSubtitleList.textContent = "";
   if (state.isLoadingAddonSubtitles) {
-    appendEmptyTrackState(addonSubtitleList, "Loading subtitles...");
+    appendEmptyTrackState(addonSubtitleList, hudText("player_hud_loading_subtitles", "Loading subtitles..."));
     return;
   }
   if (items.length === 0) {
@@ -3413,7 +3875,7 @@ const renderAddonSubtitleList = () => {
   }
   const anyDownloadInProgress = items.some(candidate => Boolean(candidate.isDownloading));
   items.forEach(item => {
-    const label = item.display || item.languageLabel || "Subtitle";
+    const label = item.display || item.languageLabel || hudText("player_hud_subtitle", "Subtitle");
     const secondary = [item.languageLabel, item.addonName, item.id ? `ID: ${item.id}` : ""]
       .filter(Boolean)
       .join(" · ");
@@ -3523,6 +3985,12 @@ const sameRgb = (left, right) => {
   return a.red === b.red && a.green === b.green && a.blue === b.blue;
 };
 
+// A swatch matches on colour and on whether it is see-through at all: "None" (fully transparent
+// black) and solid black share their RGB, and comparing RGB alone lit both in the Background row.
+// Partial alpha still matches, since Opacity and Intensity are set separately from the swatch.
+const sameSwatch = (left, right) =>
+  sameRgb(left, right) && (parseArgb(left).alpha === 0) === (parseArgb(right).alpha === 0);
+
 const renderSwatches = (container, selectedColor, eventType, availableColors = state.subtitleColorSwatches) => {
   container.textContent = "";
   const colors = Array.isArray(availableColors) ? availableColors : [];
@@ -3530,7 +3998,7 @@ const renderSwatches = (container, selectedColor, eventType, availableColors = s
     const parsed = parseArgb(color);
     const swatch = document.createElement("button");
     swatch.type = "button";
-    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameRgb(color, selectedColor) ? " selected" : ""}`;
+    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameSwatch(color, selectedColor) ? " selected" : ""}`;
     swatch.style.setProperty("--swatch", parsed.css);
     swatch.addEventListener("click", event => {
       event.stopPropagation();
@@ -3543,11 +4011,11 @@ const renderSwatches = (container, selectedColor, eventType, availableColors = s
   if (!field) return;
   // Trailing entry: a dashed "+" normally, and the colour itself once one is in use that no preset
   // covers - otherwise a custom colour would leave the whole row looking unselected.
-  const isCustom = !colors.some(color => sameRgb(color, selectedColor));
+  const isCustom = !colors.some(color => sameSwatch(color, selectedColor));
   const custom = document.createElement("button");
   custom.type = "button";
   custom.className = `swatch custom${isCustom ? " has-color selected" : ""}`;
-  custom.title = "Custom color";
+  custom.title = hudText("player_hud_custom_color", "Custom color");
   if (isCustom) {
     custom.style.setProperty("--swatch", parseArgb(selectedColor).css);
   } else {
@@ -3679,6 +4147,14 @@ const renderAssStyleRows = style => {
   }
 };
 
+// The Style tab's On/Off controls are switches: the label text stays for the strings, the state is
+// read from aria-checked, which the switch styling keys on.
+const setStyleSwitch = (button, on) => {
+  button.textContent = on ? (state.onLabel || "On") : (state.offLabel || "Off");
+  button.setAttribute("aria-checked", on ? "true" : "false");
+  button.classList.toggle("primary", on);
+};
+
 const renderSubtitleStylePanel = () => {
   const style = state.subtitleStyle || {};
   subtitleDelayLabel.textContent = state.subtitleDelayLabel || "Subtitle Delay";
@@ -3704,7 +4180,7 @@ const renderSubtitleStylePanel = () => {
       fonts.forEach((family, index) => {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = family === "" ? "Default" : family;
+        option.textContent = family === "" ? hudText("player_hud_default", "Default") : family;
         fontFamilySelect.appendChild(option);
       });
       fontFamilySelect.dataset.count = String(fonts.length);
@@ -3714,13 +4190,13 @@ const renderSubtitleStylePanel = () => {
     fontFamilySelect.value = String(selectedIndex >= 0 ? selectedIndex : 0);
   }
   outlineLabel.textContent = state.outlineLabel || "Outline";
-  outlineToggle.textContent = style.outlineEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
-  outlineToggle.classList.toggle("primary", Boolean(style.outlineEnabled));
+  setStyleSwitch(outlineToggle, Boolean(style.outlineEnabled));
+  if (subtitleOutlineGroup) subtitleOutlineGroup.classList.toggle("style-group-off", !style.outlineEnabled);
   outlineWidthLabel.textContent = state.outlineWidthLabel || "Outline Width";
   outlineWidthValue.textContent = String(Number(style.outlineWidth) || 0);
   shadowLabel.textContent = state.shadowLabel || "Shadow";
-  shadowToggle.textContent = style.shadowEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
-  shadowToggle.classList.toggle("primary", Boolean(style.shadowEnabled));
+  setStyleSwitch(shadowToggle, Boolean(style.shadowEnabled));
+  if (subtitleShadowGroup) subtitleShadowGroup.classList.toggle("style-group-off", !style.shadowEnabled);
   shadowOffsetLabel.textContent = state.shadowOffsetLabel || "Shadow Offset";
   shadowOffsetValue.textContent = (Number(style.shadowOffset) / 10).toFixed(1);
   shadowIntensityLabel.textContent = state.shadowIntensityLabel || "Shadow Intensity";
@@ -3729,11 +4205,9 @@ const renderSubtitleStylePanel = () => {
   blurLabel.textContent = state.blurLabel || "Blur";
   blurValue.textContent = String(Number(style.blur) || 0);
   boldLabel.textContent = state.boldLabel || "Bold";
-  boldToggle.textContent = style.bold ? (state.onLabel || "On") : (state.offLabel || "Off");
-  boldToggle.classList.toggle("primary", Boolean(style.bold));
+  setStyleSwitch(boldToggle, Boolean(style.bold));
   italicLabel.textContent = state.italicLabel || "Italic";
-  italicToggle.textContent = style.italic ? (state.onLabel || "On") : (state.offLabel || "Off");
-  italicToggle.classList.toggle("primary", Boolean(style.italic));
+  setStyleSwitch(italicToggle, Boolean(style.italic));
   bottomOffsetLabel.textContent = state.bottomOffsetLabel || "Bottom Offset";
   bottomOffsetValue.textContent = String(Number(style.bottomOffset) || 0);
   renderAssStyleRows(style);
@@ -3893,7 +4367,7 @@ const buildSourceRow = (item, onSelect) => {
   top.className = "track-row-top";
   const name = document.createElement("span");
   name.className = "stream-name";
-  name.textContent = item.label || "Stream";
+  name.textContent = item.label || hudText("player_hud_stream", "Stream");
   top.appendChild(name);
   if (item.isCurrent) {
     const chip = document.createElement("span");
@@ -3908,8 +4382,17 @@ const buildSourceRow = (item, onSelect) => {
     const tone = item.scoreRejected || item.score < 0 ? " negative" : item.score > 0 ? " positive" : "";
     scoreChip.className = `score-chip${tone}`;
     scoreChip.textContent = item.score > 0 ? `+${item.score}` : String(item.score);
-    if (item.scoreRejected) scoreChip.title = "Below the minimum score";
+    if (item.scoreRejected) scoreChip.title = hudText("player_hud_below_the_minimum_score", "Below the minimum score");
     top.appendChild(scoreChip);
+  }
+  // The addon name rides at the end of the title line, as a quiet glass tag, rather than taking a
+  // line of its own under the badges: on a long list that trailing line was a third of every row.
+  if (item.addonName) {
+    const addon = document.createElement("span");
+    addon.className = "stream-addon-inline";
+    addon.textContent = item.addonName;
+    addon.title = item.addonName;
+    top.appendChild(addon);
   }
   let subtitle = null;
   if (item.subtitle) {
@@ -3920,7 +4403,7 @@ const buildSourceRow = (item, onSelect) => {
 
   const badges = Array.isArray(item.badges) ? item.badges : [];
   let badgeRail = null;
-  if (badges.length > 0 || item.addonName) {
+  if (badges.length > 0) {
     badgeRail = document.createElement("span");
     badgeRail.className = "stream-badges";
     badges.forEach(badge => {
@@ -3949,12 +4432,6 @@ const buildSourceRow = (item, onSelect) => {
       }
       badgeRail.appendChild(badgeElement);
     });
-    if (item.addonName) {
-      const addon = document.createElement("span");
-      addon.className = "stream-addon-inline";
-      addon.textContent = item.addonName;
-      badgeRail.appendChild(addon);
-    }
   }
   if (badgeRail && state.sourceBadgePlacement === "top") copy.appendChild(badgeRail);
   copy.appendChild(top);
@@ -4157,7 +4634,7 @@ const renderSourceSortMenu = () => {
   const divider = document.createElement("div");
   divider.className = "source-sort-divider";
   sourceSortMenu.appendChild(divider);
-  appendFilterChip(sourceSortMenu, "Cached first", Boolean(state.sourceCachedFirst), () => {
+  appendFilterChip(sourceSortMenu, hudText("player_hud_cached_first", "Cached first"), Boolean(state.sourceCachedFirst), () => {
     pinSourceListTop();
     send("setSourceCachedFirst", state.sourceCachedFirst ? 0 : 1);
   });
@@ -4198,7 +4675,7 @@ const renderSourceModal = () => {
     sourceVirtualRenderRaf = 0;
     appendEmptyTrackState(
       sourceList,
-      state.sourceIsLoading ? "Loading streams..." : (state.noStreamsLabel || "No streams found"),
+      state.sourceIsLoading ? hudText("player_hud_loading_streams", "Loading streams...") : (state.noStreamsLabel || "No streams found"),
     );
     return;
   }
@@ -4311,7 +4788,7 @@ const appendEpisodeRow = (container, item, keyboardIndex) => {
   if (item.isWatched) {
     const watched = document.createElement("span");
     watched.className = "episode-watched";
-    watched.setAttribute("aria-label", "Watched");
+    watched.setAttribute("aria-label", hudText("player_hud_watched", "Watched"));
     watched.appendChild(buildCheckIcon());
     top.appendChild(watched);
   }
@@ -4320,7 +4797,7 @@ const appendEpisodeRow = (container, item, keyboardIndex) => {
   copy.className = "episode-copy";
   const name = document.createElement("span");
   name.className = "episode-name";
-  name.textContent = item.title || item.code || "Episode";
+  name.textContent = item.title || item.code || hudText("player_hud_episode", "Episode");
   copy.appendChild(name);
   if (item.overview) {
     const overview = document.createElement("span");
@@ -4487,7 +4964,7 @@ const renderEpisodeStreams = () => {
   if (items.length === 0) {
     appendEmptyTrackState(
       episodeStreamList,
-      state.episodeStreamsIsLoading ? "Loading streams..." : (state.noStreamsLabel || "No streams found"),
+      state.episodeStreamsIsLoading ? hudText("player_hud_loading_streams", "Loading streams...") : (state.noStreamsLabel || "No streams found"),
     );
     return;
   }
@@ -4637,6 +5114,7 @@ const renderActiveModal = () => {
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
   if (activeModal === "party") renderPartyModal();
+  if (activeModal === "streamInfo") renderStreamInfoModal();
 };
 
 window.nuvioNativeViewportChanged = () => {
@@ -4660,6 +5138,44 @@ const trackListSignature = tracks =>
     ].join(":"))
     .join("|");
 
+// Live TV's loading bar. Driven by the real stages rather than a timer alone: connecting fills
+// toward 45%, playing (the opening jump still to land) toward 90%, and landing completes it as the
+// cover fades. Each stage eases toward its ceiling, so the bar always moves but never claims done.
+let iptvLoadingProgress = 0;
+let iptvLoadingFrame = 0;
+let iptvLoadingLastAt = 0;
+const iptvLoadingCeiling = () => (state.isPlaying && !state.isLoading ? 0.9 : 0.45);
+const stepIptvLoadingBar = now => {
+  const bar = document.getElementById("iptvLoadingBar");
+  const elapsed = iptvLoadingLastAt ? Math.min(100, now - iptvLoadingLastAt) : 16;
+  iptvLoadingLastAt = now;
+  const ceiling = iptvLoadingCeiling();
+  if (iptvLoadingProgress < ceiling) {
+    // About 1.2s to close most of the gap to the ceiling.
+    iptvLoadingProgress += (ceiling - iptvLoadingProgress) * (1 - Math.exp(-elapsed / 1200));
+  }
+  if (bar) bar.style.width = `${(iptvLoadingProgress * 100).toFixed(2)}%`;
+  iptvLoadingFrame = requestAnimationFrame(stepIptvLoadingBar);
+};
+const setIptvLoading = (active, channelLabel) => {
+  const bar = document.getElementById("iptvLoadingBar");
+  if (active) {
+    const name = document.getElementById("iptvLoadingName");
+    if (name) name.textContent = channelLabel || "";
+    if (!iptvLoadingFrame) {
+      iptvLoadingProgress = 0;
+      iptvLoadingLastAt = 0;
+      if (bar) bar.style.width = "0%";
+      iptvLoadingFrame = requestAnimationFrame(stepIptvLoadingBar);
+    }
+    return;
+  }
+  if (!iptvLoadingFrame) return;
+  cancelAnimationFrame(iptvLoadingFrame);
+  iptvLoadingFrame = 0;
+  if (bar) bar.style.width = "100%";
+};
+
 const renderOpeningOverlay = suppress => {
   const progress = normalizedOpeningProgress();
   const artworkUrl = setImageSource(openingArtwork, state.openingArtwork);
@@ -4669,13 +5185,21 @@ const renderOpeningOverlay = suppress => {
   const hasProgress = progress !== null;
   const openingBootstrap = !hasReceivedPlayerControls;
   const wantsOpening = Boolean(openingBootstrap || state.showOpeningOverlay);
-  const showOpening = Boolean(!suppress && wantsOpening && state.isLoading);
+  // Live TV holds the cover over a channel's opening until its jump to the edge has landed, so
+  // the stale backlog it starts on is never shown and then cut away from.
+  const iptvOpening = Boolean(state.iptv && iptvOpeningJumpPending());
+  const showOpening = Boolean(!suppress && ((wantsOpening && state.isLoading) || iptvOpening));
   const titleText = String(state.openingTitle || state.title || "").trim();
   const messageText = String(state.openingMessage || "").trim();
   const showHorizontalProgress = hasProgress && !logoUrl;
 
   root.classList.toggle("opening-active", showOpening);
   openingOverlay.classList.toggle("visible", showOpening);
+  // Kept on while the cover fades out after loading, so the fade shows the full bar, not the film
+  // layout; it changes over only when the next showing is not a channel.
+  const iptvLoading = Boolean(showOpening && state.iptv);
+  if (showOpening) openingOverlay.classList.toggle("iptv-loading", iptvLoading);
+  setIptvLoading(iptvLoading, state.iptv ? (state.iptv.channelLabel || "") : "");
   openingOverlay.classList.toggle("has-artwork", Boolean(artworkUrl));
   openingOverlay.classList.toggle("has-progress", hasProgress);
   openingOverlay.setAttribute("aria-hidden", showOpening ? "false" : "true");
@@ -4980,7 +5504,7 @@ const finishChromePointerInteraction = event => {
 const renderPlaylistPeek = () => {
   const items = Array.isArray(state.playlistPeekItems) ? state.playlistPeekItems : [];
   const hasPeek = items.length > 0 && Boolean(state.playlistPeekTitle);
-  setText(playlistPeekTag, hasPeek ? `Playlist · ${state.playlistPeekTitle}` : "");
+  setText(playlistPeekTag, hasPeek ? hudFormat("player_hud_playlist_1_s", "Playlist · %1$s", state.playlistPeekTitle) : "");
   // Called from renderChrome, so close without re-rendering (setPlaylistPeekOpen would recurse).
   if (!hasPeek && playlistPeekOpen) {
     playlistPeekOpen = false;
@@ -5001,7 +5525,7 @@ const renderPlaylistPeek = () => {
       row.disabled = true;
       row.setAttribute("aria-current", "true");
     } else {
-      row.title = "Play this now";
+      row.title = hudText("player_hud_play_this_now", "Play this now");
       row.addEventListener("click", event => {
         event.stopPropagation();
         setPlaylistPeekOpen(false);
@@ -5018,7 +5542,7 @@ const renderPlaylistPeek = () => {
     rowTitle.textContent = String(item.title || "");
     const rowSubtitle = document.createElement("span");
     rowSubtitle.className = "playlist-peek-subtitle";
-    const label = item.state === "next" ? "Up next" : item.state === "played" ? "Played" : "";
+    const label = item.state === "next" ? hudText("player_hud_up_next", "Up next") : item.state === "played" ? hudText("player_hud_played", "Played") : "";
     rowSubtitle.textContent = [String(item.subtitle || ""), label].filter(Boolean).join(" · ");
     copy.append(rowTitle, rowSubtitle);
     row.append(position, copy);
@@ -5079,22 +5603,33 @@ const debouncedBuffering = wanted => {
 // reaches, `rewindWindowMs`) to the end of what has been received (`bufferedMs`, absolute, from
 // playerUpdate), which is the live edge. Within a few seconds of the edge counts as live; further
 // back, the badge shows the gap and jumps to the edge when clicked.
-const IPTV_LIVE_SLACK_MS = 10000;
+const IPTV_LIVE_SLACK_MS = 15000;
+// Where Go live and a channel's opening jump land, short of the received end. 5s kept playback
+// close to live but left a 5s buffer, and a provider/proxy delivery gap longer than that stalled
+// (three 5-15s stalls in one evening's session); 10s rides those out. Under IPTV_LIVE_SLACK_MS
+// with room for the buffer to wobble, so the badge reads LIVE after the jump.
+const IPTV_GO_LIVE_CUSHION_MS = 10000;
 let iptvWindowChannel = "";
 let iptvEarliestSeenMs = null;
 
-const iptvBehindLiveMs = () => {
+const iptvRawBehindLiveMs = () => {
   const positionMs = Math.max(0, Number(state.positionMs) || 0);
   const bufferedMs = Math.max(0, Number(state.bufferedMs) || 0);
   return bufferedMs > positionMs ? bufferedMs - positionMs : 0;
 };
+
+// What the badge and seek bar show. Pinned to the edge while a channel's opening jump is pending
+// (see maybeAutoGoLive): otherwise the connect burst pulled the received end ~30s ahead within a
+// second, the thumb slid back and the badge read -0:28, and the jump then threw it forward again,
+// which looked like the player seeking back and forth when playback itself only moved once.
+const iptvBehindLiveMs = () => (iptvOpeningJumpPending() ? 0 : iptvRawBehindLiveMs());
 
 // [start, end] of the live seek bar in absolute stream time, or null when not live TV.
 const iptvLiveWindow = () => {
   const iptv = state.iptv;
   if (!iptv) return null;
   const positionMs = Math.max(0, Number(state.positionMs) || 0);
-  const end = Math.max(positionMs, Number(state.bufferedMs) || 0);
+  const end = iptvOpeningJumpPending() ? positionMs : Math.max(positionMs, Number(state.bufferedMs) || 0);
   // A new channel (or a reconnect that restarted the clock) starts a new window.
   if (iptv.channelLabel !== iptvWindowChannel || iptvEarliestSeenMs === null || positionMs + 5000 < iptvEarliestSeenMs) {
     iptvWindowChannel = iptv.channelLabel;
@@ -5106,6 +5641,47 @@ const iptvLiveWindow = () => {
   return { start, end: Math.max(end, start + 1000) };
 };
 
+// Opening a channel: the provider's connect burst lands 20-30s of backlog in the cache and mpv
+// plays from the start of it, so every channel opened that far behind live. Once per channel, just
+// into playback (the burst arrives at line speed, so it is in by then), either jump to the edge the
+// way Go live does or, when the burst was small, settle where it is. One decision, early, so it
+// never second-guesses a rewind the viewer made. The opening cover stays up until it has landed
+// (renderOpeningOverlay), so the backlog's first frames are never seen.
+const IPTV_AUTO_LIVE_FROM_MS = 500;
+// How long the display stays pinned after the jump is sent, while mpv lands it.
+const IPTV_AUTO_LIVE_LANDING_MS = 2000;
+let iptvAutoLiveChannel = null;
+let iptvAutoLiveStartMs = 0;
+let iptvAutoLiveDone = false;
+let iptvAutoLiveSentAt = 0;
+
+// True from a channel's first update until its opening jump has landed (or was not needed).
+function iptvOpeningJumpPending() {
+  const iptv = state.iptv;
+  if (!iptv) return false;
+  if (iptv.channelLabel !== iptvAutoLiveChannel || !iptvAutoLiveDone) return true;
+  return iptvAutoLiveSentAt > 0 &&
+    Date.now() - iptvAutoLiveSentAt < IPTV_AUTO_LIVE_LANDING_MS &&
+    iptvRawBehindLiveMs() > IPTV_LIVE_SLACK_MS;
+}
+
+const maybeAutoGoLive = iptv => {
+  const positionMs = Math.max(0, Number(state.positionMs) || 0);
+  if (iptv.channelLabel !== iptvAutoLiveChannel) {
+    iptvAutoLiveChannel = iptv.channelLabel;
+    iptvAutoLiveStartMs = positionMs;
+    iptvAutoLiveDone = false;
+    iptvAutoLiveSentAt = 0;
+  }
+  if (iptvAutoLiveDone) return;
+  const playedMs = positionMs - iptvAutoLiveStartMs;
+  if (!state.isPlaying || state.isLoading || playedMs < IPTV_AUTO_LIVE_FROM_MS) return;
+  iptvAutoLiveDone = true;
+  if (iptvRawBehindLiveMs() <= IPTV_LIVE_SLACK_MS) return;
+  iptvAutoLiveSentAt = Date.now();
+  send("goLive", IPTV_GO_LIVE_CUSHION_MS);
+};
+
 const renderIptvLive = () => {
   const iptv = state.iptv || null;
   root.classList.toggle("iptv-live", Boolean(iptv));
@@ -5113,6 +5689,7 @@ const renderIptvLive = () => {
   setVisible(iptvLiveBadge, Boolean(iptv));
   setVisible(iptvChannelsButton, Boolean(iptv));
   if (!iptv) return;
+  maybeAutoGoLive(iptv);
   // The previous/next buttons beside play change channel.
   document.querySelectorAll(".episode-skip").forEach(button => {
     setVisible(button, true);
@@ -5145,9 +5722,11 @@ const renderIptvLive = () => {
 iptvLiveBadge.addEventListener("click", event => {
   event.stopPropagation();
   if (!state.iptv || iptvBehindLiveMs() <= IPTV_LIVE_SLACK_MS) return;
-  // Just short of the received end, so mpv lands on data it has rather than waiting for more.
-  const target = Math.max(0, (Number(state.bufferedMs) || 0) - 2000);
-  send("scrubFinish", target);
+  // Short of the received end, so mpv lands on data it has and keeps a cushion: at the very edge
+  // any pause in the provider's delivery longer than the gap left shows up as a stall. The bridge
+  // picks the target from mpv's own seekable cache range rather than this side's bufferedMs; a
+  // seek past that range threw the cache away and restarted from the connection.
+  send("goLive", IPTV_GO_LIVE_CUSHION_MS);
 });
 
 // Typing a channel number: digits collect in a box and the number is sent after a pause.
@@ -5396,6 +5975,7 @@ const renderChrome = () => {
   root.classList.toggle("seek-handle-hidden", state.seekHandleEnabled === false);
   root.classList.toggle("vignette-hidden", state.hudVignetteEnabled === false);
   applyHiddenHudButtons(state.hiddenHudButtons);
+  applyHudButtonOrder(state.hudButtonOrder);
   // The official bar also reads the time as one "position / duration" readout, right-aligned.
   applyMinimalHudTimeLayout(minimalHud || officialHud);
   applyUltraHudLayout(ultraHud);
@@ -5461,6 +6041,7 @@ const renderChrome = () => {
   setVisible(episodesButton, Boolean(state.showEpisodes));
   setVisible(episodeNotch, Boolean(state.showEpisodes));
   renderPartyChrome(isChromeHidden, pictureInPictureActive);
+  renderPartyUnread();
   const sourceNotchPosition = ["left", "hidden"].includes(state.sourceNotchPosition)
     ? state.sourceNotchPosition
     : "right";
@@ -5490,12 +6071,12 @@ const renderChrome = () => {
   submitIntroButton.dataset.tooltip = submitIntroButtonLabel;
   videoSettingsButton.setAttribute("aria-label", state.videoSettingsLabel || "Video settings");
   const pictureInPictureLabel = state.pictureInPictureActive
-    ? "Exit picture in picture"
+    ? hudText("player_hud_exit_picture_in_picture", "Exit picture in picture")
     : (state.pictureInPictureLabel || "Picture in picture");
   pictureInPictureButton.setAttribute("aria-label", pictureInPictureLabel);
   pictureInPictureButton.setAttribute("title", pictureInPictureLabel);
   pictureInPictureButton.classList.toggle("selected", Boolean(state.pictureInPictureActive));
-  pictureInPictureExitButton.setAttribute("aria-label", "Exit picture in picture");
+  pictureInPictureExitButton.setAttribute("aria-label", hudText("player_hud_exit_picture_in_picture", "Exit picture in picture"));
   const pictureInPicturePlaybackLabel = isPlaying ? (state.pauseLabel || "Pause") : (state.playLabel || "Play");
   pictureInPicturePlayButton.setAttribute("aria-label", pictureInPicturePlaybackLabel);
   pictureInPicturePlayButton.setAttribute("title", pictureInPicturePlaybackLabel);
@@ -5529,7 +6110,7 @@ const updatePlayerClock = () => {
   const speed = Number.isFinite(parsedSpeed) && parsedSpeed > 0 ? parsedSpeed : 1;
   const remainingWallMs = Math.max(0, durationMs - positionMs) / speed;
   const endTime = new Date(now.getTime() + remainingWallMs);
-  const contentLabel = String(state.episodeText || "").trim() ? "Episode" : "Movie";
+  const contentLabel = String(state.episodeText || "").trim() ? hudText("player_hud_episode", "Episode") : hudText("player_hud_movie", "Movie");
   // Live TV never ends; the same spot (and its click, "back") is the way out.
   playerEndTime.textContent = state.iptv
     ? (state.iptv.exitLabel || state.closeLabel || "Exit")
@@ -5563,6 +6144,41 @@ heroTrailerChrome.innerHTML =
   '</button>' +
   '<input id="heroTrailerVolumeSlider" class="hero-trailer-volume" type="range" min="0" max="100" step="1" value="0" aria-label="Trailer volume">';
 heroTrailerChrome.style.display = "none";
+if (isPreshowSurface) {
+  // Mute and the slider stay in the DOM (the code below updates them) but are hidden by CSS; the
+  // stop button becomes a labelled Skip, which sends the same Back action Kotlin already handles.
+  heroTrailerChrome.classList.add("preshow");
+  // Hidden here as well as in CSS, so the pre-show never shows a sound control even if a stale
+  // stylesheet is in play. They stay in the DOM because the code below updates them.
+  heroTrailerChrome
+    .querySelectorAll('[data-command="heroTrailerMute"], .hero-trailer-volume')
+    .forEach(el => el.style.setProperty("display", "none", "important"));
+  const skipButton = heroTrailerChrome.querySelector('[data-command="back"]');
+  if (skipButton) {
+    skipButton.setAttribute("aria-label", "Skip");
+    skipButton.innerHTML =
+      '<span class="hero-trailer-skip-label">Skip</span>' +
+      '<svg><use href="#icon-skip-next"></use></svg>';
+  }
+  // "Add to library" pill beside Skip, same look. Kotlin supplies the label (empty hides it) and whether the
+  // title is already saved; a click tells Kotlin to save and the pill marks itself done straight away.
+  const addButton = document.createElement("button");
+  addButton.className = "hero-trailer-button";
+  addButton.type = "button";
+  addButton.id = "heroTrailerLibraryButton";
+  addButton.style.display = "none";
+  addButton.innerHTML =
+    '<span class="hero-trailer-skip-label"></span>' +
+    '<svg><use id="heroTrailerLibraryIcon" href="#icon-add"></use></svg>';
+  addButton.addEventListener("click", () => {
+    if (addButton.dataset.done === "1") return;
+    addButton.dataset.done = "1";
+    addButton.querySelector("use").setAttribute("href", "#icon-check");
+    addButton.querySelector(".hero-trailer-skip-label").textContent = "In library";
+    send("preshowAddToLibrary", 0);
+  });
+  heroTrailerChrome.insertBefore(addButton, skipButton || heroTrailerChrome.firstChild);
+}
 root.appendChild(heroTrailerChrome);
 
 const heroTrailerLogo = heroTrailerContent.querySelector("#heroTrailerLogo");
@@ -5685,6 +6301,20 @@ function applyHeroTrailerContent() {
   setHeroTrailerLine(heroTrailerTitle, useLogo ? "" : title);
   setHeroTrailerLine(heroTrailerMeta, state.heroTrailerMeta);
   setHeroTrailerLine(heroTrailerDescription, state.heroTrailerDescription);
+  const addButton = heroTrailerChrome.querySelector("#heroTrailerLibraryButton");
+  if (addButton) {
+    const label = String(state.heroTrailerLibraryLabel || "").trim();
+    // A new trailer pushes fresh state; only reset the pill when the title under it changed, so
+    // the "done" mark survives the other re-renders of the same trailer.
+    if (addButton.dataset.forTitle !== title) {
+      addButton.dataset.forTitle = title;
+      addButton.dataset.done = state.heroTrailerInLibrary ? "1" : "0";
+    }
+    const done = addButton.dataset.done === "1";
+    addButton.style.display = label ? "" : "none";
+    addButton.querySelector(".hero-trailer-skip-label").textContent = done ? "In library" : label;
+    addButton.querySelector("use").setAttribute("href", done ? "#icon-check" : "#icon-add");
+  }
 }
 
 const applyHeroTrailer = () => {
@@ -5700,6 +6330,12 @@ const applyHeroTrailer = () => {
   if (lastCursorHidden) {
     lastCursorHidden = false;
     send("cursorVisibility", 1);
+  }
+  if (isChromelessSurface) { // fork:music
+    heroTrailerFade.style.display = "none";
+    heroTrailerContent.style.display = "none";
+    heroTrailerChrome.style.display = "none";
+    return;
   }
   const { r, g, b } = parseHeroTrailerRgb(state.heroTrailerBackgroundColor);
   const opaque = `rgb(${r}, ${g}, ${b})`;
@@ -5878,7 +6514,7 @@ const syncPlayerVolumeControl = () => {
   }
   setIconHref(playerVolumeIcon, volumeIconHref());
   if (volumeMuteButton) {
-    const label = localMuted ? "Unmute" : "Mute";
+    const label = localMuted ? hudText("player_hud_unmute", "Unmute") : hudText("player_hud_mute", "Mute");
     volumeMuteButton.setAttribute("aria-label", label);
     volumeMuteButton.title = label;
   }
@@ -5900,6 +6536,12 @@ const showVolumePill = () => {
 
 const adjustLocalVolume = deltaPercent => {
   localVolume = Math.max(0, Math.min(200, localVolume + deltaPercent));
+  // As with the slider: a non-zero volume unmutes mpv (NativePlayerController.setVolume), so the
+  // wheel and the volume keys must clear the local flag too or the icon stays muted.
+  if (localMuted && localVolume > 0) {
+    localMuted = false;
+    refreshContextMenuIndicators();
+  }
   syncPlayerVolumeControl();
   showVolumePill();
 };
@@ -6029,19 +6671,63 @@ window.nuvioSetPlaybackInfo = payload => {
 // Badges beside the title: the decoded quality (from the video-profile pass, so it is what mpv
 // is actually playing, not what the source name claims) and the subtitle in use. Runs on every
 // position tick, hence the signature check.
+// Image badges from the user's badge pack, matched in Kotlin against what is decoding (Settings ->
+// Streams -> Show in player). When there are any they stand in for the text quality badge, which
+// says the same thing less well.
+let playerPackBadges = [];
+window.nuvioSetPlayerBadges = list => {
+  playerPackBadges = (Array.isArray(list) ? list : [])
+    .map(item => ({
+      name: String(item && item.name || ""),
+      imageURL: String(item && item.imageURL || ""),
+      // The pack's chip fill: many pack images are dark glyphs drawn for a white chip, and are
+      // unreadable (a black smudge) on the bare video without it.
+      backgroundColor: String(item && item.backgroundColor || ""),
+      borderColor: String(item && item.borderColor || ""),
+    }))
+    .filter(item => item.imageURL);
+  renderTitleBadges();
+};
+
 let titleBadgesSignature = null;
 const renderTitleBadges = () => {
   if (!titleBadges) return;
   const badges = [];
   const quality = String(playbackInfo.quality || "").trim();
   const subtitle = String(state.activeSubtitleLabel || "").trim();
-  if (quality) badges.push({ kind: "quality", text: quality });
+  playerPackBadges.forEach(item => badges.push({
+    kind: "image",
+    text: item.name,
+    imageURL: item.imageURL,
+    backgroundColor: item.backgroundColor,
+    borderColor: item.borderColor,
+  }));
+  if (quality && playerPackBadges.length === 0) badges.push({ kind: "quality", text: quality });
   if (subtitle) badges.push({ kind: "subtitle", text: subtitle });
-  const signature = badges.map(badge => `${badge.kind}:${badge.text}`).join("|");
+  const signature = badges
+    .map(badge => `${badge.kind}:${badge.text}:${badge.imageURL || ""}:${badge.backgroundColor || ""}:${badge.borderColor || ""}`)
+    .join("|");
   if (signature === titleBadgesSignature) return;
   titleBadgesSignature = signature;
   titleBadges.replaceChildren();
   badges.forEach(badge => {
+    if (badge.kind === "image") {
+      const chip = document.createElement("span");
+      chip.className = "title-badge-chip";
+      chip.title = badge.text;
+      if (badge.backgroundColor) chip.style.backgroundColor = badge.backgroundColor;
+      if (badge.borderColor) chip.style.borderColor = badge.borderColor;
+      const image = document.createElement("img");
+      image.className = "title-badge-image";
+      image.src = badge.imageURL;
+      image.alt = badge.text;
+      image.decoding = "async";
+      // A pack image that fails to load leaves no gap.
+      image.onerror = () => chip.remove();
+      chip.appendChild(image);
+      titleBadges.appendChild(chip);
+      return;
+    }
     const element = document.createElement("span");
     element.className = `title-badge title-badge-${badge.kind}`;
     if (badge.kind === "subtitle") {
@@ -6193,7 +6879,28 @@ const applyHiddenHudButtons = value => {
   // render() schedules the overflow pass right after; its signature counts user-hidden buttons.
 };
 
-// Returns every collapsible button to the row in authored order, so a measurement always starts
+// The action row in the order set in Settings > Playback (comma-separated data-commands). Sorting
+// overflowCapableActions itself means restoreActionRowLayout and the overflow menu follow it too.
+// Commands the setting does not name (a button added after it was saved) keep their authored order
+// after the named ones; an empty value is the authored order.
+const authoredActionOrder = overflowCapableActions.slice();
+let appliedHudButtonOrder = "";
+const applyHudButtonOrder = value => {
+  const next = String(value || "");
+  if (next === appliedHudButtonOrder) return;
+  appliedHudButtonOrder = next;
+  const order = next.split(",").map(part => part.trim()).filter(Boolean);
+  const rank = button => {
+    const index = order.indexOf(button.dataset.command);
+    return index >= 0 ? index : order.length + authoredActionOrder.indexOf(button);
+  };
+  overflowCapableActions.sort((a, b) => rank(a) - rank(b));
+  if (!actionRow || !actionOverflowButton) return;
+  restoreActionRowLayout();
+  invalidateActionRowOverflow();
+};
+
+// Returns every collapsible button to the row in the current order, so a measurement always starts
 // from the uncollapsed layout.
 const restoreActionRowLayout = () => {
   overflowCapableActions.forEach(button => {
@@ -6499,8 +7206,14 @@ document.querySelectorAll("[data-command]").forEach(button => {
       openPlayerModal("submitIntro");
       return;
     }
+    if (command === "streamInfo") {
+      streamInfoSignature = "";
+      openPlayerModal("streamInfo");
+      send("streamInfoOpened", 0);
+      return;
+    }
     if (command === "party") {
-      openPartyModal();
+      openPartyModal(partyUnreadText() ? "chat" : "party");
       return;
     }
     send(command, 0);
@@ -6857,7 +7570,7 @@ submitIntroSubmitButton.addEventListener("click", event => {
   const start = parseIntroTime(submitIntroDraft.startTime);
   const end = parseIntroTime(submitIntroDraft.endTime);
   if (start == null || end == null || end <= start) {
-    submitIntroDraft.status = "Check the start and end times.";
+    submitIntroDraft.status = hudText("player_hud_check_the_start_and_end_times", "Check the start and end times.");
     renderSubmitIntroModal();
     return;
   }
@@ -7170,7 +7883,13 @@ window.playerControls = nextState => {
   const previousCloseToken = Number(state.closeModalsToken) || 0;
   const previousPartyPanelToken = Number(currentParty().openPanelToken) || 0;
   const previousOpenSourcesToken = Number(state.openSourcesToken) || 0;
+  const previousHudLabels = state.hudLabels;
   state = { ...state, ...nextState };
+  if (state.hudLabels && state.hudLabels !== previousHudLabels) {
+    applyHudLabels();
+    refreshSeekStepLabels();
+  }
+  reconcileOptimisticSubtitleStyle();
   applyUiFontFamily(state.uiFontFamily);
   syncSeekrTrack();
   if (!state.seekThumbnailsEnabled) {
@@ -7208,6 +7927,8 @@ window.playerControls = nextState => {
   // Kotlin asking for the party panel (the party moved to something this player cannot follow by
   // itself). A token for the same reason as openSourcesToken.
   const partyPanelToken = Number(currentParty().openPanelToken) || 0;
+  // A stream swap rebuilds this HUD with every panel closed; let Kotlin stop building stream info.
+  if (state.streamInfo && activeModal !== "streamInfo") send("streamInfoClosed", 0);
   if (!isFirstPlayerControls && partyPanelToken !== previousPartyPanelToken && activeModal !== "party") {
     openPartyModal();
   }
@@ -7293,7 +8014,7 @@ const endHoldSpeed = () => {
   consumeHoldSpeedClick = true;
   window.setTimeout(() => { consumeHoldSpeedClick = false; }, 500);
   send("setPlaybackSpeed", restore);
-  window.nuvioShowPresetPill("Playback speed", `${restore.toFixed(2).replace(/\.?0+$/, "")}x`);
+  window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), `${restore.toFixed(2).replace(/\.?0+$/, "")}x`);
 };
 
 root.addEventListener("pointerdown", event => {
@@ -7310,7 +8031,7 @@ root.addEventListener("pointerdown", event => {
     holdSpeedRestoreValue = parsedPlaybackSpeed();
     send("setPlaybackSpeed", HoldSpeedValue);
     // Pinned for the whole hold; endHoldSpeed replaces it with the restored speed.
-    window.nuvioShowPresetPill("Playback speed", `${HoldSpeedValue}x`, 24 * 60 * 60 * 1000);
+    window.nuvioShowPresetPill(hudText("player_hud_playback_speed", "Playback speed"), `${HoldSpeedValue}x`, 24 * 60 * 60 * 1000);
   }, HoldSpeedDelayMs);
 });
 ["pointerup", "pointercancel"].forEach(type => window.addEventListener(type, event => {
@@ -7415,6 +8136,21 @@ document.addEventListener("keydown", event => {
   // the full-screen player key logic below for this surface.
   if (isHeroTrailerSurface || state.heroTrailerMode) {
     return;
+  }
+  // Post-show cards are up and the video is in a corner box: the D-pad drives the cards, which Kotlin
+  // draws, so the keys they use are forwarded instead of seeking or showing the controls. Anything
+  // else (volume, fullscreen, ...) keeps working.
+  if (state.postShowInput) {
+    const postShowCodes = {
+      ArrowLeft: 1, ArrowRight: 2, ArrowUp: 3, ArrowDown: 4, Enter: 5, " ": 5,
+      Escape: 6, Backspace: 6, "1": 11, "2": 12, "3": 13, "4": 14,
+    };
+    const postShowCode = postShowCodes[event.key];
+    if (postShowCode) {
+      event.preventDefault();
+      send("postShowKey", postShowCode);
+      return;
+    }
   }
   // The hex prompt is its own layer rather than an activeModal, so the modal branches below would
   // otherwise close the panel underneath it and leave the prompt stranded.

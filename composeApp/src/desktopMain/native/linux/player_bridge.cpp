@@ -2104,6 +2104,116 @@ JNIEXPORT void JNICALL NP(seekBy)(JNIEnv *, jobject, jlong handle, jlong offsetM
     p->ended.store(false);
 }
 
+// ---- live TV seeks (Windows parity, simplified) ---------------------------
+// A live .ts channel cannot seek on the connection: a seek that misses the demuxer cache's
+// seekable ranges falls through to FFmpeg, mpv drops the cache and playback stalls. So every live
+// seek is clamped into a seekable range and dropped when there is none. Unlike Windows this does
+// not use hr-seek-demuxer-offset to reach past the newest keyframe, so "Go live" can land up to a
+// GOP short of the received end; that only means a slightly larger cushion.
+
+struct LiveCacheRange {
+    double start;
+    double end;
+};
+
+static constexpr double kLinuxLiveRangeMarginSeconds = 0.25;
+static constexpr double kLinuxLiveMinJumpSeconds = 3.0;
+
+static void readLiveCacheRanges(mpv_handle *mpv, std::vector<LiveCacheRange> &ranges, double &cacheEnd) {
+    ranges.clear();
+    cacheEnd = -1.0;
+    mpv_node state{};
+    if (!mpv || mpv_get_property(mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) < 0) return;
+    if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+        for (int i = 0; i < state.u.list->num; ++i) {
+            const std::string key = state.u.list->keys[i] ? state.u.list->keys[i] : "";
+            const mpv_node &value = state.u.list->values[i];
+            if (key == "cache-end" && value.format == MPV_FORMAT_DOUBLE) {
+                cacheEnd = value.u.double_;
+            } else if (key == "seekable-ranges" && value.format == MPV_FORMAT_NODE_ARRAY && value.u.list) {
+                for (int r = 0; r < value.u.list->num; ++r) {
+                    const mpv_node &range = value.u.list->values[r];
+                    if (range.format != MPV_FORMAT_NODE_MAP || !range.u.list) continue;
+                    double start = -1.0;
+                    double end = -1.0;
+                    for (int f = 0; f < range.u.list->num; ++f) {
+                        const std::string field = range.u.list->keys[f] ? range.u.list->keys[f] : "";
+                        const mpv_node &fieldValue = range.u.list->values[f];
+                        if (fieldValue.format != MPV_FORMAT_DOUBLE) continue;
+                        if (field == "start") start = fieldValue.u.double_;
+                        if (field == "end") end = fieldValue.u.double_;
+                    }
+                    if (start >= 0.0 && end > start) ranges.push_back({start, end});
+                }
+            }
+        }
+    }
+    mpv_free_node_contents(&state);
+}
+
+// [target] moved into the nearest seekable range, a margin in from its edges. Negative when there
+// is no range.
+static double clampIntoLiveCacheRanges(const std::vector<LiveCacheRange> &ranges, double target) {
+    double best = -1.0;
+    double bestDistance = 0.0;
+    for (const auto &range : ranges) {
+        const double low = range.start + kLinuxLiveRangeMarginSeconds;
+        const double high = std::max(low, range.end - kLinuxLiveRangeMarginSeconds);
+        const double clamped = std::min(std::max(target, low), high);
+        const double distance = std::fabs(clamped - target);
+        if (best < 0.0 || distance < bestDistance) {
+            best = clamped;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+static void seekWithinLiveCache(Player *p, double target) {
+    std::vector<LiveCacheRange> ranges;
+    double cacheEnd = -1.0;
+    readLiveCacheRanges(p->mpv, ranges, cacheEnd);
+    const double clamped = clampIntoLiveCacheRanges(ranges, target);
+    if (clamped < 0.0) return;
+    std::string position = std::to_string(clamped);
+    const char *cmd[] = {"seek", position.c_str(), "absolute+exact", nullptr};
+    mpv_command(p->mpv, cmd);
+    p->ended.store(false);
+}
+
+JNIEXPORT void JNICALL NP(seekWithinCacheTo)(JNIEnv *, jobject, jlong handle, jlong positionMs) {
+    Player *p = asPlayer(handle);
+    if (p) seekWithinLiveCache(p, positionMs / 1000.0);
+}
+
+JNIEXPORT void JNICALL NP(seekWithinCacheBy)(JNIEnv *, jobject, jlong handle, jlong offsetMs) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    double timePos = 0.0;
+    if (mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &timePos) < 0) return;
+    seekWithinLiveCache(p, timePos + offsetMs / 1000.0);
+}
+
+// "Go live": [cushionMs] short of the received end, unless that is barely a jump.
+JNIEXPORT void JNICALL NP(seekToCachedLiveEdge)(JNIEnv *, jobject, jlong handle, jlong cushionMs) {
+    Player *p = asPlayer(handle);
+    if (!p) return;
+    double timePos = -1.0;
+    mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &timePos);
+    std::vector<LiveCacheRange> ranges;
+    double cacheEnd = -1.0;
+    readLiveCacheRanges(p->mpv, ranges, cacheEnd);
+    double rangeEnd = -1.0;
+    for (const auto &range : ranges) rangeEnd = std::max(rangeEnd, range.end);
+    const double edge = cacheEnd > 0.0 ? cacheEnd : rangeEnd;
+    const double target = clampIntoLiveCacheRanges(ranges, edge - (double)std::max<jlong>(0, cushionMs) / 1000.0);
+    if (target < 0.0 || target <= timePos + kLinuxLiveMinJumpSeconds) return;
+    std::string position = std::to_string(target);
+    const char *cmd[] = {"seek", position.c_str(), "absolute+exact", nullptr};
+    mpv_command(p->mpv, cmd);
+    p->ended.store(false);
+}
+
 JNIEXPORT void JNICALL NP(setSpeed)(JNIEnv *, jobject, jlong handle, jfloat speed) {
     Player *p = asPlayer(handle);
     if (p) mpvSetDouble(p->mpv, "speed", speed);
@@ -2239,6 +2349,12 @@ JNIEXPORT jstring JNICALL NP(subtitleTracksJson)(JNIEnv *env, jobject, jlong han
     Player *p = asPlayer(handle);
     if (!p) return utf8ToJstring(env, "[]");
     return utf8ToJstring(env, buildTracksJson(p->mpv, "sub", p));
+}
+
+JNIEXPORT jstring JNICALL NP(videoTracksJson)(JNIEnv *env, jobject, jlong handle) {
+    Player *p = asPlayer(handle);
+    if (!p) return utf8ToJstring(env, "[]");
+    return utf8ToJstring(env, buildTracksJson(p->mpv, "video"));
 }
 
 JNIEXPORT jboolean JNICALL NP(selectAudioTrack)(JNIEnv *, jobject, jlong handle, jint trackId) {
@@ -2526,6 +2642,10 @@ JNIEXPORT void JNICALL NP(setCursorHidden)(JNIEnv *, jobject, jlong handle, jboo
 // Windows sets an AppUserModelID so the taskbar groups windows and the media
 // flyout can name the app. No equivalent is needed on Linux.
 JNIEXPORT void JNICALL NP(initializeAppIdentity)(JNIEnv *, jobject) {}
+
+// Windows writes its bridge/mpv logs under the app data directory it is given here. The Linux
+// bridge logs to stderr, so the directory is not needed.
+JNIEXPORT void JNICALL NP(setDataDirectory)(JNIEnv *, jobject, jstring) {}
 
 // Windows publishes to SystemMediaTransportControls. The Linux equivalent is
 // MPRIS, which Nuvio does not implement on any platform yet. Implementing it

@@ -10,7 +10,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import com.nuvio.app.features.preroll.PostShowController
+import com.nuvio.app.features.watched.WatchedRepository
+import com.nuvio.app.features.preroll.postShowScopeFor
+import com.nuvio.app.features.preroll.PostShowScope
+import com.nuvio.app.features.preroll.PostShowEpisode
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
@@ -47,6 +53,8 @@ import com.nuvio.app.features.playlist.displayTitle
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
+import com.nuvio.app.features.streams.badgeFillCssColorOrNull
+import com.nuvio.app.features.streams.toBadgeCssColorOrNull
 import com.nuvio.app.features.streams.StreamListSort
 import com.nuvio.app.features.streams.StreamListSortOrder
 import com.nuvio.app.features.streams.StreamScore
@@ -65,11 +73,57 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
+import com.nuvio.app.core.i18n.localizedString
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val runtime = this
+    // Tells the post-show what is playing and where its credits are: a film, or the finale of a
+    // season or series that the viewer has watched their way to (see postShowScopeFor).
+    val postShowTitle = title
+    LaunchedEffect(
+        parentMetaType, parentMetaId, skipIntervals, postShowTitle,
+        activeSeasonNumber, activeEpisodeNumber, activeEpisodeTitle, playerMetaVideos,
+    ) {
+        val scope: PostShowScope? = when (parentMetaType) {
+            "movie" -> PostShowScope.Film
+            "series" -> {
+                val season = activeSeasonNumber
+                val episode = activeEpisodeNumber
+                if (season == null || episode == null) {
+                    null
+                } else {
+                    postShowScopeFor(
+                        status = MetaDetailsRepository.peekAny(parentMetaType, parentMetaId)?.status,
+                        episodes = playerMetaVideos.mapNotNull { video ->
+                            val s = video.playbackSeasonNumber()
+                            val e = video.playbackEpisodeNumber()
+                            if (s == null || e == null) {
+                                null
+                            } else {
+                                // Only this season's earlier episodes decide the gate, so only those are looked up.
+                                val needed = s == season && e < episode
+                                PostShowEpisode(
+                                    season = s,
+                                    episode = e,
+                                    watched = needed && WatchedRepository.isWatched(parentMetaId, parentMetaType, s, e),
+                                )
+                            }
+                        },
+                        currentSeason = season,
+                        currentEpisode = episode,
+                        episodeTitle = activeEpisodeTitle,
+                    )
+                }
+            }
+            else -> null
+        }
+        PostShowController.setFilm(
+            scope?.let { PostShowController.Film(parentMetaType, parentMetaId, postShowTitle, skipIntervals, it) },
+        )
+    }
+    DisposableEffect(Unit) { onDispose { PostShowController.setFilm(null) } }
     val playbackFailedToast = stringResource(Res.string.player_error_playback_failed)
     val unableToPlayStreamMessage = stringResource(Res.string.player_error_unable_to_play_stream)
     val debridRateLimitedToast = stringResource(Res.string.player_error_debrid_rate_limited)
@@ -290,9 +344,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                 nextEpisodeAutoPlaySourceName.orEmpty(),
                 nextEpisodeAutoPlayCountdown ?: 0,
             )
-        playlistHandedOff -> "Starting…"
-        playlistPreparedSource != null -> "Ready · $playlistPreparedSource"
-        playlistPrepared is com.nuvio.app.features.playlist.PlaylistHandoff.Downloaded -> "Ready · downloaded"
+        playlistHandedOff -> localizedString(Res.string.playlist_player_starting)
+        playlistPreparedSource != null -> localizedString(Res.string.playlist_player_ready_source, playlistPreparedSource)
+        playlistPrepared is com.nuvio.app.features.playlist.PlaylistHandoff.Downloaded -> localizedString(Res.string.playlist_player_ready_downloaded)
         else -> ""
     }
     val nextEpisodeStatus = when {
@@ -356,14 +410,13 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         providerName = activeProviderName,
         pauseOverlayWatchingLabel = stringResource(Res.string.compose_player_youre_watching),
         pauseOverlayLogo = logo,
+        // The episode code, or nothing. Movies used to borrow this line for the provider name, which
+        // put the addon (AIOUmbra) on the pause card exactly when "Show source while paused" was
+        // off; the provider now only ever appears in the source row that setting controls.
         pauseOverlayEpisodeInfo = if (seasonNumber != null && episodeNumber != null) {
             stringResource(Res.string.compose_player_episode_code_full, seasonNumber, episodeNumber)
-        } else if (playerSettingsUiState.desktopPauseOverlaySourceEnabled) {
-            // Movies borrow this line for the provider name; the source row now says it better, so
-            // don't print it twice.
-            ""
         } else {
-            activeProviderName
+            ""
         },
         pauseOverlayEpisodeTitle = activeEpisodeTitle.orEmpty(),
         // Only a real synopsis belongs here — the raw stream/release name (activeStreamSubtitle)
@@ -398,8 +451,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         videoSettingsLabel = stringResource(Res.string.player_action_video_settings),
         pictureInPictureLabel = stringResource(Res.string.compose_player_picture_in_picture),
         pictureInPictureActive = pictureInPictureActive,
-        desktopHdrModeLabel = playerSettingsUiState.desktopHdrMode.label,
-        desktopColorProfileLabel = playerSettingsUiState.desktopColorProfile.label,
+        desktopHdrModeLabel = stringResource(playerSettingsUiState.desktopHdrMode.labelRes),
+        desktopColorProfileLabel = stringResource(playerSettingsUiState.desktopColorProfile.labelRes),
         desktopColorContrast = playerSettingsUiState.desktopColorContrast,
         desktopColorBrightness = playerSettingsUiState.desktopColorBrightness,
         desktopColorSaturation = playerSettingsUiState.desktopColorSaturation,
@@ -408,9 +461,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         // only counts when it would auto-apply (auto-detect on + detected anime), else "Off".
         desktopAnimeModeLabel = playerSettingsUiState.desktopAnimeSessionOverride?.label
             ?: if (playerSettingsUiState.desktopAnimeModeAutoEnabled && isAnimeContent) {
-                playerSettingsUiState.desktopAnimeMode.label
+                stringResource(playerSettingsUiState.desktopAnimeMode.labelRes)
             } else {
-                DesktopAnimeMode.Off.label
+                stringResource(DesktopAnimeMode.Off.labelRes)
             },
         desktopAnimeSvpEnabled = playerSettingsUiState.desktopAnimeSvpEnabled,
         rtxVsrEnabled = playerSettingsUiState.effectiveRtxVsrEnabled,
@@ -550,6 +603,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         seekHandleEnabled = playerSettingsUiState.desktopSeekHandleEnabled,
         hudVignetteEnabled = playerSettingsUiState.desktopHudVignetteEnabled,
         hiddenHudButtons = playerSettingsUiState.desktopHiddenHudButtons.sorted().joinToString(","),
+        hudButtonOrder = playerSettingsUiState.desktopHudButtonOrder.joinToString(","),
         alwaysShowClock = playerSettingsUiState.desktopAlwaysShowClockEnabled,
         playbackSpeedFineIncrementsEnabled = playerSettingsUiState.desktopPlaybackSpeedFineIncrementsEnabled,
         playbackSpeedToggleLow = playerSettingsUiState.playbackSpeedToggleLow,
@@ -685,6 +739,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         playlistPeekTitle = playlistPeek.first,
         playlistPeekItems = playlistPeek.second,
         party = rememberPartyControlsState(),
+        streamInfo = rememberStreamInfoState(),
     )
 
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
@@ -1211,6 +1266,8 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
     if (handlePartyControlsEvent(type, value)) return true
     if (handleIptvControlsEvent(type, value)) return true
     when (type) {
+        "streamInfoOpened" -> showStreamInfo = true
+        "streamInfoClosed" -> showStreamInfo = false
         "revealChrome" -> {
             if (!playerControlsLocked) {
                 controlsVisible = true
@@ -1408,59 +1465,61 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
             val cue = playerControlsNearestSubtitleCues().getOrNull(value.toInt()) ?: return true
             applySubtitleAutoSyncCue(cue)
         }
+        // The style events below build on the stored style and apply through updateSubtitleStyle,
+        // never on the last-composed one: see liveSubtitleStyle.
         "subtitleFontSizeDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(fontSizeSp = (subtitleStyle.fontSizeSp + value.toInt()).coerceIn(6, 40)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(fontSizeSp = (liveSubtitleStyle.fontSizeSp + value.toInt()).coerceIn(6, 40)),
             )
         }
         "subtitleFontDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(fontFamily = cycleSubtitleFontFamily(subtitleStyle.fontFamily, value.toInt())),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(fontFamily = cycleSubtitleFontFamily(liveSubtitleStyle.fontFamily, value.toInt())),
             )
         }
         "subtitleFontIndex" -> {
             availableSubtitleFontFamilies().getOrNull(value.toInt())?.let { family ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(fontFamily = family))
+                updateSubtitleStyle(liveSubtitleStyle.copy(fontFamily = family))
             }
         }
         "subtitleOutlineToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(outlineEnabled = !subtitleStyle.outlineEnabled))
+            updateSubtitleStyle(liveSubtitleStyle.copy(outlineEnabled = !liveSubtitleStyle.outlineEnabled))
         }
         "subtitleShadowToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(shadowEnabled = !subtitleStyle.shadowEnabled))
+            updateSubtitleStyle(liveSubtitleStyle.copy(shadowEnabled = !liveSubtitleStyle.shadowEnabled))
         }
         "subtitleShadowOffsetDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    shadowOffset = (subtitleStyle.shadowOffset + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    shadowOffset = (liveSubtitleStyle.shadowOffset + value.toInt())
                         .coerceIn(SUBTITLE_SHADOW_OFFSET_MIN, SUBTITLE_SHADOW_OFFSET_MAX),
                 ),
             )
         }
         "subtitleShadowOpacity" -> {
             val alpha = (value.toFloat() / 100f).coerceIn(0f, 1f)
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(shadowColor = subtitleStyle.shadowColor.copy(alpha = alpha)))
+            updateSubtitleStyle(liveSubtitleStyle.copy(shadowColor = liveSubtitleStyle.shadowColor.copy(alpha = alpha)))
         }
         "subtitleOutlineWidthDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    outlineWidth = (subtitleStyle.outlineWidth + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    outlineWidth = (liveSubtitleStyle.outlineWidth + value.toInt())
                         .coerceIn(SUBTITLE_OUTLINE_WIDTH_MIN, SUBTITLE_OUTLINE_WIDTH_MAX),
                 ),
             )
         }
         "subtitleBlurDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    blur = (subtitleStyle.blur + value.toInt()).coerceIn(SUBTITLE_BLUR_MIN, SUBTITLE_BLUR_MAX),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    blur = (liveSubtitleStyle.blur + value.toInt()).coerceIn(SUBTITLE_BLUR_MIN, SUBTITLE_BLUR_MAX),
                 ),
             )
         }
         "subtitleBoldToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(bold = !subtitleStyle.bold))
+            updateSubtitleStyle(liveSubtitleStyle.copy(bold = !liveSubtitleStyle.bold))
         }
         "subtitleItalicToggle" -> {
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(italic = !subtitleStyle.italic))
+            updateSubtitleStyle(liveSubtitleStyle.copy(italic = !liveSubtitleStyle.italic))
         }
         // ASS/SSA tracks: how much of the styling above reaches them, and their own size factor.
         //
@@ -1470,71 +1529,71 @@ private fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: D
         // the user had to cycle blind and read the result somewhere else.
         "subtitleAssStyleMode" -> {
             SubtitleAssStyleMode.entries.getOrNull(value.toInt())?.let { mode ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(assStyleMode = mode))
+                updateSubtitleStyle(liveSubtitleStyle.copy(assStyleMode = mode))
             }
         }
         "subtitleAssScaleDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(
-                    assScalePercent = (subtitleStyle.assScalePercent + value.toInt())
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(
+                    assScalePercent = (liveSubtitleStyle.assScalePercent + value.toInt())
                         .coerceIn(SUBTITLE_ASS_SCALE_MIN, SUBTITLE_ASS_SCALE_MAX),
                 ),
             )
         }
         "subtitleBottomOffsetDelta" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(bottomOffset = (subtitleStyle.bottomOffset + value.toInt()).coerceIn(0, 200)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(bottomOffset = (liveSubtitleStyle.bottomOffset + value.toInt()).coerceIn(0, 200)),
             )
         }
         "subtitleTextColor" -> {
             SubtitleColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(textColor = color.copy(alpha = subtitleStyle.textColor.alpha)))
+                updateSubtitleStyle(liveSubtitleStyle.copy(textColor = color.copy(alpha = liveSubtitleStyle.textColor.alpha)))
             }
         }
         "subtitleOutlineColor" -> {
             SubtitleColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(outlineColor = color.copy(alpha = subtitleStyle.outlineColor.alpha)))
+                updateSubtitleStyle(liveSubtitleStyle.copy(outlineColor = color.copy(alpha = liveSubtitleStyle.outlineColor.alpha)))
             }
         }
         "subtitleBackgroundColor" -> {
             SubtitleBackgroundColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(backgroundColor = color))
+                updateSubtitleStyle(liveSubtitleStyle.copy(backgroundColor = color))
             }
         }
         "subtitleShadowColor" -> {
             SubtitleShadowColorSwatches.getOrNull(value.toInt())?.let { color ->
-                PlayerSettingsRepository.setSubtitleStyle(
-                    subtitleStyle.copy(shadowColor = color.copy(alpha = subtitleStyle.shadowColor.alpha)),
+                updateSubtitleStyle(
+                    liveSubtitleStyle.copy(shadowColor = color.copy(alpha = liveSubtitleStyle.shadowColor.alpha)),
                 )
             }
         }
         // Custom colours from the HUD's hex prompt. It resolves alpha before sending (it knows the
         // current style and the opacity steppers), so these apply the packed value as it arrives.
         "subtitleTextColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(textColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(textColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleOutlineColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(outlineColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(outlineColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleBackgroundColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(backgroundColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(backgroundColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleShadowColorArgb" -> {
-            PlayerSettingsRepository.setSubtitleStyle(
-                subtitleStyle.copy(shadowColor = subtitleColorFromArgb(value)),
+            updateSubtitleStyle(
+                liveSubtitleStyle.copy(shadowColor = subtitleColorFromArgb(value)),
             )
         }
         "subtitleTextOpacity" -> {
             val alpha = (value.toFloat() / 100f).coerceIn(0f, 1f)
-            PlayerSettingsRepository.setSubtitleStyle(subtitleStyle.copy(textColor = subtitleStyle.textColor.copy(alpha = alpha)))
+            updateSubtitleStyle(liveSubtitleStyle.copy(textColor = liveSubtitleStyle.textColor.copy(alpha = alpha)))
         }
-        "subtitleStyleReset" -> PlayerSettingsRepository.setSubtitleStyle(SubtitleStyleState.DEFAULT)
+        "subtitleStyleReset" -> updateSubtitleStyle(SubtitleStyleState.DEFAULT)
         "parentalGuideComplete" -> {
             showParentalGuide = false
         }
@@ -1660,7 +1719,7 @@ private fun PlayerScreenRuntime.submitIntroFromPlayerControls() {
     val end = submitIntroEndTimeSec
     // A null season/episode is a film, which SkipDB accepts — only the timings have to be valid.
     if (imdbId.isNullOrBlank() || start == null || end == null || end <= start) {
-        submitIntroStatusMessage = "Check the start and end times."
+        submitIntroStatusMessage = localizedString(Res.string.skip_submit_check_the_start_and_end_times)
         return
     }
     isSubmitIntroSubmitting = true
@@ -1764,7 +1823,7 @@ private fun PlayerScreenRuntime.openInExternalPlayer() {
                         SkipSubmitToastCopy(
                             visible = true,
                             phase = "submitting",
-                            title = "Opening in external player",
+                            title = localizedString(Res.string.player_external_opening),
                             detail = it,
                             key = "external-handoff:$playerNoticeSerial",
                         )
@@ -1847,9 +1906,10 @@ private fun playerControlSourceItem(
         PlayerControlStreamBadge(
             name = badge.name,
             imageUrl = badge.imageURL,
-            backgroundColor = badge.tagColor,
-            textColor = badge.textColor,
-            borderColor = badge.borderColor,
+            // As CSS for the HUD, and the fill only for a "filled" tag, as StreamBadgeChip does.
+            backgroundColor = badgeFillCssColorOrNull(badge.tagColor, badge.tagStyle).orEmpty(),
+            textColor = badge.textColor.toBadgeCssColorOrNull().orEmpty(),
+            borderColor = badge.borderColor.toBadgeCssColorOrNull().orEmpty(),
         )
     },
     isCurrent = isCurrent,
@@ -2011,7 +2071,7 @@ private fun <T> findCurrentPlayerControlStream(
  * set, because that is the flag mpv's own track selection is turned off by.
  */
 @Composable
-private fun PlayerScreenRuntime.activePlaybackSubtitleLabel(): String = if (useCustomSubtitles) {
+internal fun PlayerScreenRuntime.activePlaybackSubtitleLabel(): String = if (useCustomSubtitles) {
     visibleAddonSubtitles.firstOrNull { subtitle ->
         subtitle.id == selectedAddonSubtitleId || subtitle.url == selectedAddonSubtitleId
     }?.display.orEmpty()

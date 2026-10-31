@@ -1,5 +1,6 @@
 package com.nuvio.app.core.ui
 
+import com.nuvio.app.core.ui.smoothBorder
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.MutableTransitionState
@@ -8,7 +9,10 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -153,6 +157,9 @@ fun NuvioScreenHeader(
     topPadding: Dp? = null,
     onBack: (() -> Unit)? = null,
     titleTrailing: (@Composable () -> Unit)? = null,
+    // Off for a screen drawn over a backdrop (the settings sky), where the header's own band of
+    // page colour shows as a solid bar across the top.
+    opaqueBackground: Boolean = true,
     actions: @Composable RowScope.() -> Unit = {},
 ) {
     val tokens = MaterialTheme.nuvio
@@ -164,7 +171,7 @@ fun NuvioScreenHeader(
         Row(
             modifier = Modifier
                 .matchParentSize()
-                .background(tokens.colors.background)
+                .then(if (opaqueBackground) Modifier.background(tokens.colors.background) else Modifier)
                 .nuvioConsumePointerEvents(),
         ) {}
         Row(
@@ -277,18 +284,39 @@ fun NuvioBackButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     shape: Shape = MaterialTheme.nuvio.shapes.avatar,
-    containerColor: Color = MaterialTheme.nuvio.colors.surface,
+    /** Unspecified (the default) draws the app's glass ([NuvioGlass]) with its light edge; a colour fills it plainly. */
+    containerColor: Color = Color.Unspecified,
     contentColor: Color = MaterialTheme.nuvio.colors.textPrimary,
     buttonSize: Dp = NuvioTokens.Space.s40,
     iconSize: Dp = NuvioTokens.Icon.md,
     contentDescription: String = stringResource(Res.string.action_back),
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val focused by interaction.collectIsFocusedAsState()
+    val glass = containerColor == Color.Unspecified
     Box(
         modifier = modifier
             .size(buttonSize)
             .clip(shape)
-            .background(containerColor)
-            .clickable(onClick = onClick),
+            .then(
+                if (glass) {
+                    // A dark base under the glass keeps the arrow readable over bright artwork.
+                    Modifier
+                        .background(Color.Black.copy(alpha = 0.28f), shape)
+                        .ditheredBackground(NuvioGlass.Fill, shape)
+                        .background(if (hovered || focused) Color.White.copy(alpha = 0.08f) else Color.Transparent, shape)
+                        .smoothBorder(
+                            width = if (focused) 2.dp else 1.dp,
+                            color = if (focused) MaterialTheme.nuvio.colors.borderFocus else NuvioGlass.EdgeColor,
+                            shape = shape,
+                        )
+                } else {
+                    Modifier.background(containerColor)
+                },
+            )
+            .hoverable(interaction)
+            .clickable(interactionSource = interaction, indication = if (glass) null else LocalIndication.current, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Icon(

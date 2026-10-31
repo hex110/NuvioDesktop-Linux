@@ -1,5 +1,6 @@
 package com.nuvio.app.features.input
 
+import com.nuvio.app.core.i18n.localizedString
 import com.nuvio.app.features.player.AppShortcutAction
 import com.nuvio.app.features.player.PlayerShortcutAction
 import kotlin.test.Test
@@ -161,6 +162,10 @@ class GamepadInputTest {
                 // Every browsing button is taken. Live TV is a tab, which the D-pad already reaches
                 // in the top bar, and it only exists once a playlist has been added.
                 AppShortcutAction.OpenLiveTv,
+                // The same: Music is a top-bar tab the D-pad reaches, and only there while it is turned on.
+                AppShortcutAction.OpenMusic,
+                // On a music page the pad's Y (the trailer key) does this; elsewhere the player is a D-pad stop away.
+                AppShortcutAction.FocusMusicPlayer,
             ),
             AppShortcutAction.entries.toSet() - boundApp,
             "app actions with no button",
@@ -310,11 +315,11 @@ class GamepadInputTest {
 
         // A read "Select / open focused item (Enter)" before; the action name stands alone now.
         assertEquals(
-            AppShortcutAction.SelectFocused.displayName,
+            localizedString(AppShortcutAction.SelectFocused.displayNameRes),
             rows.getValue(GamepadButton.A).browsingLabel,
         )
         assertEquals(
-            PlayerShortcutAction.PlayPause.displayName,
+            localizedString(PlayerShortcutAction.PlayPause.displayNameRes),
             rows.getValue(GamepadButton.A).playerLabel,
         )
         assertEquals("Move up", rows.getValue(GamepadButton.DpadUp).browsingLabel)

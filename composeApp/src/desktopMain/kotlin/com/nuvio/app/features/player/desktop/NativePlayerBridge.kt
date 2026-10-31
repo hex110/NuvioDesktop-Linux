@@ -37,7 +37,14 @@ internal object NativePlayerBridge {
 
     init {
         loadNativeLibrary()
+        // Before any other call, so the player logs and shader cache land in the same data folder as
+        // nuvio.log (beside the app when portable) rather than the bridge's %LOCALAPPDATA% default.
+        runCatching { setDataDirectory(DesktopStorage.rootDir.toAbsolutePath().toString()) }
+            .onFailure { log.w { "Native bridge data folder not set: ${it.message}" } }
     }
+
+    /** Where the bridge keeps `logs\` and `shader-cache\`: [DesktopStorage.rootDir]. */
+    private external fun setDataDirectory(directory: String)
 
     external fun create(
         hostViewPtr: Long,
@@ -84,6 +91,11 @@ internal object NativePlayerBridge {
     external fun completeSvpStartupProfile(handle: Long)
     external fun seekTo(handle: Long, positionMs: Long)
     external fun seekBy(handle: Long, offsetMs: Long)
+    /** Live TV's Go live: [cushionMs] short of the received end, within the cache's seekable range. */
+    external fun seekToCachedLiveEdge(handle: Long, cushionMs: Long)
+    /** Live TV: seeks kept inside the demuxer cache's seekable ranges (a live .ts cannot seek beyond). */
+    external fun seekWithinCacheTo(handle: Long, positionMs: Long)
+    external fun seekWithinCacheBy(handle: Long, offsetMs: Long)
     external fun setSpeed(handle: Long, speed: Float)
     external fun setResizeMode(handle: Long, mode: Int)
     external fun durationMs(handle: Long): Long
@@ -99,6 +111,7 @@ internal object NativePlayerBridge {
     external fun isMuted(handle: Long): Boolean
     external fun audioTracksJson(handle: Long): String
     external fun subtitleTracksJson(handle: Long): String
+    external fun videoTracksJson(handle: Long): String
     external fun chaptersJson(handle: Long): String
     external fun selectAudioTrack(handle: Long, trackId: Int): Boolean
     external fun selectSubtitleTrack(handle: Long, trackId: Int): Boolean
@@ -457,19 +470,27 @@ internal object NativePlayerBridge {
         val root = File(System.getProperty("java.io.tmpdir"), "nuvio-player-ui").apply { mkdirs() }
         val fontsDir = root.resolve("fonts").apply { mkdirs() }
         val htmlFile = root.resolve("controls.html")
+        val cssText = readTextResource("/player-ui/controls.css")
+            .replace("/* __NUVIO_PLAYER_FONT_FACES__ */", nativePlayerFontFaces())
+        val jsText = readTextResource("/player-ui/controls.js")
+        // The page names its stylesheet and script with a hand-maintained `?v=` key. WebView2 keeps
+        // a disk cache across launches and treats an unchanged URL as unchanged content, so when a
+        // release edited controls.css/js without remembering to bump that key, the old files kept
+        // being served from cache (a stale pre-show HUD showed the mute icon again). The key is now
+        // taken from the content itself, so the URL changes exactly when the files do.
+        val assetVersion = java.security.MessageDigest.getInstance("SHA-256")
+            .digest((cssText + "\u0000" + jsText).toByteArray(Charsets.UTF_8))
+            .take(6)
+            .joinToString("") { "%02x".format(it) }
         writeTextIfChanged(
             target = htmlFile,
-            text = readTextResource("/player-ui/controls.html"),
+            text = readTextResource("/player-ui/controls.html")
+                .replace(Regex("""(controls\.(?:css|js))\?v=[^"'\s>]*""")) { match ->
+                    "${match.groupValues[1]}?v=$assetVersion"
+                },
         )
-        writeTextIfChanged(
-            target = root.resolve("controls.css"),
-            text = readTextResource("/player-ui/controls.css")
-                .replace("/* __NUVIO_PLAYER_FONT_FACES__ */", nativePlayerFontFaces()),
-        )
-        copyResourceIfChanged(
-            resource = "/player-ui/controls.js",
-            target = root.resolve("controls.js"),
-        )
+        writeTextIfChanged(target = root.resolve("controls.css"), text = cssText)
+        writeTextIfChanged(target = root.resolve("controls.js"), text = jsText)
         copyResourceIfChanged(
             resource = "/composeResources/nuvio.composeapp.generated.resources/font/jetbrains_sans_regular.ttf",
             target = fontsDir.resolve("jetbrains_sans_regular.ttf"),
