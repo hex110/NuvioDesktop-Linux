@@ -133,9 +133,13 @@ actual object AppUpdaterPlatform {
             val command = installer + pkg.absolutePath
 
             var result = pkexec?.let { runAsRoot(listOf(it.path) + command) }
-            // 127: no polkit agent to show the prompt (a bare window manager); try sudo instead.
+            // pkexec exits 127 both when no polkit agent could show a prompt (a bare window manager)
+            // and when authentication failed: the prompt timed out or the password was refused.
+            // Only its message tells them apart. sudo stands in for the missing agent only; after a
+            // failed prompt it would just ask again in another window.
+            val pkexecRefused = result?.let { it.exitCode == 127 && "Not authorized" in it.output } == true
             val sudoBinary = sudo
-            if ((result == null || result.exitCode == 127) && sudoBinary != null) {
+            if ((result == null || (result.exitCode == 127 && !pkexecRefused)) && sudoBinary != null) {
                 result = runAsRoot(
                     listOf(sudoBinary.path, "-A", "--") + command,
                     environment = askpassHelper?.let { mapOf("SUDO_ASKPASS" to it) }.orEmpty(),
@@ -151,7 +155,11 @@ actual object AppUpdaterPlatform {
                 0 -> Unit
                 // pkexec: the prompt was dismissed or the password refused.
                 126 -> error("Update cancelled: the password prompt was closed.")
-                127 -> error("No password prompt is available on this desktop. Use the command below instead.")
+                127 -> if (pkexecRefused) {
+                    error("Administrator access was not granted: the password prompt timed out or the password was refused. Use the command below instead.")
+                } else {
+                    error("No password prompt is available on this desktop. Use the command below instead.")
+                }
                 else -> error(
                     "The package manager could not install the update (exit ${result.exitCode})." +
                         result.tail.takeIf(String::isNotBlank)?.let { "\n$it" }.orEmpty(),
