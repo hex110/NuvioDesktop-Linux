@@ -98,33 +98,58 @@ actual object AppUpdaterPlatform {
 
     private val pkexec: File? by lazy { File("/usr/bin/pkexec").takeIf(File::canExecute) }
 
-    // `sudo -A` asks through SUDO_ASKPASS; without one it could only prompt on a terminal the app
-    // does not have.
-    private val sudoAskpass: Boolean by lazy {
-        File("/usr/bin/sudo").canExecute() &&
-            System.getenv("SUDO_ASKPASS")?.let { File(it).canExecute() } == true
+    private val sudo: File? by lazy { File("/usr/bin/sudo").takeIf(File::canExecute) }
+
+    // `sudo -A` asks through SUDO_ASKPASS, never on a terminal (the app has none to offer). The
+    // variable is often only set in interactive shells, so a desktop-launched app can miss it; a
+    // known askpass helper stands in then. With neither, `sudo -A` still runs the PAM stack, so a
+    // consent prompt there (hypr-uac and the like) can grant access before any password is asked.
+    private val askpassHelper: String? by lazy {
+        val fromEnv = listOf("SUDO_ASKPASS", "SSH_ASKPASS").mapNotNull { System.getenv(it) }
+        val known = listOf(
+            "/usr/bin/ksshaskpass",
+            "/usr/lib/ssh/ksshaskpass",
+            "/usr/lib/seahorse/ssh-askpass",
+            "/usr/lib/ssh/ssh-askpass",
+            "/usr/bin/lxqt-openssh-askpass",
+            "/usr/lib/ssh/x11-ssh-askpass",
+            "/usr/bin/ssh-askpass",
+        )
+        (fromEnv + known).firstOrNull { it.isNotBlank() && File(it).canExecute() }
     }
 
     actual val canInstallLinuxPackageInApp: Boolean
-        get() = isLinux && linuxPackageInstaller != null && (pkexec != null || sudoAskpass)
+        get() = isLinux && linuxPackageInstaller != null && (pkexec != null || sudo != null)
 
     actual suspend fun installLinuxPackage(path: String): Result<UpdateInstallOutcome> = withContext(Dispatchers.IO) {
         runCatching {
             val installer = checkNotNull(linuxPackageInstaller) { "No package manager to install the update with." }
             val pkg = File(path)
             check(pkg.isFile) { "The downloaded update package is missing." }
+            // Read before the install: once the package replaces the launcher, /proc/self/exe
+            // names the old, deleted file.
+            val launcher = installedLauncher()
             // pacman and apt tell a package file from a package name by the path.
             val command = installer + pkg.absolutePath
 
             var result = pkexec?.let { runAsRoot(listOf(it.path) + command) }
-            // 127: no polkit agent to show the prompt (a bare window manager); try sudo's askpass.
-            if ((result == null || result.exitCode == 127) && sudoAskpass) {
-                result = runAsRoot(listOf("/usr/bin/sudo", "-A", "--") + command)
+            // 127: no polkit agent to show the prompt (a bare window manager); try sudo instead.
+            val sudoBinary = sudo
+            if ((result == null || result.exitCode == 127) && sudoBinary != null) {
+                result = runAsRoot(
+                    listOf(sudoBinary.path, "-A", "--") + command,
+                    environment = askpassHelper?.let { mapOf("SUDO_ASKPASS" to it) }.orEmpty(),
+                )
+                // sudo exits 1 both for a refused authentication and for a failed install; only
+                // its own "sudo: …" lines tell the two apart.
+                if (result.exitCode == 1 && result.output.lines().any { it.startsWith("sudo: ") }) {
+                    error("Administrator access was not granted. Use the command below instead.")
+                }
             }
             checkNotNull(result) { "No way to ask for the administrator password." }
             when (result.exitCode) {
                 0 -> Unit
-                // pkexec: the prompt was dismissed or the password refused; sudo -A: likewise.
+                // pkexec: the prompt was dismissed or the password refused.
                 126 -> error("Update cancelled: the password prompt was closed.")
                 127 -> error("No password prompt is available on this desktop. Use the command below instead.")
                 else -> error(
@@ -134,41 +159,54 @@ actual object AppUpdaterPlatform {
             }
             updaterLog.i { "Linux package installed: ${pkg.name}" }
             pkg.delete()
-            relaunchAfterExit()
+            launcher?.let(::relaunchAfterExit)
+                ?: updaterLog.w { "No installed launcher to restart; the app will just close." }
             scheduleExit()
             UpdateInstallOutcome.RESTARTING
         }
     }
 
-    private class RootRun(val exitCode: Int, val tail: String)
+    private class RootRun(val exitCode: Int, val output: String) {
+        val tail: String get() = output.lines().filter(String::isNotBlank).takeLast(3).joinToString("\n")
+    }
 
-    private fun runAsRoot(command: List<String>): RootRun {
+    private fun runAsRoot(command: List<String>, environment: Map<String, String> = emptyMap()): RootRun {
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
             .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+            .apply { environment().putAll(environment) }
             .start()
         val output = process.inputStream.bufferedReader().readText()
         val exitCode = process.waitFor()
         updaterLog.i { "${command.take(3).joinToString(" ")} … exited $exitCode" }
         if (exitCode != 0) updaterLog.w { output.takeLast(4000) }
-        return RootRun(exitCode, output.lines().filter(String::isNotBlank).takeLast(3).joinToString("\n"))
+        return RootRun(exitCode, output)
     }
 
     /**
-     * Starts the installed launcher again once this process has exited (the single-instance lock
-     * would hand a second copy straight back to us). The launcher path is this process's own
-     * executable: the jpackage launcher in /opt, which the package just replaced.
+     * The jpackage launcher in /opt this process runs from, which the package replaces. Read from
+     * /proc/self/exe, which gains a " (deleted)" suffix once the file has been replaced, so it
+     * is taken before the install and the suffix is dropped in case it is already there.
      */
-    private fun relaunchAfterExit() {
-        val launcher = ProcessHandle.current().info().command().orElse(null)
+    private fun installedLauncher(): String? =
+        ProcessHandle.current().info().command().orElse(null)
+            ?.removeSuffix(" (deleted)")
             ?.takeIf { it.startsWith("/opt/") }
-            ?: return
+
+    /**
+     * Starts [launcher] again once this process has exited (the single-instance lock would hand
+     * a second copy straight back to us).
+     */
+    private fun relaunchAfterExit(launcher: String) {
         val pid = ProcessHandle.current().pid()
-        val script = "while kill -0 $pid 2>/dev/null; do sleep 0.5; done; exec \"$launcher\""
-        ProcessBuilder("/usr/bin/setsid", "-f", "/bin/sh", "-c", script)
+        val script = "while kill -0 $pid 2>/dev/null; do sleep 0.5; done; " +
+            "[ -x \"\$0\" ] && exec \"\$0\""
+        ProcessBuilder("/usr/bin/setsid", "-f", "/bin/sh", "-c", script, launcher)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
             .redirectOutput(ProcessBuilder.Redirect.DISCARD)
             .redirectError(ProcessBuilder.Redirect.DISCARD)
             .start()
+        updaterLog.i { "Restart scheduled: $launcher after pid $pid exits" }
     }
 
     actual fun getSupportedAbis(): List<String> {
