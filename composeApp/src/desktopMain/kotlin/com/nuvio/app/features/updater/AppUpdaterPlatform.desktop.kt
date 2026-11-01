@@ -79,8 +79,9 @@ actual object AppUpdaterPlatform {
 
     actual fun linuxInstallCommand(assetUrl: String, assetName: String): String =
         if (usesPacman) {
-            // pacman -U fetches URLs itself.
-            "sudo pacman -U $assetUrl"
+            // Not `pacman -U <url>`: given a URL, pacman also fetches `<url>.sig` and aborts when
+            // the release has none. A local file only needs LocalFileSigLevel (Optional by default).
+            "curl -fLo /tmp/$assetName $assetUrl && sudo pacman -U /tmp/$assetName"
         } else {
             "curl -fLo /tmp/$assetName $assetUrl && sudo apt install /tmp/$assetName"
         }
