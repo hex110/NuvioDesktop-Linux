@@ -3942,6 +3942,7 @@ private fun MainAppContent(
                                             onNavigateToHome = { handleRootTabClick(AppScreenTab.Home) },
                                             onNavigateToCalendar = { navController.navigateIfResumed(CalendarRoute) },
                                             onNavigateToLiveTv = { handleRootTabClick(AppScreenTab.LiveTv) },
+                                            onNavigateToMusic = { handleRootTabClick(AppScreenTab.Music) }, // fork:music
                                             onLiveTvSettingsClick = {
                                                 requestedSettingsPageName = "Iptv"
                                                 handleRootTabClick(AppScreenTab.Settings)
@@ -5413,7 +5414,12 @@ private fun MainAppContent(
                     isProviderRatingPromptVisible(isPlaybackRouteActive),
             )
 
-            MusicRootHosts(hidden = musicPlayerHidden) // fork:music
+            MusicRootHosts(
+                hidden = musicPlayerHidden,
+                onOpenArtist = { navController.navigateIfResumed(com.nuvio.app.features.music.MusicArtistRoute(it)) },
+                onOpenAlbum = { navController.navigateIfResumed(com.nuvio.app.features.music.MusicAlbumRoute(it)) },
+                onOpenMusicTab = { latestRootTabClick.value(AppScreenTab.Music) },
+            ) // fork:music
 
             NuvioToastHost(
                 modifier = Modifier
@@ -5763,6 +5769,7 @@ private fun AppTabHost(
     onNavigateToHome: (() -> Unit)? = null,
     onNavigateToCalendar: (() -> Unit)? = null,
     onNavigateToLiveTv: (() -> Unit)? = null,
+    onNavigateToMusic: (() -> Unit)? = null,
     onLiveTvSettingsClick: () -> Unit = {},
     onMusicNavigate: (Any) -> Unit = {}, // fork:music
 ) {
@@ -5921,6 +5928,7 @@ private fun AppTabHost(
                         onNavigateToDiscover = onNavigateToDiscover,
                         onNavigateToCalendar = onNavigateToCalendar,
                         onNavigateToLiveTv = onNavigateToLiveTv,
+                        onNavigateToMusic = onNavigateToMusic,
                     )
                 }
             }
